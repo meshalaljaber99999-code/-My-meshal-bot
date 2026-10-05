@@ -11,27 +11,33 @@ from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import OptionLatestQuoteRequest, StockLatestTradeRequest
 
+# دالة لتنظيف النصوص من أي أحرف خفية أو غير مורئية
+def clean_env(val):
+    if not val:
+        return val
+    # إزالة المسافات والأحرف الخاصة الخفية مثل RLM
+    return "".join(c for c in val if ord(c) < 128).strip()
+
 # يظهر الطباعة فورا في سجلات Railway
 print = functools.partial(print, flush=True)
 
 # ============ الإعدادات ============ #
-API_KEY = os.environ.get("API_KEY")
-SECRET_KEY = os.environ.get("SECRET_KEY")
+API_KEY = clean_env(os.environ.get("API_KEY"))
+SECRET_KEY = clean_env(os.environ.get("SECRET_KEY"))
 
-SYMBOL_UNDERLYING = "SPY"       # السهم/المؤشر الأساسي
-TAKE_PROFIT_PCT = 4.0           # 400% جني ربح (x5 سعر الشراء)
-STOP_LOSS_PCT = 0.5             # 50% وقف خسارة
-CHECK_INTERVAL_SECONDS = 1      # يفحص السعر كل ثانية
-SCAN_INTERVAL_SECONDS = 30      # البحث عن عقد جديد كل 30 ثانية
-MAX_CONTRACT_PRICE = 2.0        # للسهم الواحد، أي 200 دولار للعقد
-MAX_TRADES_PER_DAY = 3          # حد أقصى للصفقات في اليوم
+SYMBOL_UNDERLYING = "SPY"       
+TAKE_PROFIT_PCT = 4.0           
+STOP_LOSS_PCT = 0.5             
+CHECK_INTERVAL_SECONDS = 1      
+SCAN_INTERVAL_SECONDS = 30      
+MAX_CONTRACT_PRICE = 2.0        
+MAX_TRADES_PER_DAY = 3          
 
-# قفل أمان: دائما Paper إلى أن تغيّره يدويا بوعي تام
 PAPER_MODE = True
 
 # ============ الاتصال ============ #
 if not API_KEY or not SECRET_KEY:
-    sys.exit("API_KEY / SECRET_KEY غير موجودة في متغيرات البيئة")
+    sys.exit("API_KEY / SECRET_KEY غير موجودة في متغيرات البيئة أو تحتوي على رموز غير صالحة")
 
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER_MODE)
 option_data_client = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
@@ -54,14 +60,7 @@ def get_underlying_price():
     return float(trade[SYMBOL_UNDERLYING].price)
 
 
-def get_option_quote(symbol):
-    req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
-    q = option_data_client.get_option_latest_quote(req)[symbol]
-    return float(q.bid_price or 0), float(q.ask_price or 0)
-
-
 def find_cheap_call_option():
-    """يبحث عن عقد Call رخيص على SPY، بين 7 و30 يوم لانتهاء الصلاحية."""
     price = get_underlying_price()
     today = datetime.now().date()
 
@@ -101,9 +100,8 @@ def find_cheap_call_option():
         ask = float(q.ask_price or 0)
         if bid <= 0 or ask <= 0 or ask > MAX_CONTRACT_PRICE:
             continue
-        if ask < 0.10 or (ask - bid) / ask > 0.25:  # سعر ضعيف أو فرق كبير
+        if ask < 0.10 or (ask - bid) / ask > 0.25:  
             continue
-        # نختار أغلى عقد ضمن الحد (الأقرب للسعر الحالي)
         if best is None or ask > best["ask"]:
             best = {"symbol": symbol, "bid": bid, "ask": ask}
 
@@ -115,7 +113,6 @@ def find_cheap_call_option():
 
 
 def buy_option(symbol, ask):
-    """يشتري عقدا واحدا، ويرجع سعر التنفيذ الفعلي أو None."""
     order = trading_client.submit_order(
         LimitOrderRequest(
             symbol=symbol,
@@ -135,7 +132,6 @@ def buy_option(symbol, ask):
             return None
 
 
-# ============ حلقة التشغيل الرئيسية (تمنع إغلاق الحاوية) ============ #
 def main():
     print("بدء تشغيل السكربت على Railway...")
     get_account_info()
@@ -166,7 +162,6 @@ def main():
                 else:
                     print("فشل تنفيذ أمر الشراء.")
             
-            # الانتظار قبل عملية البحث التالية
             time.sleep(SCAN_INTERVAL_SECONDS)
             
         except Exception as e:
