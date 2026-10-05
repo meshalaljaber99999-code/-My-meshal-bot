@@ -63,92 +63,6 @@ def get_underlying_price():
 
 
 def check_market_momentum():
-    """
-    إستراتيجية الزخم: تتأكد أن السعر الحالي أعلى من إغلاق الشمعة السابقة 
-    مما يعني وجود زخم صعودي قوي (Momentum Breakout) قبل الشراء.
-    """
-    try:
-        end_time = datetime.now()
-        start_time = end_time - timedelta(minutes=15)
-        
-        request_params = StockBarsRequest(
-            symbol_or_symbols=SYMBOL_UNDERLYING,
-            timeframe=TimeFrame.Minute,
-            start=start_time,
-            end=end_time
-        )
-        bars = stock_data_client.get_stock_bars(request_params)
-        df_bars = bars.df
-        
-        if df_bars.empty or len(df_bars) < 2:
-            return True # تجاوز الشرط في حال عدم توفر كفاية البيانات مؤقتاً
-            
-        last_close = float(df_bars.iloc[-1]['close'])
-import os
-import sys
-import time
-import functools
-from datetime import datetime, timedelta
-
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOptionContractsRequest, LimitOrderRequest, MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, ContractType, AssetStatus
-from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.requests import OptionLatestQuoteRequest, StockLatestTradeRequest, StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-
-def clean_env(val):
-    if not val:
-        return val
-    return "".join(c for c in val if ord(c) < 128).strip()
-
-print = functools.partial(print, flush=True)
-
-# ============ الإعدادات والإستراتيجية ============ #
-API_KEY = clean_env(os.environ.get("API_KEY"))
-SECRET_KEY = clean_env(os.environ.get("SECRET_KEY"))
-
-SYMBOL_UNDERLYING = "SPY"       
-TAKE_PROFIT_PCT = 4.0           # 400% جني ربح
-STOP_LOSS_PCT = 0.5             # 50% وقف خسارة
-CHECK_INTERVAL_SECONDS = 1      # فحص العقد كل ثانية أثناء الصفقة
-SCAN_INTERVAL_SECONDS = 30      # البحث عن فرصة جديدة كل 30 ثانية
-MAX_CONTRACT_PRICE = 2.5        # الحد الأقصى لسعر العقد (250 دولار)
-MAX_TRADES_PER_DAY = 3          # حد أقصى للتعاملات اليومية
-
-PAPER_MODE = True
-
-if not API_KEY or not SECRET_KEY:
-    sys.exit("API_KEY / SECRET_KEY غير موجودة في متغيرات البيئة أو تحتوي على رموز غير صالحة")
-
-trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER_MODE)
-option_data_client = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
-stock_data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
-
-
-def get_account_info():
-    try:
-        account = trading_client.get_account()
-        print(f"تم الاتصال. الرصيد: {account.cash} - القوة الشرائية: {account.buying_power}")
-    except Exception as e:
-        print(f"خطأ في جلب بيانات الحساب: {e}")
-
-
-def is_market_open():
-    try:
-        return trading_client.get_clock().is_open
-    except Exception:
-        return True
-
-
-def get_underlying_price():
-    req = StockLatestTradeRequest(symbol_or_symbols=SYMBOL_UNDERLYING)
-    trade = stock_data_client.get_stock_latest_trade(req)
-    return float(trade[SYMBOL_UNDERLYING].price)
-
-
-def check_market_momentum():
     """إستراتيجية الزخم: تتأكد من وجود حركة صعودية قوية للسهم قبل الشراء"""
     try:
         end_time = datetime.now()
@@ -198,8 +112,8 @@ def find_momentum_call_option():
         expiration_date_gte=today + timedelta(days=7),
         expiration_date_lte=today + timedelta(days=30),
         type=ContractType.CALL,
-        strike_price_gte=str(round(price * 1.005, 2)), # قريباً جداً من السعر الحالي
-        strike_price_lte=str(round(price * 1.03, 2)),  # نطاق آمن ومربح
+        strike_price_gte=str(round(price * 1.005, 2)), 
+        strike_price_lte=str(round(price * 1.03, 2)),  
         limit=500,
     )
     contracts = trading_client.get_option_contracts(request).option_contracts
@@ -228,7 +142,7 @@ def find_momentum_call_option():
         ask = float(q.ask_price or 0)
         if bid <= 0 or ask <= 0 or ask > MAX_CONTRACT_PRICE:
             continue
-        if ask < 0.15 or (ask - bid) / ask > 0.20:  # اشتراط سيولة أعلى وفارق سعر أقل
+        if ask < 0.15 or (ask - bid) / ask > 0.20:  
             continue
         if best is None or ask > best["ask"]:
             best = {"symbol": symbol, "bid": bid, "ask": ask}
@@ -334,7 +248,6 @@ def main():
                 time.sleep(300)
                 continue
 
-            # فحص إستراتيجية الزخم قبل البحث عن عقود
             if not check_market_momentum():
                 print("الزخم غير مناسب حالياً، سيتم إعادة المحاولة بعد قليل...")
                 time.sleep(30)
