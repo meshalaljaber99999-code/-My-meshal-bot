@@ -11,14 +11,11 @@ from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import OptionLatestQuoteRequest, StockLatestTradeRequest
 
-# دالة لتنظيف النصوص من أي أحرف خفية أو غير مורئية
 def clean_env(val):
     if not val:
         return val
-    # إزالة المسافات والأحرف الخاصة الخفية مثل RLM
     return "".join(c for c in val if ord(c) < 128).strip()
 
-# يظهر الطباعة فورا في سجلات Railway
 print = functools.partial(print, flush=True)
 
 # ============ الإعدادات ============ #
@@ -35,7 +32,6 @@ MAX_TRADES_PER_DAY = 3
 
 PAPER_MODE = True
 
-# ============ الاتصال ============ #
 if not API_KEY or not SECRET_KEY:
     sys.exit("API_KEY / SECRET_KEY غير موجودة في متغيرات البيئة أو تحتوي على رموز غير صالحة")
 
@@ -45,13 +41,18 @@ stock_data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
 
 def get_account_info():
-    account = trading_client.get_account()
-    print(f"تم الاتصال. الرصيد: {account.cash} - القوة الشرائية: {account.buying_power}")
-    return account
+    try:
+        account = trading_client.get_account()
+        print(f"تم الاتصال. الرصيد: {account.cash} - القوة الشرائية: {account.buying_power}")
+    except Exception as e:
+        print(f"خطأ في جلب بيانات الحساب: {e}")
 
 
 def is_market_open():
-    return trading_client.get_clock().is_open
+    try:
+        return trading_client.get_clock().is_open
+    except Exception:
+        return True # لتجنب التوقف إذا فشل الاتصال المؤقت بالمنصة
 
 
 def get_underlying_price():
@@ -133,15 +134,16 @@ def buy_option(symbol, ask):
 
 
 def main():
-    print("بدء تشغيل السكربت على Railway...")
+    print("بدء تشغيل السكربت على Railway بشكل دائم...")
     get_account_info()
     
     trades_today = 0
     
     while True:
         try:
+            # تم إزالة شرط إيقاف الحاوية عند إغلاق السوق، ليظل السكربت يعمل بانتظار فتحه
             if not is_market_open():
-                print("السوق مغلق حالياً. جاري الانتظار 60 ثانية...")
+                print("السوق مغلق حالياً. السكربت يعمل في الخلفية بانتظار فتح السوق...")
                 time.sleep(60)
                 continue
                 
@@ -165,7 +167,7 @@ def main():
             time.sleep(SCAN_INTERVAL_SECONDS)
             
         except Exception as e:
-            print(f"حدث خطأ: {e}")
+            print(f"حدث خطأ مؤقت: {e}")
             time.sleep(10)
 
 if __name__ == "__main__":
