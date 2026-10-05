@@ -134,7 +134,44 @@ def buy_option(symbol, ask):
         if status in ("canceled", "expired", "rejected"):
             return None
 
-    # لم يتنفذ خلال 30 ثانية: نلغي ونتأكد من آ
 
+# ============ حلقة التشغيل الرئيسية (تمنع إغلاق الحاوية) ============ #
+def main():
+    print("بدء تشغيل السكربت على Railway...")
+    get_account_info()
+    
+    trades_today = 0
+    
+    while True:
+        try:
+            if not is_market_open():
+                print("السوق مغلق حالياً. جاري الانتظار 60 ثانية...")
+                time.sleep(60)
+                continue
+                
+            if trades_today >= MAX_TRADES_PER_DAY:
+                print("تم الوصول للحد الأقصى من الصفقات اليومية. جاري الانتظار...")
+                time.sleep(300)
+                continue
 
+            print("جاري البحث عن عقد مناسب...")
+            best_contract = find_cheap_call_option()
+            
+            if best_contract:
+                print(f"تم العثور على عقد: {best_contract['symbol']}. جاري التنفيذ...")
+                filled_price = buy_option(best_contract['symbol'], best_contract['ask'])
+                if filled_price:
+                    print(f"تم الشراء بنجاح بسعر: {filled_price}")
+                    trades_today += 1
+                else:
+                    print("فشل تنفيذ أمر الشراء.")
+            
+            # الانتظار قبل عملية البحث التالية
+            time.sleep(SCAN_INTERVAL_SECONDS)
+            
+        except Exception as e:
+            print(f"حدث خطأ: {e}")
+            time.sleep(10)
 
+if __name__ == "__main__":
+    main()
