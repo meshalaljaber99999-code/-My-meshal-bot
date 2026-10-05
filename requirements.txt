@@ -1,2 +1,1 @@
-requests
-alpaca-trade-api
+alpaca-py
