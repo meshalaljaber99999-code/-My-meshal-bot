@@ -1,29 +1,41 @@
 import os
+import sys
 import time
+import functools
 from datetime import datetime, timedelta
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOptionContractsRequest, MarketOrderRequest
+from alpaca.trading.requests import GetOptionContractsRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, ContractType, AssetStatus
 from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.requests import OptionLatestQuoteRequest
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import OptionLatestQuoteRequest, StockLatestTradeRequest
 
-# ============ الإعدادات ============
+# يظهر الطباعة فورا في سجلات Railway
+print = functools.partial(print, flush=True)
+
+# ============ الإعدادات ============ #
 API_KEY = os.environ.get("API_KEY")
 SECRET_KEY = os.environ.get("SECRET_KEY")
 
-SYMBOL_UNDERLYING = "SPY"          # السهم/المؤشر الأساسي
-TAKE_PROFIT_PCT = 4.0              # جني ربح عند 400% (أي x5 من سعر الشراء)
-STOP_LOSS_PCT = 0.5                # وقف خسارة عند خسارة 50%
-CHECK_INTERVAL_SECONDS = 1         # يفحص السعر كل ثانية
-MAX_CONTRACT_PRICE = 2.0           # أقصى سعر للعقد وقت الشراء (دولار للسهم الواحد، أي 200 دولار للعقد)
+SYMBOL_UNDERLYING = "SPY"       # السهم/المؤشر الأساسي
+TAKE_PROFIT_PCT = 4.0           # 400% جني ربح (x5 سعر الشراء)
+STOP_LOSS_PCT = 0.5             # 50% وقف خسارة
+CHECK_INTERVAL_SECONDS = 1      # يفحص السعر كل ثانية
+SCAN_INTERVAL_SECONDS = 30      # البحث عن عقد جديد كل 30 ثانية
+MAX_CONTRACT_PRICE = 2.0        # للسهم الواحد، أي 200 دولار للعقد
+MAX_TRADES_PER_DAY = 3          # حد أقصى للصفقات في اليوم
 
-# قفل أمان: دايماً Paper إلى أن تغيّره يدوياً بوعي تام
+# قفل أمان: دائما Paper إلى أن تغيّره يدويا بوعي تام
 PAPER_MODE = True
 
-# ============ الاتصال ============
+# ============ الاتصال ============ #
+if not API_KEY or not SECRET_KEY:
+    sys.exit("API_KEY / SECRET_KEY غير موجودة في متغيرات البيئة")
+
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER_MODE)
 option_data_client = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
+stock_data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
 
 def get_account_info():
@@ -32,23 +44,97 @@ def get_account_info():
     return account
 
 
+def is_market_open():
+    return trading_client.get_clock().is_open
+
+
+def get_underlying_price():
+    req = StockLatestTradeRequest(symbol_or_symbols=SYMBOL_UNDERLYING)
+    trade = stock_data_client.get_stock_latest_trade(req)
+    return float(trade[SYMBOL_UNDERLYING].price)
+
+
+def get_option_quote(symbol):
+    req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
+    q = option_data_client.get_option_latest_quote(req)[symbol]
+    return float(q.bid_price or 0), float(q.ask_price or 0)
+
+
 def find_cheap_call_option():
     """يبحث عن عقد Call رخيص على SPY، بين 7 و30 يوم لانتهاء الصلاحية."""
-    today = datetime.now()
-    min_expiry = today + timedelta(days=7)
-    max_expiry = today + timedelta(days=30)
+    price = get_underlying_price()
+    today = datetime.now().date()
 
     request = GetOptionContractsRequest(
         underlying_symbols=[SYMBOL_UNDERLYING],
         status=AssetStatus.ACTIVE,
-        expiration_date_gte=min_expiry.strftime("%Y-%m-%d"),
-        expiration_date_lte=max_expiry.strftime("%Y-%m-%d"),
+        expiration_date_gte=today + timedelta(days=7),
+        expiration_date_lte=today + timedelta(days=30),
         type=ContractType.CALL,
-        limit=100,
+        strike_price_gte=str(round(price * 1.01, 2)),
+        strike_price_lte=str(round(price * 1.05, 2)),
+        limit=1000,
     )
     contracts = trading_client.get_option_contracts(request).option_contracts
-
     if not contracts:
-        print("ما فيه عقود متا
+        print("ما فيه عقود متاحة")
+        return None
+
+    contracts = sorted(contracts, key=lambda c: float(c.strike_price))[:300]
+    symbols = [c.symbol for c in contracts]
+
+    quotes = {}
+    for i in range(0, len(symbols), 100):
+        chunk = symbols[i:i + 100]
+        quotes.update(
+            option_data_client.get_option_latest_quote(
+                OptionLatestQuoteRequest(symbol_or_symbols=chunk)
+            )
+        )
+
+    best = None
+    for symbol in symbols:
+        q = quotes.get(symbol)
+        if not q:
+            continue
+        bid = float(q.bid_price or 0)
+        ask = float(q.ask_price or 0)
+        if bid <= 0 or ask <= 0 or ask > MAX_CONTRACT_PRICE:
+            continue
+        if ask < 0.10 or (ask - bid) / ask > 0.25:  # سعر ضعيف أو فرق كبير
+            continue
+        # نختار أغلى عقد ضمن الحد (الأقرب للسعر الحالي)
+        if best is None or ask > best["ask"]:
+            best = {"symbol": symbol, "bid": bid, "ask": ask}
+
+    if best:
+        print(f"تم اختيار: {best['symbol']} - سعر الشراء {best['ask']}")
+    else:
+        print("لا يوجد عقد مناسب ضمن الحد الأقصى للسعر")
+    return best
+
+
+def buy_option(symbol, ask):
+    """يشتري عقدا واحدا، ويرجع سعر التنفيذ الفعلي أو None."""
+    order = trading_client.submit_order(
+        LimitOrderRequest(
+            symbol=symbol,
+            qty=1,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            limit_price=round(ask, 2),
+        )
+    )
+    for _ in range(30):
+        time.sleep(1)
+        o = trading_client.get_order_by_id(order.id)
+        status = getattr(o.status, "value", str(o.status))
+        if status == "filled":
+            return float(o.filled_avg_price)
+        if status in ("canceled", "expired", "rejected"):
+            return None
+
+    # لم يتنفذ خلال 30 ثانية: نلغي ونتأكد من آ
+
 
 
