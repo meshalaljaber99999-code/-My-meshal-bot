@@ -60,8 +60,8 @@ if not API_KEY or not SECRET_KEY:
 
 PAPER_MODE = True
 
-# استخدام Delayed للخيارات لتجنب مشاكل الاشتراكات في الحساب التجريبي
-OPTIONS_FEED = OptionsFeed.DELAYED
+# استخدام OPRA لخلاصات الخيارات المعتمدة في المكتبة
+OPTIONS_FEED = OptionsFeed.OPRA
 
 
 # ============================================================
