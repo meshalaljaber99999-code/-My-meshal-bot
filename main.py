@@ -1,38 +1,15 @@
-# ============================================================
-# ALPACA OPTIONS BOT V3.5
-# PAPER ONLY
-#
-# Supports:
-#   - SPY Options
-#   - SPX / SPXW Index Options
-#
-# DATA:
-#   - Stocks: IEX
-#   - Options: INDICATIVE
-#
-# V3.5 CHANGES:
-#   - Shows exact SPY 5-minute movement
-#   - Shows SPY current price
-#   - Shows signal direction / reason
-#   - Shows option-selection diagnostics
-#   - Shows estimated position size
-#   - Keeps OPRA fix
-#   - Keeps SPX/SPXW support
-#   - Keeps state recovery
-# ============================================================
-
 import os
 import sys
 import time
-import json
 import math
-from datetime import datetime, timedelta
+import json
+from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
-from pathlib import Path
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     GetOptionContractsRequest,
+    LimitOrderRequest,
     MarketOrderRequest,
 )
 from alpaca.trading.enums import (
@@ -41,116 +18,78 @@ from alpaca.trading.enums import (
     OrderSide,
     TimeInForce,
 )
-
-from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.historical.option import OptionHistoricalDataClient
-
+from alpaca.data.historical import (
+    StockHistoricalDataClient,
+    OptionHistoricalDataClient,
+)
 from alpaca.data.requests import (
     StockBarsRequest,
-    StockLatestQuoteRequest,
-    OptionChainRequest,
     OptionLatestQuoteRequest,
+    OptionChainRequest,
 )
-
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import OptionsFeed, DataFeed
+from alpaca.data.enums import DataFeed, OptionsFeed
 
 
 # ============================================================
+# CONFIG
+# ============================================================
+
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+
+if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+    print("❌ ALPACA_API_KEY / ALPACA_SECRET_KEY غير موجودة.")
+    sys.exit(1)
+
+
+# ------------------------------------------------------------
 # SAFETY
-# ============================================================
+# ------------------------------------------------------------
 
+# Paper ONLY
 PAPER_MODE = True
 
-API_KEY = (
-    os.getenv("APCA_API_KEY_ID")
-    or os.getenv("API_KEY")
-)
-
-API_SECRET = (
-    os.getenv("APCA_API_SECRET_KEY")
-    or os.getenv("SECRET_KEY")
-)
-
-if not API_KEY or not API_SECRET:
-    print("❌ API keys are missing.")
-    sys.exit(1)
-
 if not PAPER_MODE:
-    print("❌ SAFETY ERROR: This bot is PAPER ONLY.")
+    print("❌ هذا الإصدار مخصص للـ PAPER فقط.")
     sys.exit(1)
 
 
-# ============================================================
-# CLIENTS
-# ============================================================
-
-trading_client = TradingClient(
-    API_KEY,
-    API_SECRET,
-    paper=True,
-)
-
-stock_data_client = StockHistoricalDataClient(
-    API_KEY,
-    API_SECRET,
-)
-
-option_data_client = OptionHistoricalDataClient(
-    API_KEY,
-    API_SECRET,
-)
-
-
-# ============================================================
+# ------------------------------------------------------------
 # DATA FEEDS
-# ============================================================
+# ------------------------------------------------------------
 
-OPTIONS_FEED = OptionsFeed.INDICATIVE
 STOCK_FEED = DataFeed.IEX
 
-
-# ============================================================
-# TIMEZONE
-# ============================================================
-
-NY = ZoneInfo("America/New_York")
+# Paper testing
+OPTIONS_FEED = OptionsFeed.INDICATIVE
 
 
-# ============================================================
+# ------------------------------------------------------------
 # UNDERLYINGS
-# ============================================================
+# ------------------------------------------------------------
 
-UNDERLYINGS = [
-    "SPY",
-    "SPX",
-]
+# SPY يعمل
+# SPX متوقف مؤقتاً لأن Alpaca لا يوفر SPX Spot
+# المطلوب للإشارة بدون مصدر خارجي.
+UNDERLYINGS = ["SPY"]
 
-
-# ============================================================
-# SPX PRODUCT
-#
-# ANY  = SPX + SPXW
-# SPXW = SPXW only
-# SPX  = SPX monthly only
-# ============================================================
-
-SPX_PRODUCT_MODE = "ANY"
+SPX_ENABLED = False
 
 
-# ============================================================
+# ------------------------------------------------------------
 # SIGNAL
-# ============================================================
+# ------------------------------------------------------------
 
 SIGNAL_LOOKBACK_MINUTES = 5
 
-# 0.0010 = 0.10%
+# 0.10% = 0.001
 MIN_SIGNAL_MOVE = 0.0010
 
 
-# ============================================================
-# OPTIONS FILTERS
-# ============================================================
+# ------------------------------------------------------------
+# OPTION FILTERS
+# ------------------------------------------------------------
 
 MIN_DTE = 1
 MAX_DTE = 14
@@ -159,19 +98,16 @@ MIN_DELTA = 0.40
 MAX_DELTA = 0.60
 
 MAX_PREMIUM_SPY = 15.00
-MAX_PREMIUM_SPX = 15.00
 
 MAX_SPREAD_PCT = 0.10
 
 MIN_OPEN_INTEREST = 100
 
 
-# ============================================================
+# ------------------------------------------------------------
 # RISK
-# ============================================================
+# ------------------------------------------------------------
 
-# IMPORTANT:
-# This is capital allocation, not stop-loss risk.
 CAPITAL_ALLOCATION_PCT = 0.01
 
 DAILY_LOSS_LIMIT_PCT = 0.03
@@ -183,9 +119,9 @@ MAX_OPEN_POSITIONS = 2
 MAX_CONTRACTS_PER_TRADE = 5
 
 
-# ============================================================
+# ------------------------------------------------------------
 # EXIT
-# ============================================================
+# ------------------------------------------------------------
 
 STOP_LOSS_PCT = 0.30
 
@@ -194,9 +130,9 @@ TAKE_PROFIT_PCT = 0.60
 TRAILING_STOP_PCT = 0.15
 
 
-# ============================================================
+# ------------------------------------------------------------
 # LOOP
-# ============================================================
+# ------------------------------------------------------------
 
 SCAN_INTERVAL_SECONDS = 60
 
@@ -205,676 +141,321 @@ ERROR_SLEEP_SECONDS = 30
 SYMBOL_DELAY_SECONDS = 2
 
 
+# ------------------------------------------------------------
+# ORDER
+# ------------------------------------------------------------
+
+ORDER_FILL_TIMEOUT_SECONDS = 15
+
+ORDER_FILL_CHECK_INTERVAL = 2
+
+
+# ------------------------------------------------------------
+# STATE
+# ------------------------------------------------------------
+
+STATE_FILE = "bot_state.json"
+
+
+# ============================================================
+# CLIENTS
+# ============================================================
+
+trading_client = TradingClient(
+    ALPACA_API_KEY,
+    ALPACA_SECRET_KEY,
+    paper=True,
+)
+
+stock_data_client = StockHistoricalDataClient(
+    ALPACA_API_KEY,
+    ALPACA_SECRET_KEY,
+)
+
+option_data_client = OptionHistoricalDataClient(
+    ALPACA_API_KEY,
+    ALPACA_SECRET_KEY,
+)
+
+
 # ============================================================
 # STATE
 # ============================================================
 
-STATE_FILE = Path("bot_state.json")
+def default_state():
+    return {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "trades_today": 0,
+        "estimated_daily_pnl": 0.0,
+        "positions": {},
+    }
 
-DEFAULT_STATE = {
-    "date": None,
-    "trades_today": 0,
-    "estimated_daily_pnl": 0.0,
-    "position_state": {},
-}
-
-state = DEFAULT_STATE.copy()
-
-
-# ============================================================
-# LOG
-# ============================================================
-
-def log(message):
-    now = datetime.now(NY).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-    print(
-        f"[{now}] {message}",
-        flush=True
-    )
-
-
-# ============================================================
-# SAFE FLOAT
-# ============================================================
-
-def safe_float(
-    value,
-    default=None,
-):
-    try:
-        if value is None:
-            return default
-
-        return float(value)
-
-    except Exception:
-        return default
-
-
-# ============================================================
-# LOAD STATE
-# ============================================================
 
 def load_state():
-    global state
+    if not os.path.exists(STATE_FILE):
+        return default_state()
 
     try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
 
-        if not STATE_FILE.exists():
-            state = DEFAULT_STATE.copy()
-            return
+        today = datetime.now().strftime("%Y-%m-%d")
 
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8",
-        ) as f:
+        if state.get("date") != today:
+            state = default_state()
 
-            loaded = json.load(f)
+        if "positions" not in state:
+            state["positions"] = {}
 
-        state = {
-            "date": loaded.get("date"),
-            "trades_today": loaded.get(
-                "trades_today",
-                0
-            ),
-            "estimated_daily_pnl": loaded.get(
-                "estimated_daily_pnl",
-                loaded.get(
-                    "daily_realized_pnl",
-                    0.0
-                )
-            ),
-            "position_state": loaded.get(
-                "position_state",
-                {}
-            ),
-        }
-
-        log("💾 State restored.")
+        return state
 
     except Exception as e:
-
-        log(
-            f"⚠️ State load error: {e}"
-        )
-
-        state = DEFAULT_STATE.copy()
+        print(f"⚠️ State load error: {e}")
+        return default_state()
 
 
-# ============================================================
-# SAVE STATE
-# ============================================================
+state = load_state()
+
 
 def save_state():
-
     try:
-
-        with open(
-            STATE_FILE,
-            "w",
-            encoding="utf-8",
-        ) as f:
-
-            json.dump(
-                state,
-                f,
-                indent=2,
-                default=str,
-            )
-
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
     except Exception as e:
-
-        log(
-            f"⚠️ State save error: {e}"
-        )
-
-
-# ============================================================
-# DAILY RESET
-# ============================================================
-
-def reset_daily_state_if_needed():
-
-    today = datetime.now(
-        NY
-    ).date().isoformat()
-
-    if state.get("date") != today:
-
-        state["date"] = today
-
-        state["trades_today"] = 0
-
-        state["estimated_daily_pnl"] = 0.0
-
-        save_state()
-
-        log(
-            "🔄 Daily state reset."
-        )
-
-
-# ============================================================
-# MARKET OPEN
-# ============================================================
-
-def is_market_open():
-
-    now = datetime.now(NY)
-
-    if now.weekday() >= 5:
-        return False
-
-    current_time = now.time()
-
-    market_open = datetime.strptime(
-        "09:30",
-        "%H:%M",
-    ).time()
-
-    market_close = datetime.strptime(
-        "16:00",
-        "%H:%M",
-    ).time()
-
-    return (
-        market_open
-        <= current_time
-        <= market_close
-    )
+        print(f"⚠️ State save error: {e}")
 
 
 # ============================================================
 # ACCOUNT
 # ============================================================
 
-def get_account():
-
+def print_account():
     try:
+        account = trading_client.get_account()
 
-        return trading_client.get_account()
-
-    except Exception as e:
-
-        log(
-            f"❌ Account error: {e}"
+        print(
+            f"ACCOUNT | "
+            f"Status={account.status} | "
+            f"Equity=${float(account.equity):,.2f} | "
+            f"BuyingPower=${float(account.buying_power):,.2f} | "
+            f"OptionsLevel={getattr(account, 'options_trading_level', 'N/A')}"
         )
 
+        return account
+
+    except Exception as e:
+        print(f"❌ Account error: {e}")
         return None
 
 
 # ============================================================
-# ACCOUNT INFO
+# MARKET TIME
 # ============================================================
 
-def log_account():
-
-    account = get_account()
-
-    if not account:
-        return
-
-    equity = safe_float(
-        account.equity,
-        0
-    )
-
-    buying_power = safe_float(
-        account.buying_power,
-        0
-    )
-
-    options_level = getattr(
-        account,
-        "options_trading_level",
-        None
-    )
-
-    log(
-        f"ACCOUNT | "
-        f"Status={account.status} | "
-        f"Equity=${equity:,.2f} | "
-        f"BuyingPower=${buying_power:,.2f} | "
-        f"OptionsLevel={options_level}"
-    )
+ET = ZoneInfo("America/New_York")
 
 
-# ============================================================
-# SPY LATEST PRICE
-# ============================================================
+def is_market_open():
+    now = datetime.now(ET)
 
-def get_spy_price():
+    if now.weekday() >= 5:
+        return False
 
-    try:
+    market_open = dt_time(9, 30)
+    market_close = dt_time(16, 0)
 
-        request = StockLatestQuoteRequest(
-            symbol_or_symbols=["SPY"],
-            feed=STOCK_FEED,
-        )
-
-        quotes = (
-            stock_data_client
-            .get_stock_latest_quote(request)
-        )
-
-        quote = quotes["SPY"]
-
-        bid = safe_float(
-            quote.bid_price,
-            0
-        )
-
-        ask = safe_float(
-            quote.ask_price,
-            0
-        )
-
-        if bid > 0 and ask > 0:
-            return (bid + ask) / 2
-
-        if ask > 0:
-            return ask
-
-        if bid > 0:
-            return bid
-
-        return None
-
-    except Exception as e:
-
-        log(
-            f"⚠️ SPY price error: {e}"
-        )
-
-        return None
-
-
-# ============================================================
-# GET SPY BARS
-# ============================================================
-
-def get_spy_bars():
-
-    try:
-
-        now = datetime.now(NY)
-
-        start = (
-            now
-            - timedelta(
-                minutes=SIGNAL_LOOKBACK_MINUTES
-                + 10
-            )
-        )
-
-        request = StockBarsRequest(
-            symbol_or_symbols=["SPY"],
-            timeframe=TimeFrame.Minute,
-            start=start,
-            end=now,
-            feed=STOCK_FEED,
-        )
-
-        bars = (
-            stock_data_client
-            .get_stock_bars(request)
-        )
-
-        return bars["SPY"]
-
-    except Exception as e:
-
-        log(
-            f"⚠️ SPY bars error: {e}"
-        )
-
-        return []
+    return market_open <= now.time() <= market_close
 
 
 # ============================================================
 # SPY SIGNAL
 # ============================================================
 
-def get_spy_signal():
+def get_spy_price_history():
+    end = datetime.now(ET)
+    start = end - timedelta(minutes=15)
 
-    bars = get_spy_bars()
-
-    if len(bars) < (
-        SIGNAL_LOOKBACK_MINUTES + 1
-    ):
-
-        log(
-            f"⚠️ Not enough SPY bars "
-            f"({len(bars)} received)."
-        )
-
-        return None, None, None, None
-
-    closes = [
-        safe_float(
-            bar.close,
-            0
-        )
-        for bar in bars
-    ]
-
-    old_price = closes[
-        -(SIGNAL_LOOKBACK_MINUTES + 1)
-    ]
-
-    current_close = closes[-1]
-
-    if old_price <= 0:
-
-        return (
-            None,
-            None,
-            None,
-            None,
-        )
-
-    move = (
-        current_close
-        - old_price
-    ) / old_price
-
-    if move >= MIN_SIGNAL_MOVE:
-
-        return (
-            "CALL",
-            move,
-            old_price,
-            current_close,
-        )
-
-    if move <= -MIN_SIGNAL_MOVE:
-
-        return (
-            "PUT",
-            move,
-            old_price,
-            current_close,
-        )
-
-    return (
-        None,
-        move,
-        old_price,
-        current_close,
+    request = StockBarsRequest(
+        symbol_or_symbols="SPY",
+        timeframe=TimeFrame.Minute,
+        start=start,
+        end=end,
+        feed=STOCK_FEED,
     )
 
+    bars = stock_data_client.get_stock_bars(request)
 
-# ============================================================
-# SIGNAL
-# ============================================================
-
-def get_signal(underlying):
-
-    # SPY = direct signal
-    if underlying == "SPY":
-
-        return get_spy_signal()
-
-    # SPX = SPY proxy
-    if underlying == "SPX":
-
-        return get_spy_signal()
-
-    return (
-        None,
-        None,
-        None,
-        None,
-    )
-
-
-# ============================================================
-# PRINT SIGNAL STATUS
-# ============================================================
-
-def print_signal_status(
-    underlying,
-    signal,
-    move,
-    old_price,
-    current_price,
-):
-
-    if move is None:
-
-        log(
-            f"{underlying}: "
-            f"Unable to calculate signal."
-        )
-
-        return
-
-    direction = "FLAT"
-
-    if move > 0:
-        direction = "UP"
-
-    elif move < 0:
-        direction = "DOWN"
-
-    threshold_pct = (
-        MIN_SIGNAL_MOVE * 100
-    )
-
-    move_pct = move * 100
-
-    if signal == "CALL":
-
-        reason = (
-            f"CALL threshold reached "
-            f"(≥ +{threshold_pct:.2f}%)"
-        )
-
-    elif signal == "PUT":
-
-        reason = (
-            f"PUT threshold reached "
-            f"(≤ -{threshold_pct:.2f}%)"
-        )
-
-    else:
-
-        remaining = (
-            MIN_SIGNAL_MOVE
-            - abs(move)
-        )
-
-        remaining_pct = (
-            max(remaining, 0)
-            * 100
-        )
-
-        reason = (
-            f"Below threshold | "
-            f"Need ≈ {remaining_pct:.3f}% more movement"
-        )
-
-    log(
-        f"{underlying}: "
-        f"{'🚨 SIGNAL' if signal else '⚪ No signal'} | "
-        f"Direction={direction} | "
-        f"5m Move={move_pct:+.3f}% | "
-        f"From=${old_price:.2f} "
-        f"To=${current_price:.2f} | "
-        f"{reason}"
-    )
-
-
-# ============================================================
-# GET OPTION CONTRACTS
-# ============================================================
-
-def get_option_contracts(
-    underlying,
-    contract_type,
-):
+    if bars is None:
+        return []
 
     try:
+        spy_bars = bars["SPY"]
+    except Exception:
+        return []
 
-        today = datetime.now(
-            NY
-        ).date()
+    return spy_bars
 
-        expiration_gte = (
-            today
-            + timedelta(
-                days=MIN_DTE
+
+def get_spy_signal():
+    try:
+        bars = get_spy_price_history()
+
+        if not bars or len(bars) < 2:
+            return {
+                "signal": None,
+                "direction": None,
+                "move": 0.0,
+                "from_price": None,
+                "to_price": None,
+                "reason": "Not enough bars",
+            }
+
+        lookback = min(SIGNAL_LOOKBACK_MINUTES, len(bars) - 1)
+
+        from_price = float(bars[-lookback - 1].close)
+        to_price = float(bars[-1].close)
+
+        if from_price <= 0:
+            return {
+                "signal": None,
+                "direction": None,
+                "move": 0.0,
+                "from_price": from_price,
+                "to_price": to_price,
+                "reason": "Invalid price",
+            }
+
+        move = (to_price - from_price) / from_price
+
+        if move >= MIN_SIGNAL_MOVE:
+            return {
+                "signal": "CALL",
+                "direction": "UP",
+                "move": move,
+                "from_price": from_price,
+                "to_price": to_price,
+                "reason": "Threshold reached",
+            }
+
+        if move <= -MIN_SIGNAL_MOVE:
+            return {
+                "signal": "PUT",
+                "direction": "DOWN",
+                "move": move,
+                "from_price": from_price,
+                "to_price": to_price,
+                "reason": "Threshold reached",
+            }
+
+        return {
+            "signal": None,
+            "direction": "UP" if move > 0 else "DOWN",
+            "move": move,
+            "from_price": from_price,
+            "to_price": to_price,
+            "reason": "Below threshold",
+        }
+
+    except Exception as e:
+        return {
+            "signal": None,
+            "direction": None,
+            "move": 0.0,
+            "from_price": None,
+            "to_price": None,
+            "reason": f"Error: {e}",
+        }
+
+
+# ============================================================
+# PRINT SIGNAL
+# ============================================================
+
+def print_signal(symbol, result):
+    move = result.get("move", 0.0)
+
+    direction = result.get("direction") or "-"
+
+    from_price = result.get("from_price")
+    to_price = result.get("to_price")
+
+    signal = result.get("signal")
+
+    if from_price is not None and to_price is not None:
+
+        if signal:
+            icon = "🟢" if signal == "CALL" else "🔴"
+
+            print(
+                f"{symbol}: {icon} SIGNAL={signal} | "
+                f"Direction={direction} | "
+                f"5m Move={move:+.3%} | "
+                f"From=${from_price:.2f} "
+                f"To=${to_price:.2f}"
             )
+
+        else:
+            icon = "⚪"
+
+            needed = max(
+                0,
+                MIN_SIGNAL_MOVE - abs(move)
+            )
+
+            print(
+                f"{symbol}: {icon} No signal | "
+                f"Direction={direction} | "
+                f"5m Move={move:+.3%} | "
+                f"From=${from_price:.2f} "
+                f"To=${to_price:.2f} | "
+                f"{result.get('reason')} | "
+                f"Need ≈ {needed:.3%} more movement"
+            )
+
+    else:
+        print(
+            f"{symbol}: ⚪ No signal | "
+            f"{result.get('reason')}"
         )
 
-        expiration_lte = (
-            today
-            + timedelta(
-                days=MAX_DTE
-            )
+
+# ============================================================
+# OPTION CONTRACTS
+# ============================================================
+
+def get_option_chain(symbol):
+    try:
+        request = OptionChainRequest(
+            underlying_symbol=symbol,
+            type=None,
+            feed=OPTIONS_FEED,
         )
 
+        return option_data_client.get_option_chain(request)
+
+    except Exception as e:
+        print(f"⚠️ Option chain error for {symbol}: {e}")
+        return {}
+
+
+def get_contracts(symbol):
+    try:
         request = GetOptionContractsRequest(
-            underlying_symbols=[
-                underlying
-            ],
-
+            underlying_symbols=[symbol],
             status=AssetStatus.ACTIVE,
-
-            expiration_date_gte=(
-                expiration_gte
-            ),
-
-            expiration_date_lte=(
-                expiration_lte
-            ),
-
-            type=contract_type,
-
             limit=1000,
         )
 
-        response = (
-            trading_client
-            .get_option_contracts(
-                request
-            )
-        )
+        response = trading_client.get_option_contracts(request)
 
-        return getattr(
-            response,
-            "option_contracts",
-            []
-        )
+        if hasattr(response, "option_contracts"):
+            return response.option_contracts
+
+        return response
 
     except Exception as e:
-
-        log(
-            f"⚠️ Option contracts error "
-            f"{underlying}: {e}"
-        )
-
+        print(f"⚠️ Option contracts error for {symbol}: {e}")
         return []
-
-
-# ============================================================
-# OPTION CHAIN
-#
-# NO LIMIT HERE.
-#
-# This fixes the previous Alpaca-py issue.
-# ============================================================
-
-def get_option_chain(
-    underlying,
-    contract_type,
-):
-
-    try:
-
-        today = datetime.now(
-            NY
-        ).date()
-
-        expiration_gte = (
-            today
-            + timedelta(
-                days=MIN_DTE
-            )
-        )
-
-        expiration_lte = (
-            today
-            + timedelta(
-                days=MAX_DTE
-            )
-        )
-
-        request = OptionChainRequest(
-            underlying_symbol=underlying,
-
-            # IMPORTANT:
-            # Never use OPRA here.
-            feed=OPTIONS_FEED,
-
-            type=contract_type,
-
-            expiration_date_gte=(
-                expiration_gte
-            ),
-
-            expiration_date_lte=(
-                expiration_lte
-            ),
-        )
-
-        return (
-            option_data_client
-            .get_option_chain(
-                request
-            )
-        )
-
-    except Exception as e:
-
-        error_text = str(e)
-
-        log(
-            f"⚠️ Option chain error "
-            f"{underlying}: {error_text}"
-        )
-
-        lower = error_text.lower()
-
-        if "opra agreement" in lower:
-
-            log(
-                "❌ OPRA error detected."
-            )
-
-            log(
-                "ℹ️ Code is explicitly using "
-                "OptionsFeed.INDICATIVE."
-            )
-
-        if (
-            "index options" in lower
-            and (
-                "enable" in lower
-                or "sandbox" in lower
-            )
-        ):
-
-            log(
-                "❌ SPX Index Options are not "
-                "enabled for this environment."
-            )
-
-        return {}
 
 
 # ============================================================
@@ -882,1121 +463,618 @@ def get_option_chain(
 # ============================================================
 
 def get_option_quote(symbol):
-
     try:
-
         request = OptionLatestQuoteRequest(
-            symbol_or_symbols=[symbol],
-
-            # IMPORTANT
+            symbol_or_symbols=symbol,
             feed=OPTIONS_FEED,
         )
 
-        quotes = (
-            option_data_client
-            .get_option_latest_quote(
-                request
-            )
-        )
+        response = option_data_client.get_option_latest_quote(request)
 
-        quote = quotes.get(symbol)
+        quote = response[symbol]
 
-        if quote is None:
+        bid = float(quote.bid_price or 0)
+        ask = float(quote.ask_price or 0)
+
+        if bid <= 0 or ask <= 0:
             return None
 
-        bid = safe_float(
-            quote.bid_price,
-            0
-        )
+        mid = (bid + ask) / 2
 
-        ask = safe_float(
-            quote.ask_price,
-            0
-        )
-
-        if bid <= 0 and ask <= 0:
-            return None
-
-        if bid <= 0:
-            bid = ask
-
-        if ask <= 0:
-            ask = bid
-
-        mid = (
-            bid + ask
-        ) / 2
+        spread_pct = (ask - bid) / mid if mid > 0 else 999
 
         return {
             "bid": bid,
             "ask": ask,
             "mid": mid,
-        }
-
-    except Exception as e:
-
-        log(
-            f"⚠️ Quote error "
-            f"{symbol}: {e}"
-        )
-
-        return None
-
-
-# ============================================================
-# GET DELTA
-# ============================================================
-
-def get_delta(snapshot):
-
-    try:
-
-        greeks = getattr(
-            snapshot,
-            "greeks",
-            None
-        )
-
-        if greeks is None:
-            return None
-
-        return safe_float(
-            getattr(
-                greeks,
-                "delta",
-                None
-            )
-        )
-
-    except Exception:
-
-        return None
-
-
-# ============================================================
-# OPEN INTEREST
-# ============================================================
-
-def get_open_interest(snapshot):
-
-    try:
-
-        return safe_float(
-            getattr(
-                snapshot,
-                "open_interest",
-                None
-            ),
-            0
-        )
-
-    except Exception:
-
-        return 0
-
-
-# ============================================================
-# SNAPSHOT QUOTE
-# ============================================================
-
-def get_snapshot_quote(snapshot):
-
-    try:
-
-        quote = getattr(
-            snapshot,
-            "latest_quote",
-            None
-        )
-
-        if quote is None:
-            return None
-
-        bid = safe_float(
-            getattr(
-                quote,
-                "bid_price",
-                None
-            ),
-            0
-        )
-
-        ask = safe_float(
-            getattr(
-                quote,
-                "ask_price",
-                None
-            ),
-            0
-        )
-
-        if bid <= 0 and ask <= 0:
-            return None
-
-        if bid <= 0:
-            bid = ask
-
-        if ask <= 0:
-            ask = bid
-
-        mid = (
-            bid + ask
-        ) / 2
-
-        return {
-            "bid": bid,
-            "ask": ask,
-            "mid": mid,
+            "spread_pct": spread_pct,
         }
 
     except Exception:
-
         return None
 
 
 # ============================================================
-# SPX ROOT FILTER
+# OPTION SELECTION
 # ============================================================
 
-def spx_root_allowed(contract):
+def select_option(symbol, direction):
+    try:
+        contracts = get_contracts(symbol)
 
-    if SPX_PRODUCT_MODE == "ANY":
-        return True
+        if not contracts:
+            print(f"⚠️ No option contracts found for {symbol}")
+            return None
 
-    root = getattr(
-        contract,
-        "root_symbol",
-        None
-    )
+        today = datetime.now(ET).date()
 
-    if root is None:
-        return False
+        candidates = []
 
-    root = str(root).upper()
+        for contract in contracts:
 
-    if SPX_PRODUCT_MODE == "SPXW":
-        return root == "SPXW"
+            try:
+                expiration = contract.expiration_date
 
-    if SPX_PRODUCT_MODE == "SPX":
-        return root == "SPX"
+                if isinstance(expiration, str):
+                    expiration = datetime.fromisoformat(
+                        expiration
+                    ).date()
 
-    return True
+                dte = (expiration - today).days
 
-
-# ============================================================
-# SELECT OPTION
-# ============================================================
-
-def select_option_contract(
-    underlying,
-    signal,
-):
-
-    if signal not in (
-        "CALL",
-        "PUT",
-    ):
-
-        return None
-
-    contract_type = (
-        ContractType.CALL
-        if signal == "CALL"
-        else ContractType.PUT
-    )
-
-    log(
-        f"🔎 Searching "
-        f"{underlying} {signal} options..."
-    )
-
-    contracts = get_option_contracts(
-        underlying,
-        contract_type
-    )
-
-    if not contracts:
-
-        log(
-            f"⚠️ No contracts returned "
-            f"for {underlying}."
-        )
-
-        return None
-
-    log(
-        f"📋 Contracts received: "
-        f"{len(contracts)}"
-    )
-
-    chain = get_option_chain(
-        underlying,
-        contract_type
-    )
-
-    if not chain:
-
-        log(
-            f"⚠️ Empty option chain "
-            f"for {underlying}."
-        )
-
-        return None
-
-    log(
-        f"📡 Chain snapshots: "
-        f"{len(chain)}"
-    )
-
-    # --------------------------------------------------------
-    # Underlying price
-    # --------------------------------------------------------
-
-    underlying_price = get_spy_price()
-
-    if not underlying_price:
-
-        return None
-
-    candidates = []
-
-    today = datetime.now(
-        NY
-    ).date()
-
-    # --------------------------------------------------------
-    # Counters for diagnostics
-    # --------------------------------------------------------
-
-    count_expiration = 0
-    count_delta = 0
-    count_oi = 0
-    count_quote = 0
-    count_premium = 0
-    count_spread = 0
-    count_root = 0
-
-    # --------------------------------------------------------
-    # Loop
-    # --------------------------------------------------------
-
-    for contract in contracts:
-
-        try:
-
-            symbol = getattr(
-                contract,
-                "symbol",
-                None
-            )
-
-            if not symbol:
-                continue
-
-            # ------------------------------------------------
-            # SPX / SPXW
-            # ------------------------------------------------
-
-            if (
-                underlying == "SPX"
-                and not spx_root_allowed(
-                    contract
-                )
-            ):
-
-                continue
-
-            count_root += 1
-
-            # ------------------------------------------------
-            # Expiration
-            # ------------------------------------------------
-
-            expiration = getattr(
-                contract,
-                "expiration_date",
-                None
-            )
-
-            if expiration is None:
-                continue
-
-            if hasattr(
-                expiration,
-                "date"
-            ):
-
-                expiration = (
-                    expiration.date()
-                )
-
-            if isinstance(
-                expiration,
-                str
-            ):
-
-                try:
-
-                    expiration = (
-                        datetime.strptime(
-                            expiration[:10],
-                            "%Y-%m-%d"
-                        ).date()
-                    )
-
-                except Exception:
-
+                if dte < MIN_DTE or dte > MAX_DTE:
                     continue
 
-            dte = (
-                expiration - today
-            ).days
+                contract_type = str(
+                    contract.type
+                ).lower()
 
-            if dte < MIN_DTE:
-                continue
+                if direction == "CALL":
+                    if "call" not in contract_type:
+                        continue
 
-            if dte > MAX_DTE:
-                continue
+                elif direction == "PUT":
+                    if "put" not in contract_type:
+                        continue
 
-            count_expiration += 1
+                else:
+                    continue
 
-            # ------------------------------------------------
-            # Strike
-            # ------------------------------------------------
+                strike = float(contract.strike_price)
 
-            strike = safe_float(
-                getattr(
-                    contract,
-                    "strike_price",
-                    None
+                candidates.append(
+                    (
+                        contract,
+                        dte,
+                        strike,
+                    )
                 )
-            )
 
-            if strike is None:
+            except Exception:
                 continue
 
-            # ------------------------------------------------
-            # Snapshot
-            # ------------------------------------------------
+        if not candidates:
+            print(f"⚠️ No suitable {direction} contracts for {symbol}")
+            return None
 
-            snapshot = chain.get(
-                symbol
+        # ----------------------------------------------------
+        # Get underlying price
+        # ----------------------------------------------------
+
+        bars = get_spy_price_history()
+
+        if not bars:
+            return None
+
+        underlying_price = float(bars[-1].close)
+
+        # ----------------------------------------------------
+        # Rank by closeness to ATM
+        # ----------------------------------------------------
+
+        candidates.sort(
+            key=lambda x: (
+                abs(x[2] - underlying_price),
+                x[1],
             )
+        )
 
-            if snapshot is None:
+        # ----------------------------------------------------
+        # Check quotes
+        # ----------------------------------------------------
+
+        checked = 0
+
+        for contract, dte, strike in candidates:
+
+            if checked >= 100:
+                break
+
+            checked += 1
+
+            symbol_option = contract.symbol
+
+            quote = get_option_quote(symbol_option)
+
+            if not quote:
                 continue
-
-            # ------------------------------------------------
-            # Delta
-            # ------------------------------------------------
-
-            delta = get_delta(
-                snapshot
-            )
-
-            if delta is None:
-                continue
-
-            absolute_delta = abs(
-                delta
-            )
-
-            if (
-                absolute_delta
-                < MIN_DELTA
-                or
-                absolute_delta
-                > MAX_DELTA
-            ):
-
-                continue
-
-            count_delta += 1
-
-            # ------------------------------------------------
-            # Open Interest
-            # ------------------------------------------------
-
-            open_interest = (
-                get_open_interest(
-                    snapshot
-                )
-            )
-
-            if (
-                open_interest
-                < MIN_OPEN_INTEREST
-            ):
-
-                continue
-
-            count_oi += 1
-
-            # ------------------------------------------------
-            # Quote
-            # ------------------------------------------------
-
-            quote = (
-                get_snapshot_quote(
-                    snapshot
-                )
-            )
-
-            if quote is None:
-                continue
-
-            count_quote += 1
 
             bid = quote["bid"]
             ask = quote["ask"]
             mid = quote["mid"]
+            spread_pct = quote["spread_pct"]
 
             if mid <= 0:
                 continue
 
-            # ------------------------------------------------
-            # Premium
-            # ------------------------------------------------
-
-            max_premium = (
-                MAX_PREMIUM_SPY
-                if underlying == "SPY"
-                else MAX_PREMIUM_SPX
-            )
-
-            if mid > max_premium:
-
+            if mid > MAX_PREMIUM_SPY:
                 continue
 
-            count_premium += 1
-
-            # ------------------------------------------------
-            # Spread
-            # ------------------------------------------------
-
-            spread_pct = (
-                ask - bid
-            ) / mid
-
-            if (
-                spread_pct
-                > MAX_SPREAD_PCT
-            ):
-
+            if spread_pct > MAX_SPREAD_PCT:
                 continue
 
-            count_spread += 1
+            delta = None
 
-            # ------------------------------------------------
-            # Score
-            # ------------------------------------------------
+            # Try to obtain delta if available
+            try:
+                chain = get_option_chain(symbol)
 
-            delta_score = abs(
-                absolute_delta
-                - 0.50
-            )
+                if chain and symbol_option in chain:
 
-            spread_score = (
-                spread_pct
-            )
+                    item = chain[symbol_option]
 
-            oi_score = (
-                1
-                / max(
-                    open_interest,
-                    1
-                )
-            )
+                    if hasattr(item, "greeks") and item.greeks:
 
-            # Prefer lower DTE slightly
-            dte_score = (
-                dte * 0.001
-            )
-
-            score = (
-                delta_score * 10
-                + spread_score * 5
-                + oi_score
-                + dte_score
-            )
-
-            candidates.append(
-                {
-                    "symbol": symbol,
-                    "underlying": underlying,
-                    "signal": signal,
-                    "strike": strike,
-                    "expiration": str(
-                        expiration
-                    ),
-                    "dte": dte,
-                    "delta": delta,
-                    "open_interest":
-                        open_interest,
-                    "bid": bid,
-                    "ask": ask,
-                    "mid": mid,
-                    "spread_pct":
-                        spread_pct,
-                    "root_symbol":
-                        getattr(
-                            contract,
-                            "root_symbol",
+                        delta_value = getattr(
+                            item.greeks,
+                            "delta",
                             None
-                        ),
-                    "score": score,
-                }
+                        )
+
+                        if delta_value is not None:
+                            delta = abs(float(delta_value))
+
+            except Exception:
+                delta = None
+
+            # If delta is available, enforce range
+            if delta is not None:
+                if delta < MIN_DELTA or delta > MAX_DELTA:
+                    continue
+
+            # Open interest
+            oi = getattr(
+                contract,
+                "open_interest",
+                None
             )
 
-        except Exception:
+            if oi is not None:
 
-            continue
+                try:
+                    if float(oi) < MIN_OPEN_INTEREST:
+                        continue
+                except Exception:
+                    pass
 
-    # --------------------------------------------------------
-    # Diagnostics
-    # --------------------------------------------------------
+            return {
+                "contract": contract,
+                "symbol": symbol_option,
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "spread_pct": spread_pct,
+                "delta": delta,
+                "dte": dte,
+                "strike": strike,
+            }
 
-    log(
-        f"🔬 Filter results | "
-        f"Root={count_root} | "
-        f"DTE={count_expiration} | "
-        f"Delta={count_delta} | "
-        f"OI={count_oi} | "
-        f"Quote={count_quote} | "
-        f"Premium={count_premium} | "
-        f"Spread={count_spread}"
-    )
-
-    # --------------------------------------------------------
-    # No candidates
-    # --------------------------------------------------------
-
-    if not candidates:
-
-        log(
-            f"⚠️ No suitable "
-            f"{underlying} {signal} contract."
+        print(
+            f"⚠️ No option passed filters for {symbol} {direction}"
         )
 
         return None
 
-    # --------------------------------------------------------
-    # Sort
-    # --------------------------------------------------------
-
-    candidates.sort(
-        key=lambda x: x["score"]
-    )
-
-    best = candidates[0]
-
-    log(
-        f"🎯 SELECTED | "
-        f"{best['symbol']} | "
-        f"Root={best['root_symbol']} | "
-        f"Strike={best['strike']} | "
-        f"DTE={best['dte']} | "
-        f"Delta={best['delta']:.3f} | "
-        f"Bid=${best['bid']:.2f} | "
-        f"Ask=${best['ask']:.2f} | "
-        f"Mid=${best['mid']:.2f} | "
-        f"Spread={best['spread_pct']:.1%} | "
-        f"OI={best['open_interest']:.0f}"
-    )
-
-    return best
+    except Exception as e:
+        print(f"⚠️ select_option error: {e}")
+        return None
 
 
 # ============================================================
-# GET OPTION POSITIONS
+# OPEN POSITIONS
 # ============================================================
 
-def get_option_positions():
-
+def get_open_option_positions():
     try:
+        positions = trading_client.get_all_positions()
 
-        positions = (
-            trading_client
-            .get_all_positions()
-        )
-
-        option_positions = []
+        result = []
 
         for position in positions:
 
-            asset_class = str(
-                getattr(
-                    position,
-                    "asset_class",
-                    ""
-                )
-            ).lower()
+            try:
+                asset_class = str(
+                    position.asset_class
+                ).lower()
 
-            if "option" not in asset_class:
+                if "option" in asset_class:
+                    result.append(position)
+
+            except Exception:
                 continue
 
-            qty = safe_float(
-                getattr(
-                    position,
-                    "qty",
-                    0
-                ),
-                0
-            )
-
-            if not qty:
-                continue
-
-            option_positions.append(
-                position
-            )
-
-        return option_positions
+        return result
 
     except Exception as e:
-
-        log(
-            f"⚠️ Position error: {e}"
-        )
-
+        print(f"⚠️ Position error: {e}")
         return []
 
 
+def get_open_position_count():
+    return len(get_open_option_positions())
+
+
 # ============================================================
-# UNDERLYING FROM SYMBOL
+# QUANTITY
 # ============================================================
 
-def get_position_underlying(
-    symbol
-):
+def calculate_quantity(option_mid):
+    try:
+        account = trading_client.get_account()
 
-    symbol = str(
-        symbol
-    ).upper()
+        equity = float(account.equity)
 
-    if symbol.startswith("SPY"):
-        return "SPY"
+        allocation = (
+            equity *
+            CAPITAL_ALLOCATION_PCT
+        )
 
-    if symbol.startswith("SPX"):
-        return "SPX"
+        # Option multiplier = 100
+        cost_per_contract = option_mid * 100
+
+        if cost_per_contract <= 0:
+            return 0
+
+        quantity = math.floor(
+            allocation / cost_per_contract
+        )
+
+        quantity = min(
+            quantity,
+            MAX_CONTRACTS_PER_TRADE
+        )
+
+        return max(quantity, 0)
+
+    except Exception as e:
+        print(f"⚠️ Quantity error: {e}")
+        return 0
+
+
+# ============================================================
+# TRADE PERMISSION
+# ============================================================
+
+def can_trade():
+    try:
+        if state["trades_today"] >= MAX_TRADES_PER_DAY:
+            print(
+                f"⛔ Max trades reached "
+                f"({MAX_TRADES_PER_DAY})"
+            )
+            return False
+
+        open_positions = get_open_position_count()
+
+        if open_positions >= MAX_OPEN_POSITIONS:
+            print(
+                f"⛔ Max open positions reached "
+                f"({MAX_OPEN_POSITIONS})"
+            )
+            return False
+
+        account = trading_client.get_account()
+
+        equity = float(account.equity)
+
+        max_daily_loss = (
+            equity *
+            DAILY_LOSS_LIMIT_PCT
+        )
+
+        if state["estimated_daily_pnl"] <= -max_daily_loss:
+            print(
+                f"⛔ Daily loss limit reached: "
+                f"${state['estimated_daily_pnl']:.2f}"
+            )
+            return False
+
+        return True
+
+    except Exception as e:
+        print(f"⚠️ can_trade error: {e}")
+        return False
+
+
+# ============================================================
+# WAIT FOR FILL
+# ============================================================
+
+def wait_for_fill(order_id):
+    start = time.time()
+
+    while (
+        time.time() - start
+        < ORDER_FILL_TIMEOUT_SECONDS
+    ):
+
+        try:
+            order = trading_client.get_order_by_id(
+                order_id
+            )
+
+            status = str(order.status).lower()
+
+            if status == "filled":
+                return order
+
+            if status in (
+                "canceled",
+                "cancelled",
+                "rejected",
+                "expired",
+            ):
+                return None
+
+        except Exception:
+            pass
+
+        time.sleep(
+            ORDER_FILL_CHECK_INTERVAL
+        )
+
+    # Timeout
+    try:
+        trading_client.cancel_order_by_id(
+            order_id
+        )
+    except Exception:
+        pass
 
     return None
 
 
 # ============================================================
-# INITIALIZE / RECOVER POSITIONS
+# ENTER POSITION
 # ============================================================
 
-def initialize_position_state():
-
-    positions = (
-        get_option_positions()
-    )
-
-    if not positions:
-        return
-
-    changed = False
-
-    for position in positions:
-
-        symbol = str(
-            getattr(
-                position,
-                "symbol",
-                ""
-            )
-        )
-
-        if not symbol:
-            continue
-
-        if (
-            symbol
-            in state["position_state"]
-        ):
-            continue
-
-        qty = safe_float(
-            getattr(
-                position,
-                "qty",
-                0
-            ),
-            0
-        )
-
-        avg_entry = safe_float(
-            getattr(
-                position,
-                "avg_entry_price",
-                0
-            ),
-            0
-        )
-
-        quote = get_option_quote(
-            symbol
-        )
-
-        current_mid = (
-            quote["mid"]
-            if quote
-            else avg_entry
-        )
-
-        state[
-            "position_state"
-        ][symbol] = {
-
-            "underlying":
-                get_position_underlying(
-                    symbol
-                ),
-
-            "entry_price":
-                avg_entry,
-
-            "highest_price":
-                max(
-                    avg_entry,
-                    current_mid
-                ),
-
-            "qty":
-                qty,
-
-            "entry_time":
-                datetime.now(
-                    NY
-                ).isoformat(),
-
-            "order_id":
-                None,
-        }
-
-        changed = True
-
-        log(
-            f"🔄 POSITION RECOVERED | "
-            f"{symbol} | "
-            f"Qty={qty} | "
-            f"Entry=${avg_entry:.2f}"
-        )
-
-    if changed:
-        save_state()
-
-
-# ============================================================
-# OPEN POSITION COUNT
-# ============================================================
-
-def open_position_count():
-
-    return len(
-        get_option_positions()
-    )
-
-
-# ============================================================
-# POSITION SIZE
-# ============================================================
-
-def calculate_quantity(
-    premium
-):
-
-    if (
-        premium is None
-        or premium <= 0
-    ):
-
-        return 0
-
-    account = get_account()
-
-    if not account:
-        return 0
-
-    equity = safe_float(
-        account.equity,
-        0
-    )
-
-    buying_power = safe_float(
-        account.buying_power,
-        0
-    )
-
-    allocation = (
-        equity
-        * CAPITAL_ALLOCATION_PCT
-    )
-
-    contract_cost = (
-        premium * 100
-    )
-
-    if contract_cost <= 0:
-        return 0
-
-    quantity = math.floor(
-        allocation
-        / contract_cost
-    )
-
-    max_by_bp = math.floor(
-        buying_power
-        / contract_cost
-    )
-
-    quantity = min(
-        quantity,
-        max_by_bp,
-        MAX_CONTRACTS_PER_TRADE,
-    )
-
-    log(
-        f"💵 Position sizing | "
-        f"Premium=${premium:.2f} | "
-        f"Contract cost≈${contract_cost:.2f} | "
-        f"Allocation≈${allocation:.2f} | "
-        f"Qty={quantity}"
-    )
-
-    return max(
-        quantity,
-        0
-    )
-
-
-# ============================================================
-# EXECUTE ENTRY
-# ============================================================
-
-def execute_entry(
-    contract
-):
-
-    if not contract:
+def enter_position(symbol, direction):
+    if not can_trade():
         return False
 
-    symbol = contract["symbol"]
-
-    premium = contract["mid"]
-
-    quantity = calculate_quantity(
-        premium
+    option = select_option(
+        symbol,
+        direction
     )
+
+    if not option:
+        return False
+
+    option_symbol = option["symbol"]
+
+    mid = option["mid"]
+
+    quantity = calculate_quantity(mid)
 
     if quantity <= 0:
-
-        log(
-            f"⚠️ No entry: calculated "
-            f"quantity is 0 for {symbol}."
+        print(
+            f"⚠️ Quantity=0 | "
+            f"{option_symbol} | "
+            f"Mid=${mid:.2f}"
         )
-
         return False
 
-    if (
-        open_position_count()
-        >= MAX_OPEN_POSITIONS
-    ):
-
-        log(
-            "⛔ Maximum open positions reached."
-        )
-
-        return False
-
-    if (
-        state["trades_today"]
-        >= MAX_TRADES_PER_DAY
-    ):
-
-        log(
-            "⛔ Maximum trades today reached."
-        )
-
-        return False
+    print(
+        f"🟡 ENTRY | "
+        f"{symbol} | "
+        f"{direction} | "
+        f"{option_symbol} | "
+        f"Qty={quantity} | "
+        f"Mid=${mid:.2f}"
+    )
 
     try:
-
-        order_request = (
-            MarketOrderRequest(
-                symbol=symbol,
-                qty=quantity,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-            )
+        order = LimitOrderRequest(
+            symbol=option_symbol,
+            qty=quantity,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            limit_price=round(mid, 2),
         )
 
-        order = (
-            trading_client
-            .submit_order(
-                order_request
-            )
+        submitted = trading_client.submit_order(
+            order
         )
 
-        order_id = str(
+        order_id = str(submitted.id)
+
+        print(
+            f"📤 Order submitted | "
+            f"ID={order_id}"
+        )
+
+        filled_order = wait_for_fill(
+            order_id
+        )
+
+        if not filled_order:
+
+            print(
+                f"⚪ Order NOT filled | "
+                f"{option_symbol} | "
+                f"Trade not counted"
+            )
+
+            return False
+
+        # ----------------------------------------------------
+        # Actual fill price
+        # ----------------------------------------------------
+
+        filled_qty = float(
             getattr(
-                order,
-                "id",
-                ""
+                filled_order,
+                "filled_qty",
+                quantity
             )
+            or quantity
         )
 
-        state[
-            "trades_today"
-        ] += 1
+        filled_avg = getattr(
+            filled_order,
+            "filled_avg_price",
+            None
+        )
 
-        state[
-            "position_state"
-        ][symbol] = {
+        if filled_avg is not None:
+            entry_price = float(
+                filled_avg
+            )
+        else:
+            entry_price = mid
 
-            "underlying":
-                contract[
-                    "underlying"
-                ],
+        # ----------------------------------------------------
+        # Record only after fill
+        # ----------------------------------------------------
 
-            "entry_price":
-                premium,
+        state["trades_today"] += 1
 
-            "highest_price":
-                premium,
-
-            "qty":
-                quantity,
-
-            "entry_time":
-                datetime.now(
-                    NY
-                ).isoformat(),
-
-            "order_id":
-                order_id,
+        state["positions"][option_symbol] = {
+            "underlying": symbol,
+            "direction": direction,
+            "qty": filled_qty,
+            "entry_price": entry_price,
+            "highest_price": entry_price,
+            "order_id": order_id,
+            "opened_at": datetime.now(
+                ET
+            ).isoformat(),
         }
 
         save_state()
 
-        log(
-            f"🟢 PAPER ENTRY | "
-            f"{symbol} | "
-            f"Qty={quantity} | "
-            f"Estimated Entry=${premium:.2f} | "
-            f"OrderID={order_id}"
+        print(
+            f"✅ FILLED | "
+            f"{option_symbol} | "
+            f"Qty={filled_qty} | "
+            f"Entry=${entry_price:.2f} | "
+            f"TradesToday={state['trades_today']}"
         )
 
         return True
 
     except Exception as e:
-
-        error_text = str(e)
-
-        log(
-            f"❌ Entry failed | "
-            f"{symbol} | "
-            f"{error_text}"
+        print(
+            f"❌ Entry order error: {e}"
         )
-
-        if (
-            "index options"
-            in error_text.lower()
-        ):
-
-            log(
-                "ℹ️ Check SPX Index Options "
-                "enablement."
-            )
-
         return False
 
 
 # ============================================================
-# CLOSE POSITION
+# EXIT POSITION
 # ============================================================
 
-def close_position(
+def exit_position(
     position,
     reason,
     current_price,
 ):
-
-    symbol = str(
-        getattr(
-            position,
-            "symbol",
-            ""
-        )
-    )
-
-    if not symbol:
-        return False
-
-    qty = safe_float(
-        getattr(
-            position,
-            "qty",
-            0
-        ),
-        0
-    )
-
-    avg_entry = safe_float(
-        getattr(
-            position,
-            "avg_entry_price",
-            0
-        ),
-        0
-    )
+    symbol = position.symbol
 
     try:
-
-        trading_client.close_position(
-            symbol
+        qty = abs(
+            float(position.qty)
         )
 
-        estimated_pnl = (
-            current_price
-            - avg_entry
+        if qty <= 0:
+            return False
+
+        order = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+        )
+
+        submitted = trading_client.submit_order(
+            order
+        )
+
+        order_id = str(submitted.id)
+
+        print(
+            f"📤 EXIT submitted | "
+            f"{symbol} | "
+            f"Qty={qty} | "
+            f"Reason={reason}"
+        )
+
+        filled = wait_for_fill(
+            order_id
+        )
+
+        if not filled:
+            print(
+                f"⚠️ EXIT not filled | "
+                f"{symbol}"
+            )
+            return False
+
+        avg_entry = float(
+            position.avg_entry_price
+        )
+
+        filled_exit = getattr(
+            filled,
+            "filled_avg_price",
+            None
+        )
+
+        if filled_exit is not None:
+            exit_price = float(
+                filled_exit
+            )
+        else:
+            exit_price = current_price
+
+        pnl = (
+            exit_price - avg_entry
         ) * qty * 100
 
-        state[
-            "estimated_daily_pnl"
-        ] += estimated_pnl
+        state["estimated_daily_pnl"] += pnl
 
-        if (
-            symbol
-            in state["position_state"]
-        ):
-
-            del state[
-                "position_state"
-            ][symbol]
+        state["positions"].pop(
+            symbol,
+            None
+        )
 
         save_state()
 
-        log(
-            f"🔴 PAPER EXIT | "
+        print(
+            f"✅ EXIT FILLED | "
             f"{symbol} | "
-            f"Reason={reason} | "
             f"Entry=${avg_entry:.2f} | "
-            f"Exit≈${current_price:.2f} | "
-            f"Estimated P&L≈${estimated_pnl:.2f}"
+            f"Exit=${exit_price:.2f} | "
+            f"P&L=${pnl:+.2f} | "
+            f"Reason={reason}"
         )
 
         return True
 
     except Exception as e:
-
-        log(
-            f"❌ Close failed | "
-            f"{symbol} | "
-            f"{e}"
+        print(
+            f"❌ Exit error {symbol}: {e}"
         )
-
         return False
 
 
@@ -2005,10 +1083,7 @@ def close_position(
 # ============================================================
 
 def manage_positions():
-
-    positions = (
-        get_option_positions()
-    )
+    positions = get_open_option_positions()
 
     if not positions:
         return
@@ -2017,412 +1092,203 @@ def manage_positions():
 
     for position in positions:
 
-        symbol = str(
-            getattr(
-                position,
-                "symbol",
-                ""
+        symbol = position.symbol
+
+        active_symbols.add(symbol)
+
+        try:
+            avg_entry = float(
+                position.avg_entry_price
             )
-        )
 
-        if not symbol:
-            continue
+            qty = abs(
+                float(position.qty)
+            )
 
-        active_symbols.add(
-            symbol
-        )
+            quote = get_option_quote(
+                symbol
+            )
 
-        avg_entry = safe_float(
-            getattr(
-                position,
-                "avg_entry_price",
-                0
-            ),
-            0
-        )
+            if not quote:
+                continue
 
-        if avg_entry <= 0:
-            continue
+            current_price = quote["mid"]
 
-        quote = get_option_quote(
-            symbol
-        )
+            pnl_pct = (
+                current_price - avg_entry
+            ) / avg_entry
 
-        if not quote:
-            continue
+            # ------------------------------------------------
+            # State recovery
+            # ------------------------------------------------
 
-        current_price = quote[
-            "mid"
-        ]
+            if symbol not in state["positions"]:
 
-        if current_price <= 0:
-            continue
-
-        position_data = (
-            state[
-                "position_state"
-            ].get(symbol)
-        )
-
-        if position_data is None:
-
-            position_data = {
-
-                "underlying":
-                    get_position_underlying(
-                        symbol
-                    ),
-
-                "entry_price":
-                    avg_entry,
-
-                "highest_price":
-                    avg_entry,
-
-                "qty":
-                    safe_float(
-                        getattr(
-                            position,
-                            "qty",
-                            0
-                        ),
-                        0
-                    ),
-
-                "entry_time":
-                    datetime.now(
-                        NY
+                state["positions"][symbol] = {
+                    "underlying": "UNKNOWN",
+                    "direction": "UNKNOWN",
+                    "qty": qty,
+                    "entry_price": avg_entry,
+                    "highest_price": avg_entry,
+                    "recovered": True,
+                    "opened_at": datetime.now(
+                        ET
                     ).isoformat(),
+                }
 
-                "order_id":
-                    None,
-            }
+                save_state()
 
-            state[
-                "position_state"
-            ][symbol] = (
-                position_data
-            )
+                print(
+                    f"🔄 Recovered position | "
+                    f"{symbol} | "
+                    f"Entry=${avg_entry:.2f}"
+                )
 
-        entry_price = safe_float(
-            position_data.get(
-                "entry_price",
-                avg_entry
-            ),
-            avg_entry
-        )
-
-        highest_price = safe_float(
-            position_data.get(
-                "highest_price",
-                entry_price
-            ),
-            entry_price
-        )
-
-        if (
-            current_price
-            > highest_price
-        ):
-
-            highest_price = (
-                current_price
-            )
-
-            position_data[
-                "highest_price"
-            ] = highest_price
-
-        pnl_pct = (
-            current_price
-            - entry_price
-        ) / entry_price
-
-        trailing_price = (
-            highest_price
-            * (
-                1
-                - TRAILING_STOP_PCT
-            )
-        )
-
-        log(
-            f"📊 POSITION | "
-            f"{symbol} | "
-            f"Entry=${entry_price:.2f} | "
-            f"Now=${current_price:.2f} | "
-            f"P&L={pnl_pct:+.1%} | "
-            f"High=${highest_price:.2f}"
-        )
-
-        # ----------------------------------------------------
-        # STOP LOSS
-        # ----------------------------------------------------
-
-        if (
-            pnl_pct
-            <= -STOP_LOSS_PCT
-        ):
-
-            close_position(
-                position,
-                "STOP LOSS",
-                current_price
-            )
-
-            continue
-
-        # ----------------------------------------------------
-        # TAKE PROFIT
-        # ----------------------------------------------------
-
-        if (
-            pnl_pct
-            >= TAKE_PROFIT_PCT
-        ):
-
-            close_position(
-                position,
-                "TAKE PROFIT",
-                current_price
-            )
-
-            continue
-
-        # ----------------------------------------------------
-        # TRAILING STOP
-        # ----------------------------------------------------
-
-        if (
-            highest_price
-            > entry_price
-            and current_price
-            <= trailing_price
-        ):
-
-            close_position(
-                position,
-                "TRAILING STOP",
-                current_price
-            )
-
-            continue
-
-    # --------------------------------------------------------
-    # Clean stale state
-    # --------------------------------------------------------
-
-    for symbol in list(
-        state[
-            "position_state"
-        ].keys()
-    ):
-
-        if symbol not in active_symbols:
-
-            del state[
-                "position_state"
+            position_state = state[
+                "positions"
             ][symbol]
 
-    save_state()
+            highest_price = float(
+                position_state.get(
+                    "highest_price",
+                    avg_entry
+                )
+            )
 
+            if current_price > highest_price:
+                highest_price = current_price
 
-# ============================================================
-# DAILY LOSS
-# ============================================================
+                position_state[
+                    "highest_price"
+                ] = highest_price
 
-def daily_loss_limit_hit():
+                save_state()
 
-    account = get_account()
+            # ------------------------------------------------
+            # Stop Loss
+            # ------------------------------------------------
 
-    if not account:
-        return False
+            if pnl_pct <= -STOP_LOSS_PCT:
 
-    equity = safe_float(
-        account.equity,
-        0
-    )
+                exit_position(
+                    position,
+                    "STOP LOSS",
+                    current_price,
+                )
 
-    if equity <= 0:
-        return False
+                continue
 
-    loss_limit = (
-        equity
-        * DAILY_LOSS_LIMIT_PCT
-    )
+            # ------------------------------------------------
+            # Take Profit
+            # ------------------------------------------------
 
-    pnl = safe_float(
-        state.get(
-            "estimated_daily_pnl",
-            0
-        ),
-        0
-    )
+            if pnl_pct >= TAKE_PROFIT_PCT:
 
-    if pnl <= -loss_limit:
+                exit_position(
+                    position,
+                    "TAKE PROFIT",
+                    current_price,
+                )
 
-        log(
-            f"⛔ DAILY LOSS LIMIT | "
-            f"Estimated P&L=${pnl:.2f} | "
-            f"Limit=${-loss_limit:.2f}"
-        )
+                continue
 
-        return True
+            # ------------------------------------------------
+            # Trailing Stop
+            # ------------------------------------------------
 
-    return False
+            if highest_price > avg_entry:
 
+                trailing_stop = (
+                    highest_price *
+                    (1 - TRAILING_STOP_PCT)
+                )
 
-# ============================================================
-# PROCESS UNDERLYING
-# ============================================================
+                if current_price <= trailing_stop:
 
-def process_underlying(
-    underlying
-):
+                    exit_position(
+                        position,
+                        "TRAILING STOP",
+                        current_price,
+                    )
 
-    if (
-        state[
-            "trades_today"
-        ]
-        >= MAX_TRADES_PER_DAY
-    ):
+                    continue
 
-        return
+            print(
+                f"📊 POSITION | "
+                f"{symbol} | "
+                f"Entry=${avg_entry:.2f} | "
+                f"Now=${current_price:.2f} | "
+                f"P&L={pnl_pct:+.2%} | "
+                f"High=${highest_price:.2f}"
+            )
 
-    if (
-        open_position_count()
-        >= MAX_OPEN_POSITIONS
-    ):
-
-        return
-
-    (
-        signal,
-        move,
-        old_price,
-        current_price,
-    ) = get_signal(
-        underlying
-    )
-
-    print_signal_status(
-        underlying,
-        signal,
-        move,
-        old_price,
-        current_price,
-    )
-
-    if signal is None:
-        return
-
-    log(
-        f"🚨 SIGNAL CONFIRMED | "
-        f"{underlying} | "
-        f"{signal}"
-    )
-
-    contract = (
-        select_option_contract(
-            underlying,
-            signal
-        )
-    )
-
-    if contract is None:
-        return
-
-    execute_entry(
-        contract
-    )
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-def startup_test():
-
-    log("=" * 75)
-
-    log(
-        "🚀 ALPACA OPTIONS BOT V3.5"
-    )
-
-    log("=" * 75)
-
-    log(
-        "🛡️ PAPER MODE = TRUE"
-    )
-
-    log(
-        "📡 STOCK FEED = IEX"
-    )
-
-    log(
-        "📡 OPTIONS FEED = INDICATIVE"
-    )
-
-    log(
-        "📈 UNDERLYINGS = SPY + SPX"
-    )
-
-    log(
-        f"📅 SPX PRODUCT = "
-        f"{SPX_PRODUCT_MODE}"
-    )
-
-    log(
-        f"🎯 SIGNAL = "
-        f"{SIGNAL_LOOKBACK_MINUTES}m "
-        f"/ "
-        f"{MIN_SIGNAL_MOVE:.2%}"
-    )
-
-    log(
-        "⚠️ SPX direction uses SPY "
-        "as proxy."
-    )
-
-    account = get_account()
-
-    if not account:
-
-        log(
-            "❌ Alpaca connection failed."
-        )
-
-        return False
-
-    log_account()
+        except Exception as e:
+            print(
+                f"⚠️ Manage position error "
+                f"{symbol}: {e}"
+            )
 
     # --------------------------------------------------------
-    # Test SPY option chain
+    # Remove stale state positions
     # --------------------------------------------------------
 
-    chain = get_option_chain(
+    stale = []
+
+    for symbol in list(
+        state["positions"].keys()
+    ):
+        if symbol not in active_symbols:
+            stale.append(symbol)
+
+    for symbol in stale:
+        state["positions"].pop(
+            symbol,
+            None
+        )
+
+    if stale:
+        save_state()
+
+
+# ============================================================
+# PROCESS SPY
+# ============================================================
+
+def process_spy():
+
+    result = get_spy_signal()
+
+    print_signal(
         "SPY",
-        ContractType.CALL
+        result
     )
 
-    if chain:
+    if result["signal"]:
 
-        log(
-            f"✅ INDICATIVE option chain "
-            f"working | "
-            f"{len(chain)} snapshots"
+        print(
+            f"🚨 SPY SIGNAL DETECTED: "
+            f"{result['signal']}"
         )
 
-    else:
-
-        log(
-            "⚠️ SPY option chain "
-            "returned empty."
+        enter_position(
+            "SPY",
+            result["signal"]
         )
 
-    log("=" * 75)
 
-    return True
+# ============================================================
+# SPX DISABLED
+# ============================================================
+
+def process_spx():
+
+    if not SPX_ENABLED:
+        return
+
+    print(
+        "⏸️ SPX disabled: "
+        "No real SPX Spot feed configured."
+    )
 
 
 # ============================================================
@@ -2431,48 +1297,66 @@ def startup_test():
 
 def main():
 
-    load_state()
+    print("=" * 70)
+    print("🚀 TRADING BOT V3.7")
+    print("=" * 70)
 
-    reset_daily_state_if_needed()
-
-    if not startup_test():
-
-        sys.exit(1)
-
-    initialize_position_state()
-
-    log(
-        "🤖 BOT STARTED"
+    print(
+        "MODE      : PAPER ONLY"
     )
+
+    print(
+        "STOCK FEED: IEX"
+    )
+
+    print(
+        "OPTIONS   : INDICATIVE"
+    )
+
+    print(
+        "SPY       : ENABLED"
+    )
+
+    print(
+        "SPX       : DISABLED"
+    )
+
+    print(
+        f"Signal    : "
+        f"{MIN_SIGNAL_MOVE:.2%} / "
+        f"{SIGNAL_LOOKBACK_MINUTES}m"
+    )
+
+    print(
+        f"SL        : "
+        f"{STOP_LOSS_PCT:.0%}"
+    )
+
+    print(
+        f"TP        : "
+        f"{TAKE_PROFIT_PCT:.0%}"
+    )
+
+    print(
+        f"Trailing  : "
+        f"{TRAILING_STOP_PCT:.0%}"
+    )
+
+    print("=" * 70)
+
+    print_account()
+
+    print()
 
     while True:
 
         try:
 
-            reset_daily_state_if_needed()
-
             # ------------------------------------------------
-            # Manage existing positions first
+            # Manage existing positions FIRST
             # ------------------------------------------------
 
             manage_positions()
-
-            # ------------------------------------------------
-            # Daily loss protection
-            # ------------------------------------------------
-
-            if daily_loss_limit_hit():
-
-                log(
-                    "⏸️ Trading paused "
-                    "for daily loss protection."
-                )
-
-                time.sleep(
-                    SCAN_INTERVAL_SECONDS
-                )
-
-                continue
 
             # ------------------------------------------------
             # Market closed
@@ -2480,48 +1364,9 @@ def main():
 
             if not is_market_open():
 
-                log(
-                    "💤 Market closed."
-                )
-
-                time.sleep(
-                    SCAN_INTERVAL_SECONDS
-                )
-
-                continue
-
-            # ------------------------------------------------
-            # Max positions
-            # ------------------------------------------------
-
-            if (
-                open_position_count()
-                >= MAX_OPEN_POSITIONS
-            ):
-
-                log(
-                    "⏸️ Max open positions."
-                )
-
-                time.sleep(
-                    SCAN_INTERVAL_SECONDS
-                )
-
-                continue
-
-            # ------------------------------------------------
-            # Max trades
-            # ------------------------------------------------
-
-            if (
-                state[
-                    "trades_today"
-                ]
-                >= MAX_TRADES_PER_DAY
-            ):
-
-                log(
-                    "⏸️ Max trades today."
+                print(
+                    f"[{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"⏸️ Market closed"
                 )
 
                 time.sleep(
@@ -2534,9 +1379,7 @@ def main():
             # SPY
             # ------------------------------------------------
 
-            process_underlying(
-                "SPY"
-            )
+            process_spy()
 
             time.sleep(
                 SYMBOL_DELAY_SECONDS
@@ -2546,21 +1389,11 @@ def main():
             # SPX
             # ------------------------------------------------
 
-            if (
-                open_position_count()
-                < MAX_OPEN_POSITIONS
-                and
-                state[
-                    "trades_today"
-                ]
-                < MAX_TRADES_PER_DAY
-            ):
+            process_spx()
 
-                process_underlying(
-                    "SPX"
-                )
-
-            save_state()
+            # ------------------------------------------------
+            # Wait
+            # ------------------------------------------------
 
             time.sleep(
                 SCAN_INTERVAL_SECONDS
@@ -2568,21 +1401,17 @@ def main():
 
         except KeyboardInterrupt:
 
-            log(
-                "🛑 BOT STOPPED MANUALLY"
+            print(
+                "\n🛑 Bot stopped by user."
             )
-
-            save_state()
 
             break
 
         except Exception as e:
 
-            log(
-                f"❌ MAIN LOOP ERROR: {e}"
+            print(
+                f"❌ MAIN ERROR: {e}"
             )
-
-            save_state()
 
             time.sleep(
                 ERROR_SLEEP_SECONDS
@@ -2590,7 +1419,7 @@ def main():
 
 
 # ============================================================
-# ENTRY POINT
+# START
 # ============================================================
 
 if __name__ == "__main__":
