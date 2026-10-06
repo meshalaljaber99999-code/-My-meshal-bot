@@ -692,9 +692,11 @@ def get_spy_signal():
             )
         )
 
-        data = bars.get(
-            "SPY"
-        )
+        # التعديل هنا: تجنب استخدام .get() مع كائن BarSet
+        if "SPY" not in bars:
+            return None
+
+        data = bars["SPY"]
 
         if not data:
 
