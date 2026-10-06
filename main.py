@@ -1,3 +1,9 @@
+# ============================================================
+# PROFESSIONAL ALPACA OPTIONS BOT
+# SPY + SPX / SPXW
+# PAPER ONLY
+# ============================================================
+
 import os
 import sys
 import time
@@ -32,7 +38,7 @@ from alpaca.data.enums import OptionsFeed
 
 
 # ============================================================
-#                      CONFIGURATION
+# CONFIG
 # ============================================================
 
 def clean_env(value):
@@ -41,89 +47,117 @@ def clean_env(value):
     return "".join(c for c in value if ord(c) < 128).strip()
 
 
-API_KEY = clean_env(os.environ.get("API_KEY"))
-SECRET_KEY = clean_env(os.environ.get("SECRET_KEY"))
+API_KEY = clean_env(os.getenv("API_KEY"))
+SECRET_KEY = clean_env(os.getenv("SECRET_KEY"))
 
 if not API_KEY or not SECRET_KEY:
     sys.exit("ERROR: API_KEY / SECRET_KEY غير موجودة.")
 
-# ------------------------------------------------------------
-# SAFETY
-# ------------------------------------------------------------
 
-# True = Paper Trading. لا تغيّرها إلى False الآن.
+# ============================================================
+# SAFETY
+# ============================================================
+
 PAPER_MODE = True
 
-# INDICATIVE = متاحة بدون OPRA لكنها متأخرة/مشتقة.
-# OPRA = الأفضل للتداول الحقيقي وتتطلب الاشتراك المناسب.
+# نستخدم Indicative في البداية حتى نختبر البنية.
+# عند توفر OPRA يمكن تحويلها إلى OPRA.
 OPTIONS_FEED = OptionsFeed.INDICATIVE
 
-# ------------------------------------------------------------
-# CUSTOMER STRATEGY
-# ------------------------------------------------------------
+
+# ============================================================
+# STRATEGY
+# ============================================================
 
 STRATEGY = {
 
-    "name": "Customer Strategy V1",
+    "name": "Professional Options Strategy V2",
 
-    # تم حذف SPX: Alpaca لا توفر خيارات المؤشرات.
+    # نريد الاثنين
     "underlyings": [
         "SPY",
+        "SPX",
     ],
 
     "signal": {
+
+        # AUTO = إشارة تجريبية مؤقتة
+        # لاحقًا سيأتي هنا AI Strategy Engine
         "mode": "AUTO",
+
         "lookback_minutes": 1,
-        # 0.001 = 0.10%
+
         "minimum_move_pct": 0.001,
     },
 
     "option": {
-        "min_dte": 3,
+
+        "min_dte": 1,
         "max_dte": 14,
+
         "min_delta": 0.40,
         "max_delta": 0.60,
+
         "max_premium": 15.00,
+
+        # 10% max bid/ask spread
         "max_spread_pct": 0.10,
-        # سناپشوت الخيارات لا يوفّر الحجم بشكل موثوق،
-        # لذلك الفلتر معطّل (0). ضع رقمًا فقط إذا جلبت الحجم من مصدر آخر.
-        "min_volume": 0,
+
         "min_open_interest": 100,
     },
 
     "risk": {
+
+        # أقصى مخاطرة من الحساب لكل صفقة
         "risk_per_trade_pct": 1.0,
+
         "max_daily_loss_pct": 3.0,
-        "max_trades_per_day": 10,
+
+        "max_trades_per_day": 5,
+
         "max_open_positions": 2,
+
         "max_contracts_per_trade": 5,
     },
 
     "exit": {
+
         "stop_loss_pct": 30.0,
+
         "take_profit_pct": 60.0,
+
         "trailing_enabled": True,
+
         "trailing_stop_pct": 15.0,
     },
-
 }
 
 
 # ============================================================
-#                      CLIENTS
+# CLIENTS
 # ============================================================
 
-trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER_MODE)
+trading_client = TradingClient(
+    API_KEY,
+    SECRET_KEY,
+    paper=PAPER_MODE,
+)
 
-stock_data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+stock_data_client = StockHistoricalDataClient(
+    API_KEY,
+    SECRET_KEY,
+)
 
-option_data_client = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
+option_data_client = OptionHistoricalDataClient(
+    API_KEY,
+    SECRET_KEY,
+)
 
 NY_TZ = ZoneInfo("America/New_York")
 
 
 # ============================================================
-#                      GLOBAL STATE
+# STATE
 # ============================================================
 
 trades_today = 0
@@ -132,41 +166,58 @@ state_date = datetime.now(NY_TZ).date()
 
 
 # ============================================================
-#                      LOGGING
+# LOG
 # ============================================================
 
 def log(message):
-    now = datetime.now(NY_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {message}", flush=True)
+
+    now = datetime.now(NY_TZ).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    print(
+        f"[{now}] {message}",
+        flush=True
+    )
 
 
 # ============================================================
-#                      ACCOUNT
+# ACCOUNT
 # ============================================================
 
 def get_account():
+
     try:
+
         return trading_client.get_account()
+
     except Exception as e:
-        log(f"ERROR account: {e}")
+
+        log(f"ACCOUNT ERROR: {e}")
+
         return None
 
 
 def get_equity():
+
     account = get_account()
+
     if not account:
         return 0.0
+
     try:
         return float(account.equity)
+
     except Exception:
         return 0.0
 
 
 # ============================================================
-#                      DAILY RESET
+# DAILY RESET
 # ============================================================
 
-def reset_daily_state_if_needed():
+def reset_daily_state():
+
     global trades_today
     global daily_realized_pnl
     global state_date
@@ -174,706 +225,1292 @@ def reset_daily_state_if_needed():
     today = datetime.now(NY_TZ).date()
 
     if today != state_date:
+
         trades_today = 0
+
         daily_realized_pnl = 0.0
+
         state_date = today
-        log("🔄 تم تصفير إحصائيات اليوم الجديد.")
+
+        log("🔄 Daily state reset.")
 
 
 # ============================================================
-#                      MARKET HOURS
+# MARKET
 # ============================================================
 
 def is_market_open():
+
     try:
+
         clock = trading_client.get_clock()
+
         return bool(clock.is_open)
+
     except Exception as e:
-        log(f"⚠️ مشكلة قراءة Market Clock: {e}")
+
+        log(f"CLOCK ERROR: {e}")
+
         return False
 
 
 def is_safe_trading_time():
-    current = datetime.now(NY_TZ).time()
+
+    now = datetime.now(NY_TZ).time()
 
     market_open = dt_time(9, 30)
-    first_15_minutes_end = dt_time(9, 45)
 
-    # تجنب أول 15 دقيقة
-    if market_open <= current < first_15_minutes_end:
+    first_15_end = dt_time(9, 45)
+
+    if market_open <= now < first_15_end:
+
         return False
 
     return True
 
 
 # ============================================================
-#                  SPY MARKET DIRECTION
+# SPY SIGNAL
 # ============================================================
 
 def get_spy_direction():
-    """نستخدم SPY كمرجع لاتجاه السوق."""
-
-    lookback_minutes = STRATEGY["signal"]["lookback_minutes"]
 
     now = datetime.now(NY_TZ)
-    start = now - timedelta(minutes=lookback_minutes + 2)
+
+    start = now - timedelta(minutes=5)
 
     try:
+
         request = StockBarsRequest(
+
             symbol_or_symbols="SPY",
+
             timeframe=TimeFrame.Minute,
+
             start=start,
+
             end=now,
         )
 
-        bars_response = stock_data_client.get_stock_bars(request)
-        bars = bars_response.data.get("SPY", [])
+        response = stock_data_client.get_stock_bars(
+            request
+        )
+
+        bars = response.data.get(
+            "SPY",
+            []
+        )
 
         if len(bars) < 2:
+
             return "NEUTRAL", 0.0
 
-        first_price = float(bars[0].close)
-        last_price = float(bars[-1].close)
+        first = float(
+            bars[0].close
+        )
 
-        if first_price <= 0:
+        last = float(
+            bars[-1].close
+        )
+
+        if first <= 0:
+
             return "NEUTRAL", 0.0
 
-        move_pct = (last_price - first_price) / first_price
+        move = (
+            last - first
+        ) / first
 
-        threshold = STRATEGY["signal"]["minimum_move_pct"]
+        threshold = STRATEGY[
+            "signal"
+        ][
+            "minimum_move_pct"
+        ]
 
-        if move_pct >= threshold:
-            return "BULLISH", move_pct
+        if move >= threshold:
 
-        if move_pct <= -threshold:
-            return "BEARISH", move_pct
+            return "BULLISH", move
 
-        return "NEUTRAL", move_pct
+        if move <= -threshold:
+
+            return "BEARISH", move
+
+        return "NEUTRAL", move
 
     except Exception as e:
-        log(f"⚠️ خطأ SPY direction: {e}")
+
+        log(f"SPY SIGNAL ERROR: {e}")
+
         return "NEUTRAL", 0.0
 
 
 # ============================================================
-#                  OPTION CONTRACTS
+# SIGNAL ENGINE
 # ============================================================
 
-def get_contracts(underlying, direction):
-    today = datetime.now(NY_TZ).date()
+def get_signal():
 
-    expiration_min = today + timedelta(days=STRATEGY["option"]["min_dte"])
-    expiration_max = today + timedelta(days=STRATEGY["option"]["max_dte"])
+    mode = STRATEGY[
+        "signal"
+    ][
+        "mode"
+    ]
 
-    option_type = (
-        ContractType.CALL if direction == "CALL" else ContractType.PUT
+    if mode == "CALL":
+
+        return "CALL", 0.0
+
+    if mode == "PUT":
+
+        return "PUT", 0.0
+
+    direction, move = get_spy_direction()
+
+    if direction == "BULLISH":
+
+        return "CALL", move
+
+    if direction == "BEARISH":
+
+        return "PUT", move
+
+    return None, move
+
+
+# ============================================================
+# OPTION CONTRACTS
+# ============================================================
+
+def get_contracts(
+    underlying,
+    direction,
+):
+
+    today = datetime.now(
+        NY_TZ
+    ).date()
+
+    min_dte = STRATEGY[
+        "option"
+    ][
+        "min_dte"
+    ]
+
+    max_dte = STRATEGY[
+        "option"
+    ][
+        "max_dte"
+    ]
+
+    expiration_min = (
+        today +
+        timedelta(days=min_dte)
+    )
+
+    expiration_max = (
+        today +
+        timedelta(days=max_dte)
+    )
+
+    contract_type = (
+
+        ContractType.CALL
+
+        if direction == "CALL"
+
+        else ContractType.PUT
     )
 
     try:
+
         request = GetOptionContractsRequest(
-            underlying_symbols=[underlying],
+
+            underlying_symbols=[
+                underlying
+            ],
+
             status=AssetStatus.ACTIVE,
-            expiration_date_gte=expiration_min,
-            expiration_date_lte=expiration_max,
-            type=option_type,
+
+            expiration_date_gte=
+                expiration_min,
+
+            expiration_date_lte=
+                expiration_max,
+
+            type=contract_type,
+
             limit=500,
         )
 
-        response = trading_client.get_option_contracts(request)
+        response = (
+            trading_client
+            .get_option_contracts(
+                request
+            )
+        )
 
         return response.option_contracts
 
     except Exception as e:
-        log(f"⚠️ خطأ جلب عقود {underlying}: {e}")
+
+        log(
+            f"CONTRACT ERROR "
+            f"{underlying}: {e}"
+        )
+
         return []
 
 
 # ============================================================
-#                  OPTION CHAIN / GREEKS
+# OPTION CHAIN
 # ============================================================
 
-def get_option_chain(underlying, direction):
-    option_type = (
-        ContractType.CALL if direction == "CALL" else ContractType.PUT
+def get_chain(
+    underlying,
+    direction,
+):
+
+    today = datetime.now(
+        NY_TZ
+    ).date()
+
+    min_dte = STRATEGY[
+        "option"
+    ][
+        "min_dte"
+    ]
+
+    max_dte = STRATEGY[
+        "option"
+    ][
+        "max_dte"
+    ]
+
+    contract_type = (
+
+        ContractType.CALL
+
+        if direction == "CALL"
+
+        else ContractType.PUT
     )
 
-    today = datetime.now(NY_TZ).date()
-
-    expiration_min = today + timedelta(days=STRATEGY["option"]["min_dte"])
-    expiration_max = today + timedelta(days=STRATEGY["option"]["max_dte"])
-
     try:
+
         request = OptionChainRequest(
-            underlying_symbol=underlying,
+
+            underlying_symbol=
+                underlying,
+
             feed=OPTIONS_FEED,
-            type=option_type,
-            expiration_date_gte=expiration_min,
-            expiration_date_lte=expiration_max,
+
+            type=contract_type,
+
+            expiration_date_gte=
+                today +
+                timedelta(days=min_dte),
+
+            expiration_date_lte=
+                today +
+                timedelta(days=max_dte),
         )
 
-        return option_data_client.get_option_chain(request)
+        return (
+            option_data_client
+            .get_option_chain(
+                request
+            )
+        )
 
     except Exception as e:
-        log(f"⚠️ خطأ Option Chain {underlying}: {e}")
+
+        log(
+            f"CHAIN ERROR "
+            f"{underlying}: {e}"
+        )
+
         return {}
 
 
 # ============================================================
-#                  OPTION SELECTION
+# SELECT CONTRACT
 # ============================================================
 
-def select_best_option(underlying, direction):
+def select_best_option(
+    underlying,
+    direction,
+):
 
-    contracts = get_contracts(underlying, direction)
+    contracts = get_contracts(
+        underlying,
+        direction
+    )
 
     if not contracts:
-        log(f"❌ لا توجد عقود مناسبة لـ {underlying}")
+
+        log(
+            f"❌ No contracts: "
+            f"{underlying}"
+        )
+
         return None
 
-    chain = get_option_chain(underlying, direction)
+    chain = get_chain(
+        underlying,
+        direction
+    )
 
     if not chain:
-        log(f"❌ لا توجد Option Chain لـ {underlying}")
+
+        log(
+            f"❌ No chain: "
+            f"{underlying}"
+        )
+
         return None
 
-    min_delta = STRATEGY["option"]["min_delta"]
-    max_delta = STRATEGY["option"]["max_delta"]
-    max_premium = STRATEGY["option"]["max_premium"]
-    max_spread = STRATEGY["option"]["max_spread_pct"]
-    min_volume = STRATEGY["option"]["min_volume"]
-    min_oi = STRATEGY["option"]["min_open_interest"]
+    contract_map = {
+        c.symbol: c
+        for c in contracts
+    }
+
+    min_delta = STRATEGY[
+        "option"
+    ][
+        "min_delta"
+    ]
+
+    max_delta = STRATEGY[
+        "option"
+    ][
+        "max_delta"
+    ]
+
+    max_premium = STRATEGY[
+        "option"
+    ][
+        "max_premium"
+    ]
+
+    max_spread = STRATEGY[
+        "option"
+    ][
+        "max_spread_pct"
+    ]
+
+    min_oi = STRATEGY[
+        "option"
+    ][
+        "min_open_interest"
+    ]
 
     candidates = []
 
-    contract_map = {c.symbol: c for c in contracts}
-
     for symbol, snapshot in chain.items():
 
-        contract = contract_map.get(symbol)
+        contract = contract_map.get(
+            symbol
+        )
 
         if not contract:
             continue
 
         try:
-            quote = snapshot.latest_quote
-            greeks = snapshot.greeks
 
-            if quote is None or greeks is None:
+            quote = (
+                snapshot.latest_quote
+            )
+
+            greeks = (
+                snapshot.greeks
+            )
+
+            if not quote or not greeks:
+
                 continue
 
-            bid = float(quote.bid_price or 0)
-            ask = float(quote.ask_price or 0)
+            bid = float(
+                quote.bid_price or 0
+            )
+
+            ask = float(
+                quote.ask_price or 0
+            )
 
             if bid <= 0 or ask <= 0:
-                continue
 
-            mid = (bid + ask) / 2
+                continue
 
             if ask > max_premium:
+
                 continue
 
-            spread_pct = (ask - bid) / ask
+            spread = (
+                (ask - bid) / ask
+            )
 
-            if spread_pct > max_spread:
+            if spread > max_spread:
+
                 continue
 
-            delta = abs(float(greeks.delta or 0))
+            delta = abs(
+                float(
+                    greeks.delta or 0
+                )
+            )
 
-            if not (min_delta <= delta <= max_delta):
+            if not (
+                min_delta
+                <= delta
+                <= max_delta
+            ):
+
                 continue
-
-            # --- FIX 1: الحجم ---
-            # السناپشوت لا يحتوي الحجم بشكل موثوق (كان يرجع 0
-            # فيُرفض كل عقد). الآن نقرأه إن وُجد فقط، وإلا -1 (غير معروف)
-            # ولا نرفض العقد بسببه.
-            raw_volume = getattr(snapshot, "volume", None)
-            volume = int(raw_volume) if raw_volume else -1
-
-            if min_volume > 0 and 0 <= volume < min_volume:
-                continue
-
-            # --- FIX 2: Open Interest ---
-            # القيمة الصحيحة موجودة في كائن العقد (Trading API)
-            # وليس في السناپشوت.
-            raw_oi = getattr(contract, "open_interest", None)
 
             try:
-                open_interest = int(raw_oi) if raw_oi else 0
-            except (TypeError, ValueError):
-                open_interest = 0
 
-            if open_interest < min_oi:
+                oi = int(
+                    float(
+                        getattr(
+                            contract,
+                            "open_interest",
+                            0
+                        ) or 0
+                    )
+                )
+
+            except Exception:
+
+                oi = 0
+
+            if oi < min_oi:
+
                 continue
 
-            expiration = contract.expiration_date
+            expiration = (
+                contract.expiration_date
+            )
 
-            if hasattr(expiration, "date"):
-                expiration = expiration.date()
+            if hasattr(
+                expiration,
+                "date"
+            ):
 
-            dte = (expiration - datetime.now(NY_TZ).date()).days
+                expiration = (
+                    expiration.date()
+                )
 
-            target_delta = (min_delta + max_delta) / 2
-            delta_distance = abs(delta - target_delta)
+            dte = (
+                expiration -
+                datetime.now(
+                    NY_TZ
+                ).date()
+            ).days
 
-            score = 0.0
-            score -= delta_distance * 100
-            score -= spread_pct * 100
-            score += math.log(max(open_interest, 1))
-            if volume > 0:
-                score += math.log(volume)
+            target_delta = (
+                min_delta +
+                max_delta
+            ) / 2
+
+            score = 0
+
+            score -= abs(
+                delta -
+                target_delta
+            ) * 100
+
+            score -= spread * 100
+
+            score += math.log(
+                max(oi, 1)
+            )
 
             candidates.append({
+
                 "symbol": symbol,
-                "underlying": underlying,
-                "direction": direction,
+
                 "bid": bid,
+
                 "ask": ask,
-                "mid": mid,
+
                 "delta": delta,
-                "gamma": float(greeks.gamma or 0),
-                "theta": float(greeks.theta or 0),
-                "vega": float(greeks.vega or 0),
-                "iv": float(getattr(snapshot, "implied_volatility", 0) or 0),
-                "volume": volume,
-                "open_interest": open_interest,
-                "expiration": str(expiration),
+
+                "oi": oi,
+
                 "dte": dte,
-                "strike": float(contract.strike_price),
+
+                "strike": float(
+                    contract.strike_price
+                ),
+
+                "expiration":
+                    str(expiration),
+
                 "score": score,
             })
 
         except Exception:
+
             continue
 
     if not candidates:
-        log(f"❌ لم نجد عقدًا يطابق الفلاتر لـ {underlying}")
+
+        log(
+            f"❌ No valid option "
+            f"for {underlying}"
+        )
+
         return None
 
-    candidates.sort(key=lambda x: x["score"], reverse=True)
+    candidates.sort(
+        key=lambda x:
+            x["score"],
+        reverse=True
+    )
 
     best = candidates[0]
 
-    log("🎯 أفضل عقد:")
-    log(f"   {best['symbol']}")
-    log(f"   Type: {best['direction']}")
-    log(f"   Strike: {best['strike']}")
-    log(f"   DTE: {best['dte']}")
-    log(f"   Bid/Ask: {best['bid']:.2f}/{best['ask']:.2f}")
-    log(f"   Delta: {best['delta']:.3f}")
-    log(f"   IV: {best['iv']:.3f}")
-    log(f"   Volume: {best['volume']}")
-    log(f"   OI: {best['open_interest']}")
+    log("🎯 SELECTED OPTION")
+
+    log(
+        f"Symbol: "
+        f"{best['symbol']}"
+    )
+
+    log(
+        f"Strike: "
+        f"{best['strike']}"
+    )
+
+    log(
+        f"DTE: "
+        f"{best['dte']}"
+    )
+
+    log(
+        f"Bid/Ask: "
+        f"{best['bid']:.2f}/"
+        f"{best['ask']:.2f}"
+    )
+
+    log(
+        f"Delta: "
+        f"{best['delta']:.3f}"
+    )
+
+    log(
+        f"OI: "
+        f"{best['oi']}"
+    )
 
     return best
 
 
 # ============================================================
-#                  RISK MANAGEMENT
+# POSITIONS
 # ============================================================
 
 def get_open_option_positions():
-    try:
-        positions = trading_client.get_all_positions()
 
-        options = []
+    try:
+
+        positions = (
+            trading_client
+            .get_all_positions()
+        )
+
+        result = []
 
         for position in positions:
-            asset_class = str(getattr(position, "asset_class", "")).lower()
-            symbol = str(position.symbol)
 
-            # رموز الخيارات (OSI) طويلة عادةً.
-            if "option" in asset_class or len(symbol) >= 15:
-                options.append(position)
+            asset_class = str(
+                getattr(
+                    position,
+                    "asset_class",
+                    ""
+                )
+            ).lower()
 
-        return options
+            symbol = str(
+                position.symbol
+            )
+
+            if (
+                "option"
+                in asset_class
+                or len(symbol) >= 15
+            ):
+
+                result.append(
+                    position
+                )
+
+        return result
 
     except Exception as e:
-        log(f"⚠️ خطأ قراءة المراكز: {e}")
+
+        log(
+            f"POSITION ERROR: {e}"
+        )
+
         return []
 
 
-def calculate_quantity(option_price, equity):
-    risk_pct = STRATEGY["risk"]["risk_per_trade_pct"]
-    max_contracts = STRATEGY["risk"]["max_contracts_per_trade"]
+# ============================================================
+# RISK
+# ============================================================
 
-    risk_budget = equity * risk_pct / 100
+def calculate_quantity(
+    option_price,
+    equity,
+):
 
-    # مضاعف العقد = 100
-    cost_per_contract = option_price * 100
+    risk_pct = STRATEGY[
+        "risk"
+    ][
+        "risk_per_trade_pct"
+    ]
 
-    if cost_per_contract <= 0:
+    max_contracts = STRATEGY[
+        "risk"
+    ][
+        "max_contracts_per_trade"
+    ]
+
+    budget = (
+        equity *
+        risk_pct /
+        100
+    )
+
+    contract_cost = (
+        option_price *
+        100
+    )
+
+    if contract_cost <= 0:
+
         return 0
 
-    # محافظ: نعتبر كامل الـ premium معرضًا للخسارة
-    quantity = math.floor(risk_budget / cost_per_contract)
-    quantity = min(quantity, max_contracts)
+    quantity = math.floor(
+        budget /
+        contract_cost
+    )
 
-    return max(quantity, 0)
+    quantity = min(
+        quantity,
+        max_contracts
+    )
+
+    return max(
+        quantity,
+        0
+    )
 
 
 def risk_allows_trade():
+
     equity = get_equity()
 
     if equity <= 0:
+
         return False
 
-    risk = STRATEGY["risk"]
+    risk = STRATEGY[
+        "risk"
+    ]
 
-    max_daily_loss = equity * risk["max_daily_loss_pct"] / 100
+    max_loss = (
+        equity *
+        risk[
+            "max_daily_loss_pct"
+        ] /
+        100
+    )
 
-    if daily_realized_pnl <= -max_daily_loss:
-        log("🛑 تم بلوغ Max Daily Loss.")
+    if (
+        daily_realized_pnl
+        <= -max_loss
+    ):
+
+        log(
+            "🛑 MAX DAILY LOSS"
+        )
+
         return False
 
-    if trades_today >= risk["max_trades_per_day"]:
-        log("🛑 تم بلوغ Max Trades/Day.")
+    if (
+        trades_today
+        >= risk[
+            "max_trades_per_day"
+        ]
+    ):
+
+        log(
+            "🛑 MAX TRADES/DAY"
+        )
+
         return False
 
-    if len(get_open_option_positions()) >= risk["max_open_positions"]:
-        log("🛑 Max Open Positions.")
+    if (
+        len(
+            get_open_option_positions()
+        )
+        >= risk[
+            "max_open_positions"
+        ]
+    ):
+
+        log(
+            "🛑 MAX OPEN POSITIONS"
+        )
+
         return False
 
     return True
 
 
 # ============================================================
-#                  ORDER EXECUTION
+# BUY
 # ============================================================
 
-def submit_buy(symbol, quantity, price):
+def submit_buy(
+    symbol,
+    quantity,
+    price,
+):
+
     try:
-        order_request = LimitOrderRequest(
+
+        request = LimitOrderRequest(
+
             symbol=symbol,
+
             qty=quantity,
+
             side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-            limit_price=round(price, 2),
+
+            time_in_force=
+                TimeInForce.DAY,
+
+            limit_price=
+                round(price, 2),
         )
 
-        order = trading_client.submit_order(order_request)
+        order = (
+            trading_client
+            .submit_order(request)
+        )
 
-        log(f"📤 BUY ORDER: {symbol} x{quantity} @ ${price:.2f}")
+        log(
+            f"📤 BUY "
+            f"{symbol} "
+            f"x{quantity} "
+            f"@ {price:.2f}"
+        )
 
         return order
 
     except Exception as e:
-        log(f"❌ فشل أمر الشراء: {e}")
+
+        log(
+            f"❌ BUY ERROR: {e}"
+        )
+
         return None
 
 
-def wait_for_fill(order, timeout_seconds=20):
-    """
-    يرجع (filled_price, filled_qty) أو (None, 0).
-    """
+# ============================================================
+# WAIT FILL
+# ============================================================
+
+def wait_for_fill(
+    order,
+    timeout=20,
+):
 
     start = time.time()
 
-    while time.time() - start < timeout_seconds:
-        try:
-            current = trading_client.get_order_by_id(order.id)
+    while (
+        time.time() -
+        start
+        < timeout
+    ):
 
-            status = str(getattr(current.status, "value", current.status)).lower()
+        try:
+
+            current = (
+                trading_client
+                .get_order_by_id(
+                    order.id
+                )
+            )
+
+            status = str(
+                getattr(
+                    current.status,
+                    "value",
+                    current.status
+                )
+            ).lower()
 
             if status == "filled":
-                filled_price = float(current.filled_avg_price)
-                filled_qty = int(float(current.filled_qty))
-                log(f"✅ تم التنفيذ @ ${filled_price:.2f}")
-                return filled_price, filled_qty
 
-            if status in ("canceled", "expired", "rejected"):
-                log(f"❌ Order {status}")
+                price = float(
+                    current.filled_avg_price
+                )
+
+                qty = int(
+                    float(
+                        current.filled_qty
+                    )
+                )
+
+                log(
+                    f"✅ FILLED "
+                    f"{qty} @ {price:.2f}"
+                )
+
+                return price, qty
+
+            if status in (
+                "canceled",
+                "expired",
+                "rejected",
+            ):
+
                 return None, 0
 
         except Exception as e:
-            log(f"⚠️ مشكلة متابعة الأمر: {e}")
+
+            log(
+                f"ORDER CHECK ERROR: {e}"
+            )
 
         time.sleep(1)
 
-    # --- FIX 3: إلغاء الأمر المعلّق ---
-    # سابقًا كان الأمر يبقى حيًا بعد انتهاء المهلة وقد يتنفذ لاحقًا
-    # بدون مراقبة أو وقف خسارة. الآن نلغيه ونتحقق من التنفيذ الجزئي.
-    log("⏱️ انتهت مهلة انتظار التنفيذ، محاولة إلغاء الأمر.")
-
     try:
-        trading_client.cancel_order_by_id(order.id)
-    except Exception as e:
-        log(f"⚠️ فشل إلغاء الأمر: {e}")
 
-    time.sleep(1)
+        trading_client.cancel_order_by_id(
+            order.id
+        )
 
-    try:
-        current = trading_client.get_order_by_id(order.id)
-        filled_qty = int(float(getattr(current, "filled_qty", 0) or 0))
+    except Exception:
 
-        if filled_qty > 0:
-            filled_price = float(current.filled_avg_price)
-            log(f"⚠️ تنفيذ جزئي: {filled_qty} @ ${filled_price:.2f}")
-            return filled_price, filled_qty
-
-    except Exception as e:
-        log(f"⚠️ تعذر التحقق من الأمر بعد الإلغاء: {e}")
+        pass
 
     return None, 0
 
 
-def submit_sell(symbol, quantity):
+# ============================================================
+# SELL
+# ============================================================
+
+def submit_sell(
+    symbol,
+    quantity,
+):
+
     try:
-        order = trading_client.submit_order(
-            MarketOrderRequest(
-                symbol=symbol,
-                qty=quantity,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.DAY,
-            )
+
+        request = MarketOrderRequest(
+
+            symbol=symbol,
+
+            qty=quantity,
+
+            side=OrderSide.SELL,
+
+            time_in_force=
+                TimeInForce.DAY,
         )
 
-        log(f"📤 SELL: {symbol} x{quantity}")
+        order = (
+            trading_client
+            .submit_order(request)
+        )
+
+        log(
+            f"📤 SELL "
+            f"{symbol} "
+            f"x{quantity}"
+        )
 
         return order
 
     except Exception as e:
-        log(f"❌ فشل البيع: {e}")
+
+        log(
+            f"❌ SELL ERROR: {e}"
+        )
+
         return None
 
 
 # ============================================================
-#                  POSITION MONITOR
+# MONITOR
 # ============================================================
 
-def record_pnl(entry_price, exit_price, quantity):
-    # --- FIX 4: تتبّع الربح/الخسارة اليومية ---
-    # كان المتغير يبقى 0 دائمًا فيتعطل حد الخسارة اليومي.
+def monitor_position(
+    symbol,
+    quantity,
+    entry_price,
+):
+
     global daily_realized_pnl
 
-    pnl = (exit_price - entry_price) * quantity * 100
-    daily_realized_pnl += pnl
+    stop = (
+        entry_price *
+        (
+            1 -
+            STRATEGY[
+                "exit"
+            ][
+                "stop_loss_pct"
+            ] /
+            100
+        )
+    )
 
-    log(f"📒 PnL الصفقة: ${pnl:.2f} | إجمالي اليوم: ${daily_realized_pnl:.2f}")
+    target = (
+        entry_price *
+        (
+            1 +
+            STRATEGY[
+                "exit"
+            ][
+                "take_profit_pct"
+            ] /
+            100
+        )
+    )
 
+    highest = entry_price
 
-def monitor_position(symbol, quantity, entry_price):
-
-    stop_pct = STRATEGY["exit"]["stop_loss_pct"]
-    take_profit_pct = STRATEGY["exit"]["take_profit_pct"]
-    trailing_enabled = STRATEGY["exit"]["trailing_enabled"]
-    trailing_pct = STRATEGY["exit"]["trailing_stop_pct"]
-
-    stop_price = entry_price * (1 - stop_pct / 100)
-    target_price = entry_price * (1 + take_profit_pct / 100)
-
-    highest_price = entry_price
-    last_price = entry_price
-
-    log(f"🛡️ مراقبة {symbol}")
     log(
-        f"Entry=${entry_price:.2f} | "
-        f"SL=${stop_price:.2f} | "
-        f"TP=${target_price:.2f}"
+        f"🛡️ MONITOR "
+        f"{symbol}"
     )
 
     while True:
+
         try:
-            quote_request = OptionLatestQuoteRequest(
-                symbol_or_symbols=symbol,
-                feed=OPTIONS_FEED,
+
+            request = (
+                OptionLatestQuoteRequest(
+                    symbol_or_symbols=symbol,
+                    feed=OPTIONS_FEED,
+                )
             )
 
-            quotes = option_data_client.get_option_latest_quote(quote_request)
+            quotes = (
+                option_data_client
+                .get_option_latest_quote(
+                    request
+                )
+            )
 
-            quote = quotes.get(symbol)
+            quote = quotes.get(
+                symbol
+            )
 
             if quote:
-                bid = float(quote.bid_price or 0)
+
+                bid = float(
+                    quote.bid_price or 0
+                )
 
                 if bid > 0:
-                    current_price = bid
-                    last_price = bid
 
-                    if current_price > highest_price:
-                        highest_price = current_price
+                    current = bid
 
-                        if trailing_enabled:
-                            new_stop = highest_price * (1 - trailing_pct / 100)
+                    if current > highest:
 
-                            if new_stop > stop_price:
-                                stop_price = new_stop
-                                log(f"📈 Trailing Stop → ${stop_price:.2f}")
+                        highest = current
+
+                        if STRATEGY[
+                            "exit"
+                        ][
+                            "trailing_enabled"
+                        ]:
+
+                            trailing = (
+                                highest *
+                                (
+                                    1 -
+                                    STRATEGY[
+                                        "exit"
+                                    ][
+                                        "trailing_stop_pct"
+                                    ] /
+                                    100
+                                )
+                            )
+
+                            stop = max(
+                                stop,
+                                trailing
+                            )
 
                     log(
-                        f"📊 {symbol} | "
-                        f"Bid=${current_price:.2f} | "
-                        f"SL=${stop_price:.2f} | "
-                        f"TP=${target_price:.2f}"
+                        f"📊 {symbol} "
+                        f"Bid={current:.2f} "
+                        f"SL={stop:.2f} "
+                        f"TP={target:.2f}"
                     )
 
-                    if current_price >= target_price:
-                        log("💰 TAKE PROFIT")
-                        submit_sell(symbol, quantity)
-                        record_pnl(entry_price, current_price, quantity)
+                    if current >= target:
+
+                        exit_price = current
+
+                        submit_sell(
+                            symbol,
+                            quantity
+                        )
+
+                        pnl = (
+                            exit_price -
+                            entry_price
+                        ) * quantity * 100
+
+                        daily_realized_pnl += pnl
+
+                        log(
+                            f"💰 TP "
+                            f"PnL=${pnl:.2f}"
+                        )
+
                         return
 
-                    if current_price <= stop_price:
-                        log("🛑 STOP LOSS")
-                        submit_sell(symbol, quantity)
-                        record_pnl(entry_price, current_price, quantity)
+                    if current <= stop:
+
+                        exit_price = current
+
+                        submit_sell(
+                            symbol,
+                            quantity
+                        )
+
+                        pnl = (
+                            exit_price -
+                            entry_price
+                        ) * quantity * 100
+
+                        daily_realized_pnl += pnl
+
+                        log(
+                            f"🛑 SL "
+                            f"PnL=${pnl:.2f}"
+                        )
+
                         return
 
-            # --- FIX 5: إغلاق المركز عند إغلاق السوق ---
-            # سابقًا كانت الدالة تخرج وتترك المركز مفتوحًا.
             if not is_market_open():
-                log("🔔 السوق مغلق، إغلاق المركز.")
-                submit_sell(symbol, quantity)
-                record_pnl(entry_price, last_price, quantity)
+
+                log(
+                    "🔔 MARKET CLOSED"
+                )
+
                 return
 
             time.sleep(2)
 
         except Exception as e:
-            log(f"⚠️ Monitor error: {e}")
+
+            log(
+                f"MONITOR ERROR: {e}"
+            )
+
             time.sleep(2)
 
 
 # ============================================================
-#                  SIGNAL ENGINE
+# SCAN
 # ============================================================
 
-def get_signal_for_underlying(underlying):
-    mode = STRATEGY["signal"]["mode"]
+def scan():
 
-    if mode == "AUTO":
-        direction, move = get_spy_direction()
-
-        if direction == "BULLISH":
-            return "CALL", move
-
-        if direction == "BEARISH":
-            return "PUT", move
-
-        return None, move
-
-    if mode == "CALL":
-        return "CALL", 0.0
-
-    if mode == "PUT":
-        return "PUT", 0.0
-
-    return None, 0.0
-
-
-# ============================================================
-#                  MAIN SCAN
-# ============================================================
-
-def scan_for_trade():
     global trades_today
 
-    reset_daily_state_if_needed()
+    reset_daily_state()
 
     if not is_market_open():
+
         return
 
     if not is_safe_trading_time():
+
         return
 
     if not risk_allows_trade():
+
         return
 
-    for underlying in STRATEGY["underlyings"]:
+    direction, move = get_signal()
 
-        direction, move = get_signal_for_underlying(underlying)
+    if not direction:
 
-        if not direction:
-            continue
+        return
 
-        log(
-            f"🔎 SIGNAL: {underlying} {direction} "
-            f"move={move * 100:.3f}%"
+    log(
+        f"🔎 SIGNAL "
+        f"{direction} "
+        f"move={move * 100:.3f}%"
+    )
+
+    for underlying in STRATEGY[
+        "underlyings"
+    ]:
+
+        option = (
+            select_best_option(
+                underlying,
+                direction
+            )
         )
 
-        contract = select_best_option(underlying, direction)
+        if not option:
 
-        if not contract:
             continue
 
         equity = get_equity()
 
-        quantity = calculate_quantity(contract["ask"], equity)
+        qty = calculate_quantity(
+            option["ask"],
+            equity
+        )
 
-        if quantity <= 0:
-            log("⚠️ رأس المال غير كافٍ لشراء عقد واحد ضمن Risk Limit.")
+        if qty <= 0:
+
+            log(
+                "⚠️ Risk budget "
+                "cannot buy 1 contract."
+            )
+
             continue
 
-        order = submit_buy(contract["symbol"], quantity, contract["ask"])
+        order = submit_buy(
+            option["symbol"],
+            qty,
+            option["ask"]
+        )
 
         if not order:
+
             continue
 
-        filled_price, filled_qty = wait_for_fill(order)
+        filled_price, filled_qty = (
+            wait_for_fill(order)
+        )
 
-        if filled_price is None or filled_qty <= 0:
+        if not filled_price:
+
             continue
 
         trades_today += 1
 
-        log(f"🚀 دخلت الصفقة رقم {trades_today} اليوم.")
+        log(
+            f"🚀 TRADE "
+            f"#{trades_today}"
+        )
 
-        # نراقب الكمية المنفذة فعليًا (قد تكون جزئية)
-        monitor_position(contract["symbol"], filled_qty, filled_price)
+        monitor_position(
+            option["symbol"],
+            filled_qty,
+            filled_price
+        )
 
-        # صفقة واحدة في كل دورة
         break
 
 
 # ============================================================
-#                  STARTUP
+# STARTUP
 # ============================================================
 
-def print_startup():
-    log("================================================")
-    log("🚀 PROFESSIONAL OPTIONS BOT V1")
-    log("================================================")
-    log(f"Paper Trading: {PAPER_MODE}")
-    log(f"Options Feed: {OPTIONS_FEED}")
-    log(f"Underlyings: {STRATEGY['underlyings']}")
+def startup():
+
     log(
-        f"Delta: {STRATEGY['option']['min_delta']} - "
-        f"{STRATEGY['option']['max_delta']}"
+        "================================"
     )
+
     log(
-        f"DTE: {STRATEGY['option']['min_dte']} - "
-        f"{STRATEGY['option']['max_dte']}"
+        "🚀 PROFESSIONAL OPTIONS BOT"
     )
-    log(f"Risk/Trade: {STRATEGY['risk']['risk_per_trade_pct']}%")
-    log(f"Daily Loss Limit: {STRATEGY['risk']['max_daily_loss_pct']}%")
-    log("================================================")
+
+    log(
+        "================================"
+    )
+
+    log(
+        f"Paper: {PAPER_MODE}"
+    )
+
+    log(
+        f"Feed: {OPTIONS_FEED.value}"
+    )
+
+    log(
+        f"Underlyings: "
+        f"{STRATEGY['underlyings']}"
+    )
 
     account = get_account()
 
     if account:
-        log(f"💰 Cash: {account.cash}")
-        log(f"💰 Equity: {account.equity}")
-        log(f"💰 Buying Power: {account.buying_power}")
+
+        log(
+            f"Cash: {account.cash}"
+        )
+
+        log(
+            f"Equity: {account.equity}"
+        )
+
+        log(
+            f"Buying Power: "
+            f"{account.buying_power}"
+        )
+
+        log(
+            f"Options Buying Power: "
+            f"{getattr(account, 'options_buying_power', 'N/A')}"
+        )
+
     else:
-        log("❌ لم نستطع قراءة الحساب.")
+
+        log(
+            "❌ ACCOUNT CONNECTION FAILED"
+        )
 
 
 # ============================================================
-#                  PROGRAM
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
 
-    print_startup()
+    startup()
 
     while True:
+
         try:
-            scan_for_trade()
+
+            scan()
+
             time.sleep(10)
 
         except KeyboardInterrupt:
-            log("🛑 تم إيقاف البوت يدويًا.")
+
+            log(
+                "🛑 BOT STOPPED"
+            )
+
             break
 
         except Exception as e:
-            log(f"🔥 Main Error: {e}")
+
+            log(
+                f"🔥 MAIN ERROR: {e}"
+            )
+
             time.sleep(10)
