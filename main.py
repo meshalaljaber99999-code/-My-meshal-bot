@@ -35,8 +35,17 @@ from alpaca.data.enums import DataFeed, OptionsFeed
 # CONFIG
 # ============================================================
 
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+ALPACA_API_KEY = (
+    os.getenv("APCA_API_KEY_ID")
+    or os.getenv("ALPACA_API_KEY")
+    or os.getenv("API_KEY")
+)
+
+ALPACA_SECRET_KEY = (
+    os.getenv("APCA_API_SECRET_KEY")
+    or os.getenv("ALPACA_SECRET_KEY")
+    or os.getenv("SECRET_KEY")
+)
 
 if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
     print("❌ ALPACA_API_KEY / ALPACA_SECRET_KEY غير موجودة.")
@@ -676,7 +685,7 @@ def select_option(symbol, direction):
         return None
 
     except Exception as e:
-        print(f"⚠️ select_option error: {e}")
+        print(f"⚠️️ select_option error: {e}")
         return None
 
 
