@@ -197,4 +197,8 @@ def reset_daily_state():
 
 def is_market_open():
     try:
-        clock = trading_
+        clock = trading_client.get_clock()
+        return clock.is_open
+    except Exception as e:
+        log(f"CLOCK ERROR: {e}")
+        return False
