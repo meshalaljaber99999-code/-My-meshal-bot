@@ -1,5 +1,6 @@
-alpaca-py>=0.43.2
-scikit-learn
-pandas
-numpy
+alpaca-py
+lightgbm
 optuna
+numpy
+pandas
+scikit-learn
