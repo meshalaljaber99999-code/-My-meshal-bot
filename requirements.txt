@@ -1,5 +1,4 @@
 alpaca-py>=0.43.2
-lightgbm
 scikit-learn
 pandas
 numpy
