@@ -14,5 +14,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # نسخ باقي ملفات المشروع
 COPY . .
 
-# تشغيل البوت
-CMD ["python", "main.py"]
+# تشغيل البوت مع تفعيل المخرجات الفورية
+CMD ["python", "-u", "main.py"]
