@@ -9,8 +9,6 @@ import lightgbm as lgb
 from sklearn.ensemble import RandomForestClassifier
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
-from flask import Flask
-import threading
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -37,19 +35,6 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed, OptionsFeed
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-# ============================================================
-# FLASK WEB SERVER FOR RAILWAY HEALTH CHECK
-# ============================================================
-app = Flask(__name__)
-
-@app.route("/")
-def health_check():
-    return "Bot is running live and healthy!", 200
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ============================================================
 # CONFIG & SETTINGS
@@ -264,7 +249,6 @@ def is_market_open():
 # ADVANCED GATES: SOCIAL SENTIMENT RADAR & MACRO CALENDAR
 # ============================================================
 def check_social_media_sentiment(symbol):
-    """رادار مشاعر منصات التواصل الاجتماعي ومجتمعات التداول (Reddit/X Hype)"""
     try:
         end = datetime.now(ET)
         start = end - timedelta(hours=4)
@@ -447,7 +431,6 @@ class MultiModelEnsembleEngine:
         self.last_trained_date = ""
 
     def optimize_hyperparameters_optuna(self, X_train, y_train):
-        """التحسين الذاتي المستمر للمعاملات عبر Optuna (Hyperparameter Auto-Tuning)"""
         try:
             def objective(trial):
                 n_est = trial.suggest_int('n_estimators', 20, 100, step=20)
@@ -639,7 +622,6 @@ def enter_position(symbol, direction, confidence, vix_val=15.0):
     is_calendar_ok, _ = check_earnings_and_macro_calendar(symbol)
     if not is_calendar_ok: return False
 
-    # فحص رادار مشاعر منصات التواصل الاجتماعي
     is_social_ok, _ = check_social_media_sentiment(symbol)
     if not is_social_ok: return False
 
@@ -851,10 +833,9 @@ def main():
             time.sleep(ERROR_SLEEP_SECONDS)
 
 # ============================================================
-# RAILWAY STARTUP
+# EXECUTION ENTRYPOINT
 # ============================================================
-
-def start_trading_engine():
+if __name__ == "__main__":
     log_print("=" * 70)
     log_print("🤖 TRADING ENGINE STARTING...")
     log_print("📡 MARKET DATA ENGINE READY")
@@ -868,13 +849,3 @@ def start_trading_engine():
     except Exception as e:
         log_print(f"🚨 TRADING ENGINE CRASHED: {e}")
         raise
-
-
-# Start the trading engine when Gunicorn imports main:app
-trading_thread = threading.Thread(
-    target=start_trading_engine,
-    daemon=True,
-    name="TradingEngine"
-)
-
-trading_thread.start()
