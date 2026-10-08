@@ -9,6 +9,8 @@ import lightgbm as lgb
 from sklearn.ensemble import RandomForestClassifier
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
+from flask import Flask
+import threading
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -35,6 +37,19 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed, OptionsFeed
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# ============================================================
+# FLASK WEB SERVER FOR RAILWAY HEALTH CHECK
+# ============================================================
+app = Flask(__name__)
+
+@app.route("/")
+def health_check():
+    return "Bot is running live and healthy!", 200
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ============================================================
 # CONFIG & SETTINGS
@@ -836,4 +851,10 @@ def main():
             time.sleep(ERROR_SLEEP_SECONDS)
 
 if __name__ == "__main__":
+    # تشغيل خادم الويب في الخلفية لإرضاء منصة Railway
+    server_thread = threading.Thread(target=run_web_server, daemon=True)
+    server_thread.start()
+    log_print("🌐 Background Web Server started for Railway health check.")
+    
+    # تشغيل البوت الأساسي
     main()
