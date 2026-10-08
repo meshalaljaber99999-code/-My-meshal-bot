@@ -5,3 +5,4 @@ numpy
 pandas
 scikit-learn
 flask
+CMD ["gunicorn", "main:app", "--bind", "0.0.0.0:8080"]
