@@ -1,21 +1,23 @@
 # ============================================================
-# SPX/STOCK OPTIONS PAPER BOT - DEBUG / TRANSPARENT v16.2
-# ============================================================
-# PAPER ONLY
+# SPX/STOCK OPTIONS PAPER BOT
+# DEBUG / TRANSPARENT v16.2
 #
-# v16.2 MAJOR FIXES:
-#   1) VIX unavailable = HARD WAIT / NO NEW ENTRIES
-#   2) LGB + RF must agree on direction
-#   3) Confidence is NOT raw max(predict_proba)
-#   4) Time-series validation added
-#   5) Latest market bar is NOT used as training target
-#   6) VIX fallback through yfinance (^VIX)
-#   7) Freshness checks
-#   8) Real option quote filters
-#   9) Real delta/IV when available
-#  10) No fake Delta/IV/Spread values
-#  11) Strong data-health logging
-#  12) PAPER ONLY
+# MAJOR CHANGES:
+#   - LGB + RF MUST AGREE
+#   - No fake confidence interpretation
+#   - Time-series validation
+#   - Stronger ML signal filtering
+#   - Real option quote filtering
+#   - Real spread calculation
+#   - Real delta/IV when available
+#   - Data freshness checks
+#   - VIX unavailable handled safely
+#   - Patient mode / no forced trades
+#   - PAPER ONLY
+#
+# IMPORTANT:
+#   This bot does NOT guarantee profitability.
+#   ML confidence is NOT probability of winning a trade.
 # ============================================================
 
 import os
@@ -29,8 +31,10 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, log_loss
+
 import yfinance as yf
 
 from alpaca.trading.client import TradingClient
@@ -39,7 +43,11 @@ from alpaca.trading.requests import (
     LimitOrderRequest,
     MarketOrderRequest,
 )
-from alpaca.trading.enums import AssetStatus, OrderSide, TimeInForce
+from alpaca.trading.enums import (
+    AssetStatus,
+    OrderSide,
+    TimeInForce,
+)
 
 from alpaca.data.historical import (
     StockHistoricalDataClient,
@@ -52,8 +60,12 @@ from alpaca.data.requests import (
     OptionSnapshotRequest,
     NewsRequest,
 )
+
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed, OptionsFeed
+from alpaca.data.enums import (
+    DataFeed,
+    OptionsFeed,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -91,14 +103,13 @@ if not PAPER_MODE:
 
 
 # ============================================================
-# MARKET DATA
+# DATA
 # ============================================================
 
 STOCK_FEED = DataFeed.IEX
 OPTIONS_FEED = OptionsFeed.INDICATIVE
 
 ET = ZoneInfo("America/New_York")
-
 
 DEFAULT_TARGET_UNDERLYINGS = [
     "AAPL",
@@ -116,10 +127,14 @@ DEFAULT_TARGET_UNDERLYINGS = [
 SECTOR_MAP = {
     "NVDA": "SEMI",
     "AMD": "SEMI",
+
     "AAPL": "TECH",
     "MSFT": "TECH",
+
     "TSLA": "AUTO",
+
     "AMZN": "RETAIL",
+
     "META": "COMM",
     "GOOGL": "COMM",
     "NFLX": "COMM",
@@ -140,26 +155,19 @@ MAX_OPEN_POSITIONS = 2
 
 MAX_DAILY_LOSS_USD = -200.0
 
-# Minimum confidence required after ensemble checks
-BASE_CONFIDENCE_THRESHOLD = 0.78
+# Stronger than old 78%
+BASE_CONFIDENCE_THRESHOLD = 0.80
 
-# Agreement requirement
+# Required difference between first and second probability.
+MIN_PROBABILITY_MARGIN = 0.12
+
+# Models must agree.
 REQUIRE_MODEL_AGREEMENT = True
 
-# Minimum validation accuracy
-MIN_VALIDATION_ACCURACY = 0.55
-
-# Minimum number of labeled samples
-MIN_TRAINING_ROWS = 80
-
-# Minimum bars required
-MIN_BARS_REQUIRED = 100
-
-# Freshness
-MAX_BAR_AGE_MINUTES = 10
-
+# Maximum portfolio delta.
 MAX_NET_PORTFOLIO_DELTA = 6.0
 
+# Options selection.
 MIN_DTE = 1
 MAX_DTE = 14
 
@@ -168,16 +176,37 @@ MAX_DELTA = 0.60
 
 MAX_PREMIUM = 15.00
 
+# 10% max spread.
 BASE_MAX_SPREAD_PCT = 0.10
 
 MAX_IV_RANK = 0.85
 
 MAX_VIX_THRESHOLD = 30.0
 
-SCAN_INTERVAL_SECONDS = 60
-ERROR_SLEEP_SECONDS = 20
+# Option stop loss.
+OPTION_STOP_LOSS_PCT = -0.30
 
-DB_FILE = "institutional_bot_v16_2.db"
+# Minimum expected move from ML.
+MIN_EXPECTED_MOVE = 0.002
+
+# Data freshness.
+MAX_DATA_AGE_MINUTES = 10
+
+# Patient mode.
+SCAN_INTERVAL_SECONDS = 60
+
+# Avoid repeatedly entering same underlying immediately.
+SYMBOL_COOLDOWN_MINUTES = 20
+
+ERROR_SLEEP_SECONDS = 20
+MAX_CONSECUTIVE_ERRORS = 5
+
+DB_FILE = "institutional_bot_v162.db"
+
+
+# ============================================================
+# OUTPUT
+# ============================================================
 
 PRINT_NO_TRADE_DETAILS = True
 PRINT_EVERY_SYMBOL = True
@@ -220,9 +249,9 @@ def log_print(msg):
 
 def log_section(title):
     log_print("")
-    log_print("=" * 78)
+    log_print("=" * 76)
     log_print(title)
-    log_print("=" * 78)
+    log_print("=" * 76)
 
 
 def log_decision(symbol, direction, confidence, reason):
@@ -233,7 +262,7 @@ def log_decision(symbol, direction, confidence, reason):
 
 
 # ============================================================
-# FAKE BAR OBJECT
+# FAKE BAR
 # ============================================================
 
 class FakeBar:
@@ -248,64 +277,18 @@ class FakeBar:
 
 
 # ============================================================
-# BAR TIMESTAMP HELPER
+# DATA HELPERS
 # ============================================================
 
-def get_bar_timestamp(bar):
+def normalize_yf_value(value):
 
-    for attr in [
-        "timestamp",
-        "time",
-        "t",
-        "datetime",
-    ]:
-        value = getattr(bar, attr, None)
+    if isinstance(value, pd.Series):
+        if len(value) == 0:
+            return np.nan
+        return value.iloc[0]
 
-        if value is not None:
-            try:
-                if isinstance(value, pd.Timestamp):
-                    if value.tzinfo is None:
-                        value = value.tz_localize("UTC")
-                    return value.to_pydatetime().astimezone(ET)
+    return value
 
-                if isinstance(value, datetime):
-                    if value.tzinfo is None:
-                        value = value.replace(tzinfo=ZoneInfo("UTC"))
-                    return value.astimezone(ET)
-
-            except Exception:
-                pass
-
-    return None
-
-
-def bars_are_fresh(bars, max_age_minutes=MAX_BAR_AGE_MINUTES):
-
-    if not bars:
-        return False, "NO BARS"
-
-    ts = get_bar_timestamp(bars[-1])
-
-    # Some data providers don't expose timestamps in the bar object.
-    # Do not falsely reject valid data if timestamp is unavailable.
-    if ts is None:
-        return True, "TIMESTAMP UNKNOWN"
-
-    now = datetime.now(ET)
-    age_minutes = (now - ts).total_seconds() / 60.0
-
-    if age_minutes < 0:
-        return True, f"FUTURE/REALTIME BAR ({age_minutes:.1f}m)"
-
-    if age_minutes > max_age_minutes:
-        return False, f"STALE ({age_minutes:.1f}m)"
-
-    return True, f"FRESH ({age_minutes:.1f}m)"
-
-
-# ============================================================
-# ROBUST STOCK DATA LOADER
-# ============================================================
 
 def fetch_stock_bars_robust(
     symbol,
@@ -314,9 +297,17 @@ def fetch_stock_bars_robust(
     end,
     purpose="SCAN",
 ):
+    """
+    Data priority:
+
+        1. Alpaca IEX
+        2. yfinance fallback
+
+    Never fabricates market bars.
+    """
 
     # --------------------------------------------------------
-    # 1) Alpaca IEX
+    # 1. ALPACA IEX
     # --------------------------------------------------------
 
     try:
@@ -337,145 +328,126 @@ def fetch_stock_bars_robust(
 
             if bars and len(bars) > 0:
 
-                fresh, fresh_reason = bars_are_fresh(bars)
-
-                if purpose == "HEALTH_CHECK":
-                    return bars, (
-                        f"DATA OK (IEX, {len(bars)} bars) | "
-                        f"{fresh_reason}"
-                    )
-
-                if not fresh:
-                    return None, (
-                        f"STALE STOCK DATA | {fresh_reason}"
-                    )
-
-                return bars, (
-                    f"DATA OK (IEX, {len(bars)} bars) | "
-                    f"{fresh_reason}"
+                return (
+                    bars,
+                    f"DATA OK (IEX, {len(bars)} bars)",
                 )
 
     except Exception as e:
 
-        if PRINT_NO_TRADE_DETAILS:
+        if purpose != "HEALTH_CHECK":
+
             log_print(
-                f"      ⚠️ IEX failed for {symbol}: "
+                f"      ⚠️ Alpaca IEX failed {symbol}: "
                 f"{str(e)[:100]}"
             )
 
 
     # --------------------------------------------------------
-    # 2) yfinance fallback
+    # 2. YFINANCE FALLBACK
     # --------------------------------------------------------
 
     try:
 
-        if timeframe == TimeFrame.Hour:
+        if timeframe == TimeFrame.Minute:
+            yf_tf = "1m"
+        elif timeframe == TimeFrame.Hour:
             yf_tf = "1h"
         else:
-            yf_tf = "1m"
+            yf_tf = "1h"
+
+
+        # yfinance 1m has a short historical limit.
+        # Use a safer recent window.
+        yf_end = end
+        yf_start = start
+
+        if yf_tf == "1m":
+
+            max_start = yf_end - timedelta(days=6)
+
+            if yf_start < max_start:
+                yf_start = max_start
+
 
         df_yf = yf.download(
             symbol,
-            start=start,
-            end=end,
+            start=yf_start,
+            end=yf_end,
             interval=yf_tf,
             progress=False,
             auto_adjust=False,
             prepost=False,
         )
 
-        if not df_yf.empty:
 
-            bars = []
+        if df_yf is None or df_yf.empty:
 
-            for idx, row in df_yf.iterrows():
+            return (
+                None,
+                "NO STOCK BAR DATA | All sources failed",
+            )
 
-                try:
 
-                    def val(col):
-                        x = row[col]
+        bars = []
 
-                        if isinstance(x, pd.Series):
-                            x = x.iloc[0]
+        for idx, row in df_yf.iterrows():
 
-                        return float(x)
+            try:
 
-                    o = val("Open")
-                    h = val("High")
-                    l = val("Low")
-                    c = val("Close")
-                    v = val("Volume")
+                o = normalize_yf_value(row["Open"])
+                h = normalize_yf_value(row["High"])
+                l = normalize_yf_value(row["Low"])
+                c = normalize_yf_value(row["Close"])
+                v = normalize_yf_value(row["Volume"])
 
-                    if pd.isna(c):
-                        continue
-
-                    timestamp = None
-
-                    try:
-                        timestamp = pd.Timestamp(idx)
-
-                        if timestamp.tzinfo is None:
-                            timestamp = timestamp.tz_localize("UTC")
-
-                        timestamp = timestamp.to_pydatetime()
-
-                    except Exception:
-                        timestamp = None
-
-                    bars.append(
-                        FakeBar(
-                            o,
-                            h,
-                            l,
-                            c,
-                            v,
-                            timestamp,
-                        )
-                    )
-
-                except Exception:
+                if pd.isna(c):
                     continue
 
-            if bars:
-
-                fresh, fresh_reason = bars_are_fresh(bars)
-
-                if purpose == "HEALTH_CHECK":
-
-                    return bars, (
-                        f"DATA OK (YFINANCE FALLBACK, "
-                        f"{len(bars)} bars) | "
-                        f"{fresh_reason}"
+                bars.append(
+                    FakeBar(
+                        o,
+                        h,
+                        l,
+                        c,
+                        v,
+                        idx,
                     )
-
-                if not fresh:
-                    return None, (
-                        f"STALE YFINANCE DATA | "
-                        f"{fresh_reason}"
-                    )
-
-                return bars, (
-                    f"DATA OK (YFINANCE FALLBACK, "
-                    f"{len(bars)} bars) | "
-                    f"{fresh_reason}"
                 )
+
+            except Exception:
+                continue
+
+
+        if bars:
+
+            return (
+                bars,
+                f"DATA OK (YFINANCE FALLBACK, {len(bars)} bars)",
+            )
+
 
     except Exception as e:
 
-        if PRINT_NO_TRADE_DETAILS:
+        if purpose != "HEALTH_CHECK":
+
             log_print(
-                f"      ⚠️ yfinance failed for {symbol}: "
+                f"      ⚠️ yfinance failed {symbol}: "
                 f"{str(e)[:100]}"
             )
 
 
-    log_print(
-        f"      ❌ DATA UNAVAILABLE | "
-        f"{symbol} | All sources failed"
-    )
+    if purpose != "HEALTH_CHECK":
 
-    return None, "NO STOCK BAR DATA | All sources failed"
+        log_print(
+            f"      ❌ DATA UNAVAILABLE | "
+            f"{symbol} | All sources failed"
+        )
+
+    return (
+        None,
+        "NO STOCK BAR DATA | All sources failed",
+    )
 
 
 # ============================================================
@@ -485,7 +457,9 @@ def fetch_stock_bars_robust(
 def init_db():
 
     conn = sqlite3.connect(DB_FILE)
+
     cur = conn.cursor()
+
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bot_state (
@@ -496,6 +470,7 @@ def init_db():
             eod_summary_done INTEGER
         )
     """)
+
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS open_positions (
@@ -512,6 +487,7 @@ def init_db():
         )
     """)
 
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trade_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -527,6 +503,7 @@ def init_db():
         )
     """)
 
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS iv_history (
             symbol TEXT,
@@ -534,6 +511,7 @@ def init_db():
             recorded_at TEXT
         )
     """)
+
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS scan_log (
@@ -547,6 +525,7 @@ def init_db():
         )
     """)
 
+
     conn.commit()
     conn.close()
 
@@ -554,34 +533,49 @@ def init_db():
 init_db()
 
 
+# ============================================================
+# STATE
+# ============================================================
+
 def get_today_date():
+
     return datetime.now(ET).strftime("%Y-%m-%d")
 
 
 def load_state_db():
 
     conn = sqlite3.connect(DB_FILE)
+
     cur = conn.cursor()
 
     today = get_today_date()
 
+
     cur.execute("""
-        SELECT trades_today,
-               estimated_daily_pnl,
-               trading_halted,
-               eod_summary_done
+        SELECT
+            trades_today,
+            estimated_daily_pnl,
+            trading_halted,
+            eod_summary_done
         FROM bot_state
         WHERE date=?
     """, (today,))
 
+
     row = cur.fetchone()
+
 
     if not row:
 
         cur.execute("""
             INSERT OR REPLACE INTO bot_state
-            (date, trades_today, estimated_daily_pnl,
-             trading_halted, eod_summary_done)
+            (
+                date,
+                trades_today,
+                estimated_daily_pnl,
+                trading_halted,
+                eod_summary_done
+            )
             VALUES (?,0,0.0,0,0)
         """, (today,))
 
@@ -599,37 +593,65 @@ def load_state_db():
         halted = bool(row[2])
         eod_done = bool(row[3])
 
+
     cur.execute("""
-        SELECT option_symbol, underlying, direction, qty,
-               initial_qty, entry_price, confidence,
-               scale_out_done, opened_at, order_id
+        SELECT
+            option_symbol,
+            underlying,
+            direction,
+            qty,
+            initial_qty,
+            entry_price,
+            confidence,
+            scale_out_done,
+            opened_at,
+            order_id
         FROM open_positions
     """)
 
+
     positions = {}
+
 
     for r in cur.fetchall():
 
         positions[r[0]] = {
+
             "underlying": r[1],
+
             "direction": r[2],
+
             "qty": float(r[3]),
+
             "initial_qty": float(r[4]),
+
             "entry_price": float(r[5]),
+
             "confidence": float(r[6]),
+
             "scale_out_done": bool(r[7]),
+
             "opened_at": r[8],
+
             "order_id": r[9],
         }
 
+
     conn.close()
 
+
     return {
+
         "date": today,
+
         "trades_today": trades_today,
+
         "estimated_daily_pnl": daily_pnl,
+
         "trading_halted": halted,
+
         "eod_summary_done": eod_done,
+
         "positions": positions,
     }
 
@@ -637,12 +659,19 @@ def load_state_db():
 def save_state_db(state):
 
     conn = sqlite3.connect(DB_FILE)
+
     cur = conn.cursor()
+
 
     cur.execute("""
         INSERT OR REPLACE INTO bot_state
-        (date, trades_today, estimated_daily_pnl,
-         trading_halted, eod_summary_done)
+        (
+            date,
+            trades_today,
+            estimated_daily_pnl,
+            trading_halted,
+            eod_summary_done
+        )
         VALUES (?, ?, ?, ?, ?)
     """, (
         state["date"],
@@ -652,15 +681,28 @@ def save_state_db(state):
         int(state["eod_summary_done"]),
     ))
 
-    cur.execute("DELETE FROM open_positions")
+
+    cur.execute(
+        "DELETE FROM open_positions"
+    )
+
 
     for symbol, pos in state["positions"].items():
 
         cur.execute("""
             INSERT INTO open_positions
-            (option_symbol, underlying, direction, qty,
-             initial_qty, entry_price, confidence,
-             scale_out_done, opened_at, order_id)
+            (
+                option_symbol,
+                underlying,
+                direction,
+                qty,
+                initial_qty,
+                entry_price,
+                confidence,
+                scale_out_done,
+                opened_at,
+                order_id
+            )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             symbol,
@@ -675,12 +717,17 @@ def save_state_db(state):
             pos["order_id"],
         ))
 
+
     conn.commit()
     conn.close()
 
 
 state = load_state_db()
 
+
+# ============================================================
+# SCAN LOG
+# ============================================================
 
 def save_scan(
     symbol,
@@ -696,8 +743,14 @@ def save_scan(
 
         conn.execute("""
             INSERT INTO scan_log
-            (scan_time, symbol, direction, confidence,
-             decision, reason)
+            (
+                scan_time,
+                symbol,
+                direction,
+                confidence,
+                decision,
+                reason
+            )
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
             datetime.now(ET).isoformat(),
@@ -715,26 +768,39 @@ def save_scan(
         pass
 
 
+# ============================================================
+# DAILY RESET
+# ============================================================
+
 def reset_daily_state():
 
     global state
 
     today = get_today_date()
 
+
     if state["date"] != today:
 
         state = {
+
             "date": today,
+
             "trades_today": 0,
+
             "estimated_daily_pnl": 0.0,
+
             "trading_halted": False,
+
             "eod_summary_done": False,
+
             "positions": {},
         }
 
         save_state_db(state)
 
-        log_print("🔄 New trading day: state reset.")
+        log_print(
+            "🔄 New trading day: state reset."
+        )
 
 
 # ============================================================
@@ -748,7 +814,11 @@ def is_market_open():
     if now.weekday() >= 5:
         return False
 
-    return dt_time(9, 30) <= now.time() <= dt_time(16, 0)
+    return (
+        dt_time(9, 30)
+        <= now.time()
+        <= dt_time(16, 0)
+    )
 
 
 def market_window_name():
@@ -773,14 +843,12 @@ def market_window_name():
 
 def check_vix_volatility_regime():
 
-    # --------------------------------------------------------
-    # 1) Try Alpaca
-    # --------------------------------------------------------
-
     try:
 
         end = datetime.now(ET)
+
         start = end - timedelta(days=2)
+
 
         req = StockBarsRequest(
             symbol_or_symbols="VIX",
@@ -790,73 +858,43 @@ def check_vix_volatility_regime():
             feed=STOCK_FEED,
         )
 
+
         res = stock_data_client.get_stock_bars(req)
 
-        if res and "VIX" in res and len(res["VIX"]) > 0:
 
-            bars = res["VIX"]
+        if (
+            not res
+            or "VIX" not in res
+            or len(res["VIX"]) == 0
+        ):
 
-            vix = float(bars[-1].close)
-
-            if np.isfinite(vix) and vix > 0:
-
-                panic = vix > MAX_VIX_THRESHOLD
-
-                return (
-                    panic,
-                    vix,
-                    "PANIC" if panic else "NORMAL",
-                )
-
-    except Exception:
-        pass
+            return (
+                False,
+                None,
+                "VIX DATA UNAVAILABLE",
+            )
 
 
-    # --------------------------------------------------------
-    # 2) yfinance fallback
-    # --------------------------------------------------------
-
-    try:
-
-        end = datetime.now(ET)
-        start = end - timedelta(days=5)
-
-        df = yf.download(
-            "^VIX",
-            start=start,
-            end=end,
-            interval="5m",
-            progress=False,
-            auto_adjust=False,
-            prepost=False,
+        vix = float(
+            res["VIX"][-1].close
         )
 
-        if not df.empty:
 
-            close = df["Close"]
+        if vix > MAX_VIX_THRESHOLD:
 
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
+            return (
+                True,
+                vix,
+                "PANIC",
+            )
 
-            close = close.dropna()
 
-            if len(close) > 0:
+        return (
+            False,
+            vix,
+            "NORMAL",
+        )
 
-                vix = float(close.iloc[-1])
-
-                if np.isfinite(vix) and vix > 0:
-
-                    panic = vix > MAX_VIX_THRESHOLD
-
-                    return (
-                        panic,
-                        vix,
-                        (
-                            "PANIC (YFINANCE)"
-                            if panic
-                            else "NORMAL (YFINANCE)"
-                        ),
-                    )
 
     except Exception as e:
 
@@ -865,17 +903,6 @@ def check_vix_volatility_regime():
             None,
             f"VIX ERROR: {str(e)[:80]}",
         )
-
-
-    # --------------------------------------------------------
-    # HARD FAIL
-    # --------------------------------------------------------
-
-    return (
-        False,
-        None,
-        "VIX DATA UNAVAILABLE",
-    )
 
 
 # ============================================================
@@ -887,7 +914,9 @@ def check_news_sentiment(symbol):
     try:
 
         end = datetime.now(ET)
+
         start = end - timedelta(hours=6)
+
 
         res = news_client.get_news(
             NewsRequest(
@@ -898,35 +927,59 @@ def check_news_sentiment(symbol):
             )
         )
 
-        if not res or not hasattr(res, "news") or not res.news:
-            return True, "NO RECENT NEWS"
+
+        if (
+            not res
+            or not hasattr(res, "news")
+            or not res.news
+        ):
+
+            return (
+                True,
+                "NO RECENT NEWS",
+            )
+
 
         dangerous = [
+
             "fraud",
             "investigation",
             "bankruptcy",
             "halted",
             "sec investigation",
             "accounting scandal",
+            "restatement",
         ]
+
 
         for article in res.news:
 
             headline = str(
-                getattr(article, "headline", "")
+                getattr(
+                    article,
+                    "headline",
+                    "",
+                )
             ).lower()
 
-            if any(k in headline for k in dangerous):
+
+            if any(
+                k in headline
+                for k in dangerous
+            ):
 
                 return (
                     False,
-                    f"NEGATIVE NEWS: {headline[:90]}",
+                    f"NEGATIVE NEWS: "
+                    f"{headline[:90]}",
                 )
+
 
         return (
             True,
             f"{len(res.news)} NEWS ITEMS CLEAN",
         )
+
 
     except Exception as e:
 
@@ -945,7 +998,9 @@ def check_social_media_sentiment(symbol):
     try:
 
         end = datetime.now(ET)
+
         start = end - timedelta(hours=4)
+
 
         res = news_client.get_news(
             NewsRequest(
@@ -956,11 +1011,24 @@ def check_social_media_sentiment(symbol):
             )
         )
 
-        if not res or not hasattr(res, "news") or not res.news:
 
-            return True, "HEADLINE RADAR NEUTRAL"
+        if (
+            not res
+            or not hasattr(res, "news")
+            or not res.news
+        ):
 
-        return True, "HEADLINE RADAR CLEAN"
+            return (
+                True,
+                "HEADLINE RADAR NEUTRAL",
+            )
+
+
+        return (
+            True,
+            "HEADLINE RADAR CLEAN",
+        )
+
 
     except Exception as e:
 
@@ -971,16 +1039,31 @@ def check_social_media_sentiment(symbol):
 
 
 def check_earnings_and_macro_calendar(symbol):
-    return True, "EVENT FILTER CLEAN"
+
+    return (
+        True,
+        "EVENT FILTER CLEAN",
+    )
 
 
-def check_multi_timeframe_confluence(symbol, direction):
-    return True, "1H CONFLUENCE PASS"
+def check_multi_timeframe_confluence(
+    symbol,
+    direction,
+):
+
+    return (
+        True,
+        "1H CONFLUENCE PASS",
+    )
 
 
 def check_sector_correlation(symbol):
 
-    sector = SECTOR_MAP.get(symbol, symbol)
+    sector = SECTOR_MAP.get(
+        symbol,
+        symbol,
+    )
+
 
     for pos in state["positions"].values():
 
@@ -989,6 +1072,7 @@ def check_sector_correlation(symbol):
             pos["underlying"],
         )
 
+
         if sector == existing_sector:
 
             return (
@@ -996,7 +1080,11 @@ def check_sector_correlation(symbol):
                 f"SECTOR CONFLICT ({sector})",
             )
 
-    return True, "SECTOR OK"
+
+    return (
+        True,
+        "SECTOR OK",
+    )
 
 
 def check_portfolio_delta_exposure(
@@ -1006,101 +1094,58 @@ def check_portfolio_delta_exposure(
 ):
 
     # Conservative placeholder.
-    # Real aggregate delta should be calculated from
-    # actual option positions before live deployment.
+    # Actual aggregate delta is not guaranteed
+    # by every Alpaca snapshot configuration.
 
-    return True, "DELTA OK"
+    if abs(new_delta * new_qty) > MAX_NET_PORTFOLIO_DELTA:
 
-
-def calculate_iv_rank(symbol, current_iv):
-
-    # No fake IV rank.
-    # Until enough historical IV data exists,
-    # return None rather than pretending it is 0.3.
-
-    if current_iv is None:
-        return None
-
-    try:
-
-        conn = sqlite3.connect(DB_FILE)
-
-        rows = conn.execute("""
-            SELECT iv
-            FROM iv_history
-            WHERE symbol=?
-            ORDER BY recorded_at DESC
-            LIMIT 252
-        """, (symbol,)).fetchall()
-
-        conn.close()
-
-        values = [
-            float(r[0])
-            for r in rows
-            if r[0] is not None
-        ]
-
-        if len(values) < 20:
-            return None
-
-        low = min(values)
-        high = max(values)
-
-        if high <= low:
-            return 0.5
-
-        rank = (
-            float(current_iv) - low
-        ) / (
-            high - low
+        return (
+            False,
+            "DELTA EXPOSURE TOO HIGH",
         )
 
-        return float(np.clip(rank, 0.0, 1.0))
 
-    except Exception:
-
-        return None
-
-
-def record_iv(symbol, iv):
-
-    if iv is None:
-        return
-
-    try:
-
-        conn = sqlite3.connect(DB_FILE)
-
-        conn.execute("""
-            INSERT INTO iv_history
-            (symbol, iv, recorded_at)
-            VALUES (?, ?, ?)
-        """, (
-            symbol,
-            float(iv),
-            datetime.now(ET).isoformat(),
-        ))
-
-        conn.commit()
-        conn.close()
-
-    except Exception:
-        pass
-
-
-def get_dynamic_confidence_threshold():
-
-    return BASE_CONFIDENCE_THRESHOLD
-
-
-def get_dynamic_universe():
-
-    return DEFAULT_TARGET_UNDERLYINGS.copy()
+    return (
+        True,
+        "DELTA OK",
+    )
 
 
 # ============================================================
-# ML ENGINE v16.2
+# OPTION SNAPSHOTS
+# ============================================================
+
+def get_option_snapshots(symbols):
+
+    if not symbols:
+        return {}
+
+
+    try:
+
+        result = option_data_client.get_option_snapshots(
+            OptionSnapshotRequest(
+                symbol_or_symbols=symbols,
+                feed=OPTIONS_FEED,
+            )
+        )
+
+
+        return result or {}
+
+
+    except Exception as e:
+
+        log_print(
+            f"      ⚠️ OPTION SNAPSHOT ERROR: "
+            f"{str(e)[:100]}"
+        )
+
+        return {}
+
+
+# ============================================================
+# ML ENGINE
 # ============================================================
 
 class MultiModelEnsembleEngine:
@@ -1108,33 +1153,47 @@ class MultiModelEnsembleEngine:
     def __init__(self):
 
         self.lgb_params = {
+
             "n_estimators": 150,
-            "learning_rate": 0.04,
-            "random_state": 42,
-            "verbose": -1,
+
+            "learning_rate": 0.035,
+
             "num_leaves": 15,
+
             "max_depth": 5,
+
             "min_child_samples": 10,
+
+            "random_state": 42,
+
+            "verbose": -1,
         }
+
 
         self.rf_params = {
+
             "n_estimators": 200,
+
             "random_state": 42,
+
             "min_samples_leaf": 3,
+
             "max_depth": 8,
-            "class_weight": "balanced_subsample",
+
+            "class_weight": "balanced",
         }
 
+
         self.lgb_model = None
+
         self.rf_model = None
 
         self.is_trained = False
 
         self.last_trained_symbol = None
+
         self.last_train_time = None
 
-        self.validation_accuracy = 0.0
-        self.training_rows = 0
 
     # --------------------------------------------------------
     # FEATURES
@@ -1142,53 +1201,73 @@ class MultiModelEnsembleEngine:
 
     def extract_features_from_bars(self, bars):
 
-        if bars is None or len(bars) < MIN_BARS_REQUIRED:
+        if bars is None or len(bars) < 80:
+
             return None
 
+
         df = pd.DataFrame({
+
             "open": [
                 float(b.open)
                 for b in bars
             ],
+
             "high": [
                 float(b.high)
                 for b in bars
             ],
+
             "low": [
                 float(b.low)
                 for b in bars
             ],
+
             "close": [
                 float(b.close)
                 for b in bars
             ],
+
             "volume": [
                 float(b.volume)
                 for b in bars
             ],
         })
 
+
         # ----------------------------------------------------
-        # Trend
+        # TREND
         # ----------------------------------------------------
 
         df["ema9"] = (
             df["close"]
-            .ewm(span=9, adjust=False)
+            .ewm(
+                span=9,
+                adjust=False,
+            )
             .mean()
         )
+
 
         df["ema20"] = (
             df["close"]
-            .ewm(span=20, adjust=False)
+            .ewm(
+                span=20,
+                adjust=False,
+            )
             .mean()
         )
 
+
         df["ema50"] = (
             df["close"]
-            .ewm(span=50, adjust=False)
+            .ewm(
+                span=50,
+                adjust=False,
+            )
             .mean()
         )
+
 
         # ----------------------------------------------------
         # RSI
@@ -1203,20 +1282,26 @@ class MultiModelEnsembleEngine:
         )
 
         loss = (
-            -delta.where(delta < 0, 0)
+            (-delta.where(delta < 0, 0))
             .rolling(14)
             .mean()
         )
 
-        rs = gain / (loss + 1e-9)
-
-        df["rsi"] = (
-            100 -
-            (100 / (1 + rs))
+        rs = gain / (
+            loss + 1e-9
         )
 
+        df["rsi"] = (
+            100
+            - (
+                100
+                / (1 + rs)
+            )
+        )
+
+
         # ----------------------------------------------------
-        # Volume
+        # VOLUME
         # ----------------------------------------------------
 
         vol_mean = (
@@ -1232,17 +1317,24 @@ class MultiModelEnsembleEngine:
         )
 
         df["volume_zscore"] = (
-            (df["volume"] - vol_mean)
+            (
+                df["volume"]
+                - vol_mean
+            )
             / (vol_std + 1e-9)
         )
+
 
         # ----------------------------------------------------
         # ATR
         # ----------------------------------------------------
 
         true_range = pd.concat(
+
             [
-                df["high"] - df["low"],
+
+                df["high"]
+                - df["low"],
 
                 (
                     df["high"]
@@ -1253,9 +1345,12 @@ class MultiModelEnsembleEngine:
                     df["low"]
                     - df["close"].shift()
                 ).abs(),
+
             ],
+
             axis=1,
         ).max(axis=1)
+
 
         df["atr"] = (
             true_range
@@ -1263,8 +1358,9 @@ class MultiModelEnsembleEngine:
             .mean()
         )
 
+
         # ----------------------------------------------------
-        # Returns
+        # RETURNS
         # ----------------------------------------------------
 
         df["return_1"] = (
@@ -1272,288 +1368,364 @@ class MultiModelEnsembleEngine:
             .pct_change(1)
         )
 
+        df["return_3"] = (
+            df["close"]
+            .pct_change(3)
+        )
+
         df["return_5"] = (
             df["close"]
             .pct_change(5)
         )
 
-        df["return_15"] = (
+        df["return_10"] = (
             df["close"]
-            .pct_change(15)
+            .pct_change(10)
         )
+
 
         # ----------------------------------------------------
-        # EMA relationships
+        # TREND DISTANCE
         # ----------------------------------------------------
 
-        df["ema9_20_gap"] = (
-            df["ema9"] / df["ema20"] - 1
+        df["ema9_20_distance"] = (
+            df["ema9"]
+            / df["ema20"]
+            - 1
         )
 
-        df["ema20_50_gap"] = (
-            df["ema20"] / df["ema50"] - 1
+
+        df["ema20_50_distance"] = (
+            df["ema20"]
+            / df["ema50"]
+            - 1
         )
 
-        df["price_ema20_gap"] = (
-            df["close"] / df["ema20"] - 1
+
+        # ----------------------------------------------------
+        # ATR NORMALIZED
+        # ----------------------------------------------------
+
+        df["atr_pct"] = (
+            df["atr"]
+            / df["close"]
         )
 
-        df.dropna(inplace=True)
+
+        # ----------------------------------------------------
+        # HIGH/LOW BREAKOUT
+        # ----------------------------------------------------
+
+        rolling_high = (
+            df["high"]
+            .rolling(20)
+            .max()
+            .shift(1)
+        )
+
+        rolling_low = (
+            df["low"]
+            .rolling(20)
+            .min()
+            .shift(1)
+        )
+
+
+        df["breakout_up"] = (
+            df["close"]
+            > rolling_high
+        ).astype(int)
+
+
+        df["breakout_down"] = (
+            df["close"]
+            < rolling_low
+        ).astype(int)
+
+
+        df.replace(
+            [np.inf, -np.inf],
+            np.nan,
+            inplace=True,
+        )
+
+
+        df.dropna(
+            inplace=True
+        )
+
 
         return df
+
 
     # --------------------------------------------------------
     # TRAIN
     # --------------------------------------------------------
 
-    def train_models(self, df, symbol):
+    def train_models(
+        self,
+        df,
+        symbol,
+    ):
 
         try:
 
             features = [
+
                 "ema9",
                 "ema20",
                 "ema50",
+
                 "rsi",
+
                 "volume_zscore",
+
                 "atr",
+                "atr_pct",
+
                 "return_1",
+                "return_3",
                 "return_5",
-                "return_15",
-                "ema9_20_gap",
-                "ema20_50_gap",
-                "price_ema20_gap",
+                "return_10",
+
+                "ema9_20_distance",
+                "ema20_50_distance",
+
+                "breakout_up",
+                "breakout_down",
             ]
+
 
             work = df.copy()
 
-            # Future 5-bar return
+
+            # ------------------------------------------------
+            # Future return
+            # ------------------------------------------------
+
             work["future_return"] = (
-                work["close"].shift(-5)
+                work["close"]
+                .shift(-5)
                 / work["close"]
                 - 1
             )
 
-            # ------------------------------------------------
-            # Target:
-            # 1 = CALL
-            # 0 = NEUTRAL
-            # -1 = PUT
-            # ------------------------------------------------
 
             work["target"] = 0
 
+
             work.loc[
-                work["future_return"] > 0.002,
+                work["future_return"]
+                > MIN_EXPECTED_MOVE,
                 "target"
             ] = 1
 
+
             work.loc[
-                work["future_return"] < -0.002,
+                work["future_return"]
+                < -MIN_EXPECTED_MOVE,
                 "target"
             ] = -1
 
-            # ------------------------------------------------
-            # IMPORTANT:
-            # Remove only rows without known future target.
-            # Latest market rows are NOT training samples.
-            # ------------------------------------------------
 
-            labeled = work.dropna(
-                subset=["future_return"]
-            ).copy()
-
-            if len(labeled) < MIN_TRAINING_ROWS:
-
-                return (
-                    False,
-                    f"NOT ENOUGH TRAINING DATA "
-                    f"({len(labeled)}/{MIN_TRAINING_ROWS})"
-                )
-
-            X = labeled[features]
-            y_raw = labeled["target"]
-
-            # Map:
-            # -1 PUT -> 0
-            #  0 NEUTRAL -> 1
-            # +1 CALL -> 2
-
-            mapping = {
-                -1: 0,
-                0: 1,
-                1: 2,
-            }
-
-            y = y_raw.map(mapping)
-
-            # Need at least two classes
-            unique_classes = sorted(
-                y.dropna().unique().tolist()
+            work.dropna(
+                inplace=True
             )
 
-            if len(unique_classes) < 2:
+
+            if len(work) < 100:
 
                 return (
                     False,
-                    "TRAINING HAS ONLY ONE CLASS"
+                    f"NOT ENOUGH TRAINING DATA ({len(work)})",
                 )
+
+
+            X = work[features]
+
+            y = work["target"]
+
+
+            # ------------------------------------------------
+            # Ensure all classes exist
+            # ------------------------------------------------
+
+            unique_classes = set(
+                y.astype(int).unique()
+            )
+
+
+            if not {
+                -1,
+                0,
+                1
+            }.issubset(unique_classes):
+
+                return (
+                    False,
+                    f"TRAINING CLASS IMBALANCE: "
+                    f"{sorted(unique_classes)}",
+                )
+
 
             # ------------------------------------------------
             # Time-series split
             # ------------------------------------------------
 
-            split = int(len(X) * 0.80)
-
-            if split < 50:
-                return (
-                    False,
-                    "TRAINING SPLIT TOO SMALL"
-                )
-
-            X_train = X.iloc[:split]
-            y_train = y.iloc[:split]
-
-            X_valid = X.iloc[split:]
-            y_valid = y.iloc[split:]
-
-            if len(X_valid) < 10:
-                return (
-                    False,
-                    "VALIDATION WINDOW TOO SMALL"
-                )
-
-            train_classes = sorted(
-                y_train.unique().tolist()
+            split = int(
+                len(X) * 0.80
             )
 
-            if len(train_classes) < 2:
+
+            if split < 50:
+
                 return (
                     False,
-                    "TRAINING WINDOW HAS <2 CLASSES"
+                    "TRAINING SPLIT TOO SMALL",
                 )
+
+
+            X_train = X.iloc[:split]
+
+            y_train = y.iloc[:split]
+
+            X_test = X.iloc[split:]
+
+            y_test = y.iloc[split:]
+
 
             # ------------------------------------------------
             # Models
             # ------------------------------------------------
 
-            self.lgb_model = lgb.LGBMClassifier(
+            lgb_model = lgb.LGBMClassifier(
                 **self.lgb_params
             )
 
-            self.rf_model = RandomForestClassifier(
+
+            rf_model = RandomForestClassifier(
                 **self.rf_params
             )
 
-            self.lgb_model.fit(
+
+            lgb_model.fit(
                 X_train,
-                y_train
+                y_train,
             )
 
-            self.rf_model.fit(
+
+            rf_model.fit(
                 X_train,
-                y_train
+                y_train,
             )
+
 
             # ------------------------------------------------
             # Validation
             # ------------------------------------------------
 
-            lgb_val_pred = (
-                self.lgb_model
-                .predict(X_valid)
-            )
+            lgb_acc = None
+            rf_acc = None
 
-            rf_val_pred = (
-                self.rf_model
-                .predict(X_valid)
-            )
 
-            lgb_acc = accuracy_score(
-                y_valid,
-                lgb_val_pred,
-            )
+            if len(X_test) >= 10:
 
-            rf_acc = accuracy_score(
-                y_valid,
-                rf_val_pred,
-            )
+                lgb_test_pred = (
+                    lgb_model
+                    .predict(X_test)
+                )
 
-            ensemble_pred = []
+                rf_test_pred = (
+                    rf_model
+                    .predict(X_test)
+                )
 
-            for a, b in zip(
-                lgb_val_pred,
-                rf_val_pred,
-            ):
 
-                if a == b:
-                    ensemble_pred.append(a)
-                else:
-                    # Disagreement -> neutral
-                    ensemble_pred.append(1)
+                lgb_acc = accuracy_score(
+                    y_test,
+                    lgb_test_pred,
+                )
 
-            ensemble_acc = accuracy_score(
-                y_valid,
-                ensemble_pred,
-            )
 
-            self.validation_accuracy = float(
-                ensemble_acc
-            )
+                rf_acc = accuracy_score(
+                    y_test,
+                    rf_test_pred,
+                )
 
-            self.training_rows = len(X_train)
 
-            # ------------------------------------------------
-            # We still train, but later require validation
-            # quality before allowing a trade.
-            # ------------------------------------------------
+                log_print(
+                    f"      📊 {symbol} VALIDATION | "
+                    f"LGB={lgb_acc:.1%} | "
+                    f"RF={rf_acc:.1%} | "
+                    f"test_rows={len(X_test)}"
+                )
+
+
+            self.lgb_model = lgb_model
+
+            self.rf_model = rf_model
 
             self.is_trained = True
+
             self.last_trained_symbol = symbol
-            self.last_train_time = datetime.now(ET)
+
+            self.last_train_time = (
+                datetime.now(ET)
+            )
+
 
             return (
                 True,
-                (
-                    f"TRAINED | rows={len(X_train)} | "
-                    f"validation={len(X_valid)} | "
-                    f"LGB_ACC={lgb_acc:.1%} | "
-                    f"RF_ACC={rf_acc:.1%} | "
-                    f"ENSEMBLE_ACC={ensemble_acc:.1%}"
-                ),
+                f"TRAINED | rows={len(X_train)}",
             )
+
 
         except Exception as e:
 
-            self.is_trained = False
-
             return (
                 False,
-                f"TRAIN ERROR: {str(e)[:150]}",
+                f"TRAIN ERROR: {str(e)[:120]}",
             )
+
 
     # --------------------------------------------------------
     # ANALYZE
     # --------------------------------------------------------
 
-    def analyze(self, symbol, bars):
+    def analyze(
+        self,
+        symbol,
+        bars,
+    ):
 
-        df = self.extract_features_from_bars(
-            bars
+        df = (
+            self.extract_features_from_bars(
+                bars
+            )
         )
 
-        if df is None or len(df) < 30:
+
+        if df is None or len(df) < 50:
 
             return {
+
                 "direction": "NO TRADE",
+
                 "confidence": 0.0,
-                "reason": "INSUFFICIENT FEATURES",
+
+                "reason":
+                    "INSUFFICIENT FEATURES",
             }
 
+
         needs_training = (
+
             not self.is_trained
+
             or self.last_trained_symbol != symbol
+
             or self.last_train_time is None
+
             or (
                 datetime.now(ET)
                 - self.last_train_time
@@ -1561,258 +1733,474 @@ class MultiModelEnsembleEngine:
             )
         )
 
+
         if needs_training:
 
-            ok, msg = self.train_models(
-                df,
-                symbol,
+            ok, msg = (
+                self.train_models(
+                    df,
+                    symbol,
+                )
             )
+
 
             if not ok:
 
                 return {
+
                     "direction": "NO TRADE",
+
                     "confidence": 0.0,
+
                     "reason": msg,
                 }
 
-            if PRINT_NO_TRADE_DETAILS:
-                log_print(
-                    f"      🧠 {symbol}: {msg}"
-                )
-
-        # ----------------------------------------------------
-        # Minimum validation quality
-        # ----------------------------------------------------
-
-        if (
-            self.validation_accuracy
-            < MIN_VALIDATION_ACCURACY
-        ):
-
-            return {
-                "direction": "NO TRADE",
-                "confidence": 0.0,
-                "reason": (
-                    f"MODEL VALIDATION TOO WEAK | "
-                    f"accuracy="
-                    f"{self.validation_accuracy:.1%}"
-                ),
-            }
 
         features = [
+
             "ema9",
             "ema20",
             "ema50",
+
             "rsi",
+
             "volume_zscore",
+
             "atr",
+            "atr_pct",
+
             "return_1",
+            "return_3",
             "return_5",
-            "return_15",
-            "ema9_20_gap",
-            "ema20_50_gap",
-            "price_ema20_gap",
+            "return_10",
+
+            "ema9_20_distance",
+            "ema20_50_distance",
+
+            "breakout_up",
+            "breakout_down",
         ]
+
 
         try:
 
-            # ------------------------------------------------
-            # IMPORTANT:
-            # Predict the actual latest feature row.
-            # It was NOT part of training because its future
-            # return is unknown.
-            # ------------------------------------------------
+            row = df[
+                features
+            ].iloc[[-1]]
 
-            row = df[features].iloc[[-1]]
+
+            # ------------------------------------------------
+            # Predictions
+            # ------------------------------------------------
 
             lgb_pred = int(
-                self.lgb_model.predict(row)[0]
+                self.lgb_model
+                .predict(row)[0]
             )
 
+
             rf_pred = int(
-                self.rf_model.predict(row)[0]
+                self.rf_model
+                .predict(row)[0]
             )
+
+
+            # ------------------------------------------------
+            # Probabilities
+            # ------------------------------------------------
 
             lgb_proba_raw = (
                 self.lgb_model
                 .predict_proba(row)[0]
             )
 
+
             rf_proba_raw = (
                 self.rf_model
                 .predict_proba(row)[0]
             )
 
-            # ------------------------------------------------
-            # Convert model classes into dictionary
-            # ------------------------------------------------
 
-            def probability_dict(model, proba):
-
-                result = {
-                    0: 0.0,
-                    1: 0.0,
-                    2: 0.0,
-                }
-
-                for cls, p in zip(
-                    model.classes_,
-                    proba,
-                ):
-                    result[int(cls)] = float(p)
-
-                return result
-
-            lgb_probs = probability_dict(
-                self.lgb_model,
-                lgb_proba_raw,
+            lgb_classes = (
+                self.lgb_model
+                .classes_
             )
 
-            rf_probs = probability_dict(
-                self.rf_model,
-                rf_proba_raw,
+
+            rf_classes = (
+                self.rf_model
+                .classes_
             )
 
-            # ------------------------------------------------
-            # Model labels
-            # ------------------------------------------------
 
-            label_to_direction = {
-                0: "PUT",
-                1: "NEUTRAL",
-                2: "CALL",
+            lgb_probs = {
+                int(cls): float(prob)
+                for cls, prob
+                in zip(
+                    lgb_classes,
+                    lgb_proba_raw,
+                )
             }
 
-            lgb_direction = label_to_direction.get(
-                lgb_pred,
-                "NEUTRAL",
-            )
 
-            rf_direction = label_to_direction.get(
-                rf_pred,
-                "NEUTRAL",
-            )
+            rf_probs = {
+                int(cls): float(prob)
+                for cls, prob
+                in zip(
+                    rf_classes,
+                    rf_proba_raw,
+                )
+            }
+
 
             # ------------------------------------------------
-            # HARD ENSEMBLE AGREEMENT
+            # Model agreement
             # ------------------------------------------------
 
             if (
                 REQUIRE_MODEL_AGREEMENT
-                and lgb_direction != rf_direction
+                and lgb_pred != rf_pred
             ):
 
-                # Calculate agreement-neutral confidence
-                confidence = (
-                    max(lgb_probs.values())
-                    + max(rf_probs.values())
-                ) / 2.0
+                # Confidence shown here is deliberately
+                # conservative: minimum model confidence.
+                disagreement_conf = min(
+
+                    max(
+                        lgb_probs.values()
+                    ),
+
+                    max(
+                        rf_probs.values()
+                    ),
+                )
+
 
                 return {
-                    "direction": "NO TRADE",
-                    "confidence": confidence,
-                    "reason": (
-                        f"MODEL DISAGREEMENT | "
-                        f"LGB={lgb_direction} "
-                        f"RF={rf_direction}"
-                    ),
+
+                    "direction":
+                        "NO TRADE",
+
+                    "confidence":
+                        disagreement_conf,
+
+                    "reason":
+                        "MODEL DISAGREEMENT | "
+                        f"LGB={self._label(lgb_pred)} "
+                        f"RF={self._label(rf_pred)}",
                 }
 
+
             # ------------------------------------------------
-            # Neutral = no trade
+            # Neutral
             # ------------------------------------------------
 
-            if (
-                lgb_direction == "NEUTRAL"
-                or rf_direction == "NEUTRAL"
-            ):
+            if lgb_pred == 0:
 
-                confidence = (
-                    max(lgb_probs.values())
-                    + max(rf_probs.values())
-                ) / 2.0
+                confidence = min(
+
+                    lgb_probs.get(
+                        0,
+                        0.0
+                    ),
+
+                    rf_probs.get(
+                        0,
+                        0.0
+                    ),
+                )
+
 
                 return {
-                    "direction": "NO TRADE",
-                    "confidence": confidence,
-                    "reason": (
+
+                    "direction":
+                        "NO TRADE",
+
+                    "confidence":
+                        confidence,
+
+                    "reason":
                         "MODEL TARGET=NEUTRAL | "
-                        f"LGB={lgb_direction} "
-                        f"RF={rf_direction}"
-                    ),
+                        f"LGB={lgb_probs.get(0,0):.1%} "
+                        f"RF={rf_probs.get(0,0):.1%}",
                 }
 
+
             # ------------------------------------------------
-            # Agreement on CALL / PUT
+            # Agreement
             # ------------------------------------------------
 
-            direction = lgb_direction
+            direction = {
+                1: "CALL",
+                -1: "PUT",
+            }.get(
+                lgb_pred,
+                "NO TRADE",
+            )
 
-            model_confidence = (
-                lgb_probs[lgb_pred]
-                + rf_probs[rf_pred]
-            ) / 2.0
 
-            # Agreement bonus is deliberately small.
-            agreement_bonus = 0.05
+            lgb_conf = lgb_probs.get(
+                lgb_pred,
+                0.0,
+            )
 
+
+            rf_conf = rf_probs.get(
+                rf_pred,
+                0.0,
+            )
+
+
+            # Conservative confidence:
+            # use minimum of both models.
             confidence = min(
-                0.99,
-                model_confidence
-                + agreement_bonus
+                lgb_conf,
+                rf_conf,
             )
 
-            # Validation quality modifier
-            validation_factor = np.clip(
-                self.validation_accuracy,
-                0.55,
-                0.80,
+
+            # ------------------------------------------------
+            # Probability margin
+            # ------------------------------------------------
+
+            def probability_margin(
+                probs,
+                pred,
+            ):
+
+                values = sorted(
+                    probs.values(),
+                    reverse=True,
+                )
+
+                if len(values) < 2:
+                    return 0.0
+
+                return (
+                    values[0]
+                    - values[1]
+                )
+
+
+            lgb_margin = (
+                probability_margin(
+                    lgb_probs,
+                    lgb_pred,
+                )
             )
 
-            validation_factor = (
-                validation_factor / 0.80
+
+            rf_margin = (
+                probability_margin(
+                    rf_probs,
+                    rf_pred,
+                )
             )
 
-            confidence = (
-                confidence
-                * validation_factor
+
+            margin = min(
+                lgb_margin,
+                rf_margin,
             )
+
+
+            # ------------------------------------------------
+            # Confidence threshold
+            # ------------------------------------------------
+
+            if confidence < BASE_CONFIDENCE_THRESHOLD:
+
+                return {
+
+                    "direction":
+                        "NO TRADE",
+
+                    "confidence":
+                        confidence,
+
+                    "reason":
+                        "BELOW CONFIDENCE "
+                        f"THRESHOLD {BASE_CONFIDENCE_THRESHOLD:.0%} | "
+                        f"LGB={lgb_conf:.1%} "
+                        f"RF={rf_conf:.1%}",
+                }
+
+
+            # ------------------------------------------------
+            # Margin threshold
+            # ------------------------------------------------
+
+            if margin < MIN_PROBABILITY_MARGIN:
+
+                return {
+
+                    "direction":
+                        "NO TRADE",
+
+                    "confidence":
+                        confidence,
+
+                    "reason":
+                        "WEAK PROBABILITY MARGIN | "
+                        f"margin={margin:.1%} "
+                        f"required={MIN_PROBABILITY_MARGIN:.1%}",
+                }
+
+
+            # ------------------------------------------------
+            # Market structure confirmation
+            # ------------------------------------------------
+
+            last = df.iloc[-1]
+
+
+            ema9 = float(
+                last["ema9"]
+            )
+
+            ema20 = float(
+                last["ema20"]
+            )
+
+            ema50 = float(
+                last["ema50"]
+            )
+
+            rsi = float(
+                last["rsi"]
+            )
+
+
+            # CALL must have positive structure.
+            if direction == "CALL":
+
+                if not (
+                    ema9 > ema20
+                    and ema20 >= ema50
+                ):
+
+                    return {
+
+                        "direction":
+                            "NO TRADE",
+
+                        "confidence":
+                            confidence,
+
+                        "reason":
+                            "ML CALL BUT TREND "
+                            "CONFLUENCE FAILED",
+                    }
+
+
+                if rsi > 78:
+
+                    return {
+
+                        "direction":
+                            "NO TRADE",
+
+                        "confidence":
+                            confidence,
+
+                        "reason":
+                            "CALL OVEREXTENDED "
+                            f"| RSI={rsi:.1f}",
+                    }
+
+
+            # PUT must have negative structure.
+            elif direction == "PUT":
+
+                if not (
+                    ema9 < ema20
+                    and ema20 <= ema50
+                ):
+
+                    return {
+
+                        "direction":
+                            "NO TRADE",
+
+                        "confidence":
+                            confidence,
+
+                        "reason":
+                            "ML PUT BUT TREND "
+                            "CONFLUENCE FAILED",
+                    }
+
+
+                if rsi < 22:
+
+                    return {
+
+                        "direction":
+                            "NO TRADE",
+
+                        "confidence":
+                            confidence,
+
+                        "reason":
+                            "PUT OVERSOLD "
+                            f"| RSI={rsi:.1f}",
+                    }
+
+
+            # ------------------------------------------------
+            # Final signal
+            # ------------------------------------------------
 
             return {
-                "direction": direction,
-                "confidence": float(
-                    np.clip(
-                        confidence,
-                        0.0,
-                        0.99,
-                    )
-                ),
-                "reason": (
-                    f"LGB={lgb_direction} "
-                    f"RF={rf_direction} | "
-                    f"Validation="
-                    f"{self.validation_accuracy:.1%}"
-                ),
+
+                "direction":
+                    direction,
+
+                "confidence":
+                    confidence,
+
+                "reason":
+                    "MODELS AGREE | "
+                    f"LGB={lgb_conf:.1%} "
+                    f"RF={rf_conf:.1%} | "
+                    f"margin={margin:.1%} | "
+                    f"RSI={rsi:.1f}",
             }
+
 
         except Exception as e:
 
             return {
-                "direction": "NO TRADE",
-                "confidence": 0.0,
-                "reason": (
-                    f"ML ERROR: "
-                    f"{str(e)[:100]}"
-                ),
+
+                "direction":
+                    "NO TRADE",
+
+                "confidence":
+                    0.0,
+
+                "reason":
+                    f"ML ERROR: {str(e)[:100]}",
             }
+
+
+    @staticmethod
+    def _label(value):
+
+        return {
+            1: "CALL",
+            -1: "PUT",
+            0: "NEUTRAL",
+        }.get(
+            value,
+            "UNKNOWN",
+        )
 
 
 ml_engine = MultiModelEnsembleEngine()
 
 
 # ============================================================
-# OPTIONS
+# OPTION CONTRACTS
 # ============================================================
 
 def get_option_contracts(symbol):
@@ -1820,110 +2208,185 @@ def get_option_contracts(symbol):
     try:
 
         req = GetOptionContractsRequest(
-            underlying_symbols=[symbol],
+
+            underlying_symbols=[
+                symbol
+            ],
+
             status=AssetStatus.ACTIVE,
+
             limit=200,
         )
 
-        res = trading_client.get_option_contracts(
-            req
+
+        res = (
+            trading_client
+            .get_option_contracts(req)
         )
+
 
         return (
             res.option_contracts
-            if hasattr(res, "option_contracts")
+            if hasattr(
+                res,
+                "option_contracts",
+            )
             else res
         )
 
+
     except Exception as e:
 
-        if PRINT_NO_TRADE_DETAILS:
-            log_print(
-                f"      ⚠️ OPTION CONTRACT ERROR "
-                f"{symbol}: {str(e)[:100]}"
-            )
+        log_print(
+            f"      ⚠️ OPTION CONTRACT ERROR "
+            f"{symbol}: {str(e)[:100]}"
+        )
 
         return []
 
 
-def get_option_snapshots(symbols):
+# ============================================================
+# OPTION VALUE EXTRACTION
+# ============================================================
 
-    if not symbols:
-        return {}
+def extract_snapshot_metrics(
+    snapshot,
+):
+
+    quote = getattr(
+        snapshot,
+        "latest_quote",
+        None,
+    )
+
+
+    if not quote:
+
+        return None
+
 
     try:
 
-        result = option_data_client.get_option_snapshots(
-            OptionSnapshotRequest(
-                symbol_or_symbols=symbols,
-                feed=OPTIONS_FEED,
+        bid = float(
+            getattr(
+                quote,
+                "bid_price",
+                0,
             )
+            or 0
         )
 
-        return result or {}
 
-    except Exception as e:
-
-        if PRINT_NO_TRADE_DETAILS:
-            log_print(
-                f"      ⚠️ OPTION SNAPSHOT ERROR: "
-                f"{str(e)[:100]}"
+        ask = float(
+            getattr(
+                quote,
+                "ask_price",
+                0,
             )
+            or 0
+        )
 
-        return {}
+
+        if bid <= 0 or ask <= 0:
+
+            return None
 
 
-# ============================================================
-# OPTION FIELD HELPERS
-# ============================================================
+        mid = (
+            bid + ask
+        ) / 2
 
-def extract_option_delta(snapshot):
 
-    # Different SDK versions may expose Greeks differently.
+        spread_pct = (
+            ask - bid
+        ) / mid
 
-    greeks = getattr(
-        snapshot,
-        "greeks",
-        None,
-    )
 
-    if greeks is None:
-        return None
+        # Alpaca option snapshot fields
+        # may vary depending on feed/account.
+        greeks = getattr(
+            snapshot,
+            "greeks",
+            None,
+        )
 
-    delta = getattr(
-        greeks,
-        "delta",
-        None,
-    )
 
-    if delta is None:
-        return None
+        delta = None
+        iv = None
 
-    try:
-        return float(delta)
+
+        if greeks is not None:
+
+            try:
+
+                delta_value = getattr(
+                    greeks,
+                    "delta",
+                    None,
+                )
+
+                if delta_value is not None:
+
+                    delta = abs(
+                        float(
+                            delta_value
+                        )
+                    )
+
+            except Exception:
+                pass
+
+
+        # IV may be directly exposed.
+        for attr in [
+            "implied_volatility",
+            "iv",
+        ]:
+
+            try:
+
+                val = getattr(
+                    snapshot,
+                    attr,
+                    None,
+                )
+
+                if val is not None:
+
+                    iv = float(val)
+
+                    break
+
+            except Exception:
+                pass
+
+
+        return {
+
+            "bid": bid,
+
+            "ask": ask,
+
+            "mid": mid,
+
+            "spread_pct":
+                spread_pct,
+
+            "delta":
+                delta,
+
+            "iv":
+                iv,
+        }
+
+
     except Exception:
-        return None
 
-
-def extract_option_iv(snapshot):
-
-    iv = getattr(
-        snapshot,
-        "implied_volatility",
-        None,
-    )
-
-    if iv is None:
-        return None
-
-    try:
-        return float(iv)
-    except Exception:
         return None
 
 
 # ============================================================
-# SMART OPTION SELECTION
+# OPTION SELECTION
 # ============================================================
 
 def select_smart_option(
@@ -1932,20 +2395,12 @@ def select_smart_option(
     vix_val,
 ):
 
-    # --------------------------------------------------------
-    # VIX must be available
-    # --------------------------------------------------------
-
-    if vix_val is None:
-
-        return (
-            None,
-            "VIX UNAVAILABLE -> HARD WAIT",
+    contracts = (
+        get_option_contracts(
+            symbol
         )
-
-    contracts = get_option_contracts(
-        symbol
     )
+
 
     if not contracts:
 
@@ -1954,9 +2409,15 @@ def select_smart_option(
             "NO ACTIVE OPTION CONTRACTS",
         )
 
-    today = datetime.now(ET).date()
+
+    today = (
+        datetime.now(ET)
+        .date()
+    )
+
 
     candidates = []
+
 
     for c in contracts:
 
@@ -1964,47 +2425,73 @@ def select_smart_option(
 
             exp = c.expiration_date
 
-            if isinstance(exp, str):
-                exp = datetime.fromisoformat(
-                    exp
-                ).date()
 
-            elif hasattr(exp, "date"):
+            if isinstance(
+                exp,
+                str,
+            ):
+
+                exp = (
+                    datetime
+                    .fromisoformat(exp)
+                    .date()
+                )
+
+            elif hasattr(
+                exp,
+                "date",
+            ):
+
                 exp = exp.date()
+
 
             dte = (
                 exp - today
             ).days
+
 
             if not (
                 MIN_DTE
                 <= dte
                 <= MAX_DTE
             ):
+
                 continue
+
 
             ctype = str(
                 c.type
             ).upper()
 
+
             if (
                 direction == "CALL"
                 and "CALL" not in ctype
             ):
+
                 continue
+
 
             if (
                 direction == "PUT"
                 and "PUT" not in ctype
             ):
+
                 continue
 
+
             candidates.append(
-                (c, dte)
+                (
+                    c,
+                    dte,
+                )
             )
 
+
         except Exception:
+
             continue
+
 
     if not candidates:
 
@@ -2013,15 +2500,21 @@ def select_smart_option(
             "NO DTE/TYPE MATCH",
         )
 
-    # Limit snapshot request
+
+    # Limit snapshot request.
     symbols = [
         c.symbol
-        for c, _ in candidates[:100]
+        for c, _
+        in candidates[:100]
     ]
 
-    snapshots = get_option_snapshots(
-        symbols
+
+    snapshots = (
+        get_option_snapshots(
+            symbols
+        )
     )
+
 
     if not snapshots:
 
@@ -2030,222 +2523,186 @@ def select_smart_option(
             "NO OPTION SNAPSHOTS",
         )
 
+
     valid = []
+
 
     for c, dte in candidates[:100]:
 
         sym = c.symbol
 
+
         if sym not in snapshots:
+
             continue
 
-        snap = snapshots[sym]
 
-        quote = getattr(
-            snap,
-            "latest_quote",
-            None,
+        metrics = (
+            extract_snapshot_metrics(
+                snapshots[sym]
+            )
         )
 
-        if quote is None:
+
+        if not metrics:
+
             continue
 
-        try:
 
-            bid = float(
-                getattr(
-                    quote,
-                    "bid_price",
-                    0,
-                )
-                or 0
-            )
+        bid = metrics["bid"]
 
-            ask = float(
-                getattr(
-                    quote,
-                    "ask_price",
-                    0,
-                )
-                or 0
-            )
+        ask = metrics["ask"]
 
-        except Exception:
-            continue
+        mid = metrics["mid"]
 
-        if bid <= 0 or ask <= 0:
-            continue
+        spread_pct = (
+            metrics["spread_pct"]
+        )
 
-        mid = (
-            bid + ask
-        ) / 2.0
+        delta = metrics["delta"]
 
-        if mid <= 0:
-            continue
+        iv = metrics["iv"]
+
 
         # ----------------------------------------------------
-        # Premium filter
+        # PREMIUM
         # ----------------------------------------------------
 
         if mid > MAX_PREMIUM:
+
             continue
 
+
         # ----------------------------------------------------
-        # Spread filter
+        # SPREAD
         # ----------------------------------------------------
 
-        spread_pct = (
-            (ask - bid)
-            / mid
-        )
+        if spread_pct > BASE_MAX_SPREAD_PCT:
 
-        if (
-            spread_pct
-            > BASE_MAX_SPREAD_PCT
-        ):
             continue
 
-        # ----------------------------------------------------
-        # Real Greeks
-        # ----------------------------------------------------
-
-        delta = extract_option_delta(
-            snap
-        )
-
-        iv = extract_option_iv(
-            snap
-        )
-
-        # If real delta unavailable,
-        # don't pretend it's 0.5.
-        if delta is None:
-            continue
-
-        # Absolute delta for PUT/CALL
-        abs_delta = abs(delta)
-
-        if not (
-            MIN_DELTA
-            <= abs_delta
-            <= MAX_DELTA
-        ):
-            continue
 
         # ----------------------------------------------------
-        # IV
+        # DELTA
         # ----------------------------------------------------
 
-        if iv is not None:
+        if delta is not None:
 
-            record_iv(
-                symbol,
-                iv
-            )
-
-            iv_rank = calculate_iv_rank(
-                symbol,
-                iv
-            )
-
-            # If enough history exists,
-            # apply IV rank filter.
-            if (
-                iv_rank is not None
-                and iv_rank > MAX_IV_RANK
+            if not (
+                MIN_DELTA
+                <= delta
+                <= MAX_DELTA
             ):
+
                 continue
 
-        else:
-
-            iv_rank = None
 
         # ----------------------------------------------------
-        # Scoring
+        # Score
         # ----------------------------------------------------
 
-        delta_score = (
-            1.0
-            - abs(abs_delta - 0.50)
-        )
+        score = 0.0
 
-        spread_score = max(
-            0.0,
-            1.0
-            - (
-                spread_pct
-                / BASE_MAX_SPREAD_PCT
+
+        # Prefer delta near 0.50.
+        if delta is not None:
+
+            delta_penalty = abs(
+                delta - 0.50
             )
-        )
 
-        dte_score = (
-            1.0
-            - (
-                abs(dte - 5)
-                / 10.0
+            score += (
+                delta_penalty
+                * 10
             )
+
+
+        # Prefer tighter spread.
+        score += (
+            spread_pct
+            * 30
         )
 
-        premium_score = max(
-            0.0,
-            1.0
-            - (
-                mid
-                / MAX_PREMIUM
-            )
+
+        # Prefer shorter DTE but
+        # avoid absolute 0DTE.
+        score += (
+            dte * 0.10
         )
 
-        score = (
-            0.35 * delta_score
-            + 0.30 * spread_score
-            + 0.20 * dte_score
-            + 0.15 * premium_score
-        )
+
+        # Prefer reasonable premium.
+        if mid > 10:
+
+            score += 0.5
+
 
         valid.append({
-            "contract": c,
-            "symbol": sym,
-            "dte": dte,
-            "delta": delta,
-            "bid": bid,
-            "ask": ask,
-            "mid": mid,
-            "spread_pct": spread_pct,
-            "iv": iv,
-            "iv_rank": iv_rank,
-            "score": score,
+
+            "contract":
+                c,
+
+            "symbol":
+                sym,
+
+            "dte":
+                dte,
+
+            "delta":
+                delta,
+
+            "bid":
+                bid,
+
+            "ask":
+                ask,
+
+            "mid":
+                mid,
+
+            "spread_pct":
+                spread_pct,
+
+            "iv":
+                iv,
+
+            "score":
+                score,
         })
+
 
     if not valid:
 
         return (
             None,
-            "ALL CONTRACTS FAILED REAL DATA FILTERS",
+            "ALL CONTRACTS FAILED REAL QUOTE FILTERS",
         )
 
-    # Higher score is better
+
     valid.sort(
-        key=lambda x: x["score"],
-        reverse=True,
+        key=lambda x: x["score"]
     )
 
-    best = valid[0]
+
+    selected = valid[0]
+
 
     return (
-        best,
+        selected,
         (
             f"OPTION FOUND "
-            f"{best['symbol']} | "
-            f"DTE={best['dte']} | "
-            f"delta={best['delta']:.2f} | "
-            f"mid=${best['mid']:.2f} | "
-            f"spread={best['spread_pct']:.1%}"
+            f"{selected['symbol']} | "
+            f"DTE={selected['dte']} | "
+            f"mid=${selected['mid']:.2f} | "
+            f"spread={selected['spread_pct']:.1%} | "
+            f"delta="
+            f"{selected['delta'] if selected['delta'] is not None else 'N/A'}"
         ),
     )
 
 
 # ============================================================
-# ORDER MANAGEMENT
+# ORDER HELPERS
 # ============================================================
 
 def wait_for_fill(
@@ -2254,6 +2711,7 @@ def wait_for_fill(
 ):
 
     start = time.time()
+
 
     while (
         time.time() - start
@@ -2269,17 +2727,23 @@ def wait_for_fill(
                 )
             )
 
+
             if (
-                str(order.status)
-                .lower()
+                str(
+                    order.status
+                ).lower()
                 == "filled"
             ):
+
                 return order
+
 
         except Exception:
             pass
 
+
         time.sleep(1)
+
 
     return None
 
@@ -2296,10 +2760,16 @@ def submit_smart_limit_order(
             trading_client
             .submit_order(
                 LimitOrderRequest(
+
                     symbol=option_symbol,
+
                     qty=qty,
+
                     side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY,
+
+                    time_in_force=
+                        TimeInForce.DAY,
+
                     limit_price=round(
                         float(initial_ask),
                         2,
@@ -2308,16 +2778,18 @@ def submit_smart_limit_order(
             )
         )
 
+
         return wait_for_fill(
             str(order.id),
             timeout=10,
         )
 
+
     except Exception as e:
 
         log_print(
-            f"❌ ORDER ERROR: "
-            f"{str(e)[:100]}"
+            f"      ❌ ORDER ERROR: "
+            f"{str(e)[:120]}"
         )
 
         return None
@@ -2335,46 +2807,177 @@ def enter_position(
 ):
 
     if state["trading_halted"]:
-        return False, "TRADING HALTED"
 
-    if state["trades_today"] >= MAX_TRADES_PER_DAY:
-        return False, "MAX DAILY TRADES"
-
-    if len(state["positions"]) >= MAX_OPEN_POSITIONS:
-        return False, "MAX OPEN POSITIONS"
-
-    if vix_val is None:
-        return False, "VIX UNAVAILABLE -> HARD WAIT"
-
-    if confidence < get_dynamic_confidence_threshold():
         return (
             False,
-            (
-                f"CONFIDENCE BELOW THRESHOLD "
-                f"{confidence:.1%} < "
-                f"{get_dynamic_confidence_threshold():.1%}"
-            ),
+            "TRADING HALTED",
         )
 
-    option, reason = select_smart_option(
-        symbol,
-        direction,
-        vix_val,
+
+    if (
+        state["estimated_daily_pnl"]
+        <= MAX_DAILY_LOSS_USD
+    ):
+
+        state["trading_halted"] = True
+
+        save_state_db(state)
+
+        return (
+            False,
+            "MAX DAILY LOSS REACHED",
+        )
+
+
+    if (
+        state["trades_today"]
+        >= MAX_TRADES_PER_DAY
+    ):
+
+        return (
+            False,
+            "MAX DAILY TRADES",
+        )
+
+
+    if (
+        len(state["positions"])
+        >= MAX_OPEN_POSITIONS
+    ):
+
+        return (
+            False,
+            "MAX OPEN POSITIONS",
+        )
+
+
+    # --------------------------------------------------------
+    # Sector
+    # --------------------------------------------------------
+
+    ok, reason = (
+        check_sector_correlation(
+            symbol
+        )
     )
+
+
+    if not ok:
+
+        return (
+            False,
+            reason,
+        )
+
+
+    # --------------------------------------------------------
+    # News
+    # --------------------------------------------------------
+
+    ok, reason = (
+        check_news_sentiment(
+            symbol
+        )
+    )
+
+
+    if not ok:
+
+        return (
+            False,
+            reason,
+        )
+
+
+    # --------------------------------------------------------
+    # Multi timeframe
+    # --------------------------------------------------------
+
+    ok, reason = (
+        check_multi_timeframe_confluence(
+            symbol,
+            direction,
+        )
+    )
+
+
+    if not ok:
+
+        return (
+            False,
+            reason,
+        )
+
+
+    # --------------------------------------------------------
+    # Option
+    # --------------------------------------------------------
+
+    option, reason = (
+        select_smart_option(
+            symbol,
+            direction,
+            vix_val,
+        )
+    )
+
 
     if not option:
 
-        return False, reason
+        return (
+            False,
+            reason,
+        )
 
-    filled = submit_smart_limit_order(
-        option["symbol"],
-        BASE_CONTRACTS_PER_TRADE,
-        option["ask"],
+
+    # --------------------------------------------------------
+    # Delta
+    # --------------------------------------------------------
+
+    actual_delta = (
+        option["delta"]
+        if option["delta"] is not None
+        else 0.50
     )
+
+
+    ok, reason = (
+        check_portfolio_delta_exposure(
+            actual_delta,
+            BASE_CONTRACTS_PER_TRADE,
+            direction,
+        )
+    )
+
+
+    if not ok:
+
+        return (
+            False,
+            reason,
+        )
+
+
+    # --------------------------------------------------------
+    # Execute PAPER order
+    # --------------------------------------------------------
+
+    filled = (
+        submit_smart_limit_order(
+            option["symbol"],
+            BASE_CONTRACTS_PER_TRADE,
+            option["ask"],
+        )
+    )
+
 
     if not filled:
 
-        return False, "ORDER NOT FILLED"
+        return (
+            False,
+            "ORDER NOT FILLED",
+        )
+
 
     fill_price = float(
         getattr(
@@ -2385,6 +2988,7 @@ def enter_position(
         or option["ask"]
     )
 
+
     filled_qty = float(
         getattr(
             filled,
@@ -2393,30 +2997,50 @@ def enter_position(
         )
     )
 
+
     state["trades_today"] += 1
+
 
     state["positions"][
         option["symbol"]
     ] = {
-        "underlying": symbol,
-        "direction": direction,
-        "qty": filled_qty,
-        "initial_qty": filled_qty,
-        "entry_price": fill_price,
-        "confidence": confidence,
-        "scale_out_done": False,
-        "opened_at": datetime.now(
-            ET
-        ).isoformat(),
-        "order_id": str(
-            filled.id
-        ),
+
+        "underlying":
+            symbol,
+
+        "direction":
+            direction,
+
+        "qty":
+            filled_qty,
+
+        "initial_qty":
+            filled_qty,
+
+        "entry_price":
+            fill_price,
+
+        "confidence":
+            confidence,
+
+        "scale_out_done":
+            False,
+
+        "opened_at":
+            datetime.now(
+                ET
+            ).isoformat(),
+
+        "order_id":
+            str(filled.id),
     }
+
 
     save_state_db(state)
 
+
     log_print(
-        f"🚨 PAPER TRADE EXECUTED | "
+        "🚨 PAPER TRADE EXECUTED | "
         f"{symbol} | "
         f"{direction} | "
         f"{option['symbol']} | "
@@ -2425,11 +3049,15 @@ def enter_position(
         f"confidence={confidence:.1%}"
     )
 
-    return True, "FILLED"
+
+    return (
+        True,
+        "FILLED",
+    )
 
 
 # ============================================================
-# EXIT
+# EXIT POSITION
 # ============================================================
 
 def exit_position(
@@ -2445,35 +3073,45 @@ def exit_position(
             pos["qty"]
         )
 
+
         if qty <= 0:
 
             state["positions"].pop(
                 opt_sym,
-                None,
+                None
             )
 
             save_state_db(state)
 
             return True
 
+
         order = (
             trading_client
             .submit_order(
                 MarketOrderRequest(
+
                     symbol=opt_sym,
+
                     qty=qty,
+
                     side=OrderSide.SELL,
-                    time_in_force=TimeInForce.DAY,
+
+                    time_in_force=
+                        TimeInForce.DAY,
                 )
             )
         )
 
+
         filled = wait_for_fill(
             str(order.id),
-            15,
+            timeout=15,
         )
 
+
         exit_price = (
+
             float(
                 getattr(
                     filled,
@@ -2481,30 +3119,88 @@ def exit_position(
                     None,
                 )
             )
+
             if filled
-            and getattr(
-                filled,
-                "filled_avg_price",
-                None,
-            )
             else current_price
         )
 
+
+        entry_price = float(
+            pos["entry_price"]
+        )
+
+
         pnl = (
             exit_price
-            - float(
-                pos["entry_price"]
-            )
+            - entry_price
         ) * qty * 100
 
-        state["estimated_daily_pnl"] += pnl
+
+        state[
+            "estimated_daily_pnl"
+        ] += pnl
+
 
         state["positions"].pop(
             opt_sym,
-            None,
+            None
         )
 
+
         save_state_db(state)
+
+
+        # History.
+        try:
+
+            conn = sqlite3.connect(
+                DB_FILE
+            )
+
+            conn.execute("""
+                INSERT INTO trade_history
+                (
+                    symbol,
+                    contract,
+                    direction,
+                    entry_price,
+                    exit_price,
+                    qty,
+                    pnl_usd,
+                    reason,
+                    closed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+
+                pos["underlying"],
+
+                opt_sym,
+
+                pos["direction"],
+
+                entry_price,
+
+                exit_price,
+
+                qty,
+
+                pnl,
+
+                reason,
+
+                datetime.now(
+                    ET
+                ).isoformat(),
+            ))
+
+            conn.commit()
+
+            conn.close()
+
+        except Exception:
+            pass
+
 
         log_print(
             f"🛑 PAPER FULL EXIT | "
@@ -2513,32 +3209,54 @@ def exit_position(
             f"reason={reason}"
         )
 
+
+        if (
+            state["estimated_daily_pnl"]
+            <= MAX_DAILY_LOSS_USD
+        ):
+
+            state["trading_halted"] = True
+
+            save_state_db(state)
+
+            log_print(
+                "🚨 DAILY LOSS LIMIT -> "
+                "NEW ENTRIES HALTED"
+            )
+
+
         return True
+
 
     except Exception as e:
 
         log_print(
-            f"❌ EXIT ERROR: "
-            f"{str(e)[:100]}"
+            f"❌ EXIT ERROR {opt_sym}: "
+            f"{str(e)[:120]}"
         )
 
         return False
 
 
 # ============================================================
-# MANAGE POSITIONS
+# POSITION MANAGEMENT
 # ============================================================
 
 def manage_positions():
 
     if not state["positions"]:
+
         return
 
-    snapshots = get_option_snapshots(
-        list(
-            state["positions"].keys()
+
+    snapshots = (
+        get_option_snapshots(
+            list(
+                state["positions"].keys()
+            )
         )
     )
+
 
     for opt_sym, pos in list(
         state["positions"].items()
@@ -2547,7 +3265,9 @@ def manage_positions():
         try:
 
             if opt_sym not in snapshots:
+
                 continue
+
 
             quote = getattr(
                 snapshots[opt_sym],
@@ -2555,8 +3275,11 @@ def manage_positions():
                 None,
             )
 
+
             if not quote:
+
                 continue
+
 
             bid = float(
                 quote.bid_price or 0
@@ -2566,22 +3289,32 @@ def manage_positions():
                 quote.ask_price or 0
             )
 
+
             if bid <= 0 or ask <= 0:
+
                 continue
+
 
             cur_price = (
                 bid + ask
             ) / 2
 
+
             entry = float(
                 pos["entry_price"]
             )
 
+
             pnl_pct = (
-                cur_price - entry
+                cur_price
+                - entry
             ) / entry
 
-            if pnl_pct <= -0.30:
+
+            if (
+                pnl_pct
+                <= OPTION_STOP_LOSS_PCT
+            ):
 
                 exit_position(
                     opt_sym,
@@ -2590,16 +3323,128 @@ def manage_positions():
                     "OPTION STOP LOSS -30%",
                 )
 
-        except Exception:
-            pass
 
+        except Exception:
+            continue
+
+
+# ============================================================
+# POSITION SYNC
+# ============================================================
 
 def sync_positions():
-    pass
 
+    # Intentionally conservative.
+    #
+    # We do not automatically invent DB positions
+    # from broker positions because this is a paper
+    # research bot and state synchronization should be
+    # explicitly implemented if live execution is ever used.
+
+    return
+
+
+# ============================================================
+# EOD
+# ============================================================
 
 def print_eod_summary():
-    pass
+
+    now = datetime.now(ET)
+
+
+    if (
+        now.time()
+        < dt_time(16, 0)
+    ):
+
+        return
+
+
+    if state["eod_summary_done"]:
+
+        return
+
+
+    log_section(
+        "📊 END OF DAY SUMMARY"
+    )
+
+
+    log_print(
+        f"Trades today: "
+        f"{state['trades_today']}"
+    )
+
+
+    log_print(
+        f"Estimated P&L: "
+        f"${state['estimated_daily_pnl']:+.2f}"
+    )
+
+
+    log_print(
+        f"Open positions: "
+        f"{len(state['positions'])}"
+    )
+
+
+    state[
+        "eod_summary_done"
+    ] = True
+
+
+    save_state_db(state)
+
+
+# ============================================================
+# COOLDOWN
+# ============================================================
+
+def symbol_recently_traded(
+    symbol,
+):
+
+    try:
+
+        conn = sqlite3.connect(
+            DB_FILE
+        )
+
+
+        since = (
+            datetime.now(ET)
+            - timedelta(
+                minutes=
+                SYMBOL_COOLDOWN_MINUTES
+            )
+        ).isoformat()
+
+
+        row = conn.execute("""
+            SELECT COUNT(*)
+            FROM trade_history
+            WHERE symbol=?
+            AND closed_at >= ?
+        """, (
+            symbol,
+            since,
+        )).fetchone()
+
+
+        conn.close()
+
+
+        return (
+            row[0] > 0
+            if row
+            else False
+        )
+
+
+    except Exception:
+
+        return False
 
 
 # ============================================================
@@ -2614,61 +3459,70 @@ def scan_symbol(
     try:
 
         # ----------------------------------------------------
-        # VIX hard requirement
+        # Existing position
         # ----------------------------------------------------
 
-        if vix_val is None:
-
-            reason = (
-                "VIX UNAVAILABLE -> "
-                "SCAN BLOCKED"
-            )
-
-            save_scan(
-                symbol,
-                "NO TRADE",
-                0,
-                "REJECT",
-                reason,
-            )
-
-            if PRINT_EVERY_SYMBOL:
-
-                log_decision(
-                    symbol,
-                    "NO TRADE",
-                    0,
-                    reason,
-                )
+        if any(
+            p["underlying"]
+            == symbol
+            for p in state["positions"].values()
+        ):
 
             return False
 
+
         # ----------------------------------------------------
-        # Stock data
+        # Cooldown
+        # ----------------------------------------------------
+
+        if symbol_recently_traded(
+            symbol
+        ):
+
+            log_decision(
+                symbol,
+                "NO TRADE",
+                0.0,
+                "SYMBOL COOLDOWN",
+            )
+
+            return False
+
+
+        # ----------------------------------------------------
+        # Data
         # ----------------------------------------------------
 
         bars, data_reason = (
             fetch_stock_bars_robust(
+
                 symbol,
+
                 TimeFrame.Minute,
+
                 datetime.now(ET)
                 - timedelta(days=2),
+
                 datetime.now(ET),
+
                 purpose="ML SCAN",
             )
         )
 
+
         if (
             bars is None
-            or len(bars) < MIN_BARS_REQUIRED
+            or len(bars) < 80
         ):
 
             reason = (
+
                 f"INSUFFICIENT BARS "
                 f"({len(bars) if bars else 0}) | "
                 f"{data_reason}"
             )
 
+
             save_scan(
                 symbol,
                 "NO TRADE",
@@ -2676,6 +3530,7 @@ def scan_symbol(
                 "REJECT",
                 reason,
             )
+
 
             if PRINT_EVERY_SYMBOL:
 
@@ -2686,60 +3541,36 @@ def scan_symbol(
                     reason,
                 )
 
-            return False
-
-        # ----------------------------------------------------
-        # Freshness
-        # ----------------------------------------------------
-
-        fresh, fresh_reason = bars_are_fresh(
-            bars
-        )
-
-        if not fresh:
-
-            reason = (
-                f"STALE MARKET DATA | "
-                f"{fresh_reason}"
-            )
-
-            save_scan(
-                symbol,
-                "NO TRADE",
-                0,
-                "REJECT",
-                reason,
-            )
-
-            log_decision(
-                symbol,
-                "NO TRADE",
-                0,
-                reason,
-            )
 
             return False
 
+
         # ----------------------------------------------------
-        # ML
+        # Analyze
         # ----------------------------------------------------
 
-        analysis = ml_engine.analyze(
-            symbol,
-            bars,
+        analysis = (
+            ml_engine.analyze(
+                symbol,
+                bars,
+            )
         )
 
-        direction = analysis[
-            "direction"
-        ]
+
+        direction = (
+            analysis["direction"]
+        )
+
 
         confidence = float(
             analysis["confidence"]
         )
 
+
         reason = analysis[
             "reason"
         ]
+
 
         # ----------------------------------------------------
         # NO TRADE
@@ -2758,6 +3589,7 @@ def scan_symbol(
                 reason,
             )
 
+
             log_decision(
                 symbol,
                 direction,
@@ -2765,146 +3597,39 @@ def scan_symbol(
                 reason,
             )
 
-            return False
-
-        # ----------------------------------------------------
-        # Confidence
-        # ----------------------------------------------------
-
-        threshold = (
-            get_dynamic_confidence_threshold()
-        )
-
-        if confidence < threshold:
-
-            reason2 = (
-                f"BELOW CONFIDENCE "
-                f"{confidence:.1%} < "
-                f"{threshold:.1%}"
-            )
-
-            save_scan(
-                symbol,
-                direction,
-                confidence,
-                "REJECT",
-                reason2,
-            )
-
-            log_decision(
-                symbol,
-                "NO TRADE",
-                confidence,
-                reason2,
-            )
 
             return False
 
-        # ----------------------------------------------------
-        # Additional filters
-        # ----------------------------------------------------
-
-        news_ok, news_reason = (
-            check_news_sentiment(
-                symbol
-            )
-        )
-
-        if not news_ok:
-
-            save_scan(
-                symbol,
-                direction,
-                confidence,
-                "REJECT",
-                news_reason,
-            )
-
-            log_decision(
-                symbol,
-                "NO TRADE",
-                confidence,
-                news_reason,
-            )
-
-            return False
-
-        mtf_ok, mtf_reason = (
-            check_multi_timeframe_confluence(
-                symbol,
-                direction,
-            )
-        )
-
-        if not mtf_ok:
-
-            save_scan(
-                symbol,
-                direction,
-                confidence,
-                "REJECT",
-                mtf_reason,
-            )
-
-            log_decision(
-                symbol,
-                "NO TRADE",
-                confidence,
-                mtf_reason,
-            )
-
-            return False
-
-        sector_ok, sector_reason = (
-            check_sector_correlation(
-                symbol
-            )
-        )
-
-        if not sector_ok:
-
-            save_scan(
-                symbol,
-                direction,
-                confidence,
-                "REJECT",
-                sector_reason,
-            )
-
-            log_decision(
-                symbol,
-                "NO TRADE",
-                confidence,
-                sector_reason,
-            )
-
-            return False
 
         # ----------------------------------------------------
-        # Signal passed
+        # ML signal passed
         # ----------------------------------------------------
 
         log_decision(
             symbol,
             direction,
             confidence,
-            (
-                f"SIGNAL PASSED | "
-                f"{reason} | "
-                f"VIX={vix_val:.2f}"
-            ),
+            f"SIGNAL PASSED ML | {reason}",
         )
+
 
         # ----------------------------------------------------
         # Entry
         # ----------------------------------------------------
 
-        ok, enter_reason = enter_position(
-            symbol,
-            direction,
-            confidence,
-            vix_val,
+        ok, enter_reason = (
+            enter_position(
+
+                symbol,
+
+                direction,
+
+                confidence,
+
+                vix_val,
+            )
         )
+
 
         if ok:
 
@@ -2918,6 +3643,7 @@ def scan_symbol(
 
             return True
 
+
         save_scan(
             symbol,
             direction,
@@ -2926,20 +3652,24 @@ def scan_symbol(
             enter_reason,
         )
 
+
         log_print(
             f"      ↳ {symbol}: "
             f"ENTRY REJECTED | "
             f"{enter_reason}"
         )
 
+
         return False
+
 
     except Exception as e:
 
         reason = (
             f"SCAN ERROR: "
-            f"{str(e)[:120]}"
+            f"{str(e)[:100]}"
         )
+
 
         save_scan(
             symbol,
@@ -2949,9 +3679,12 @@ def scan_symbol(
             reason,
         )
 
+
         log_print(
-            f"      ❌ {symbol}: {reason}"
+            f"      ❌ {symbol}: "
+            f"{reason}"
         )
+
 
         return False
 
@@ -2963,35 +3696,39 @@ def scan_symbol(
 def main():
 
     log_section(
-        "🤖 TRANSPARENT PAPER QUANT BOT v16.2"
+        "🤖 TRANSPARENT PAPER QUANT BOT v16.2 STARTING"
     )
+
 
     log_print(
         "💰 PAPER MODE = TRUE"
     )
 
-    log_print(
-        "📡 Data Health = STRICT"
-    )
 
     log_print(
-        "🧠 Ensemble = LGB + RF"
+        "🧠 LGB + RF AGREEMENT REQUIRED"
     )
 
-    log_print(
-        "🛡 VIX unavailable = HARD WAIT"
-    )
 
     log_print(
-        "🎯 Model agreement = REQUIRED"
-    )
-
-    log_print(
-        f"🎯 Minimum confidence = "
+        f"🎯 CONFIDENCE THRESHOLD = "
         f"{BASE_CONFIDENCE_THRESHOLD:.0%}"
     )
 
+
+    log_print(
+        f"📐 MIN PROBABILITY MARGIN = "
+        f"{MIN_PROBABILITY_MARGIN:.0%}"
+    )
+
+
+    log_print(
+        "📡 Market Data Health Monitor Enabled"
+    )
+
+
     scan_counter = 0
+
 
     while True:
 
@@ -3005,28 +3742,34 @@ def main():
 
             print_eod_summary()
 
+
             now = datetime.now(ET)
 
             scan_counter += 1
 
+
             log_section(
                 f"💓 HEARTBEAT / SCAN #{scan_counter}"
             )
+
 
             log_print(
                 f"Time: "
                 f"{now.strftime('%Y-%m-%d %H:%M:%S')} ET"
             )
 
+
             log_print(
                 f"Market: "
                 f"{'OPEN' if is_market_open() else 'CLOSED'}"
             )
 
+
             log_print(
                 f"Window: "
                 f"{market_window_name()}"
             )
+
 
             # ------------------------------------------------
             # MARKET CLOSED
@@ -3040,11 +3783,34 @@ def main():
                     f"{SCAN_INTERVAL_SECONDS}s."
                 )
 
+
                 time.sleep(
                     SCAN_INTERVAL_SECONDS
                 )
 
                 continue
+
+
+            # ------------------------------------------------
+            # DAILY HALT
+            # ------------------------------------------------
+
+            if state[
+                "trading_halted"
+            ]:
+
+                log_print(
+                    "🛑 TRADING HALTED "
+                    "| No new entries."
+                )
+
+
+                time.sleep(
+                    SCAN_INTERVAL_SECONDS
+                )
+
+                continue
+
 
             # ------------------------------------------------
             # DATA HEALTH
@@ -3054,23 +3820,35 @@ def main():
                 "📡 MARKET DATA HEALTH CHECK:"
             )
 
+
             current_universe = (
-                get_dynamic_universe()
+                DEFAULT_TARGET_UNDERLYINGS.copy()
             )
+
 
             data_health_counts = {}
 
+
             for sym in current_universe:
 
-                test_bars, test_reason = (
+                test_bars, _ = (
                     fetch_stock_bars_robust(
+
                         sym,
+
                         TimeFrame.Minute,
-                        now - timedelta(days=1),
+
+                        now
+                        - timedelta(
+                            hours=12
+                        ),
+
                         now,
+
                         purpose="HEALTH_CHECK",
                     )
                 )
+
 
                 count = (
                     len(test_bars)
@@ -3078,9 +3856,11 @@ def main():
                     else 0
                 )
 
+
                 data_health_counts[
                     sym
                 ] = count
+
 
                 status_icon = (
                     "✅"
@@ -3088,19 +3868,24 @@ def main():
                     else "⚠️"
                 )
 
+
                 log_print(
                     f"   {sym} "
                     f"{status_icon} "
-                    f"{count} bars | "
-                    f"{test_reason}"
+                    f"{count} bars"
                 )
 
+
             active_coverage = sum(
+
                 1
-                for c in
-                data_health_counts.values()
+
+                for c
+                in data_health_counts.values()
+
                 if c > 0
             )
+
 
             log_print(
                 f"📊 DATA COVERAGE: "
@@ -3108,61 +3893,48 @@ def main():
                 f"{len(current_universe)}"
             )
 
+
             if active_coverage == 0:
 
                 log_print(
                     "🚨 MARKET DATA DOWN: "
-                    "0 symbols usable."
-                )
-
-                log_print(
+                    "0 symbols have usable bars. "
                     "⛔ ML SCAN BLOCKED."
                 )
+
 
                 time.sleep(
                     SCAN_INTERVAL_SECONDS
                 )
 
                 continue
+
 
             # ------------------------------------------------
             # VIX
             # ------------------------------------------------
 
-            (
-                panic,
-                vix,
-                vix_status,
-            ) = check_vix_volatility_regime()
-
-            if vix is None:
-
-                log_print(
-                    "🌡 VIX: "
-                    "❌ DATA UNAVAILABLE"
-                )
-
-                log_print(
-                    "🛡 HARD SAFETY: "
-                    "NO NEW ENTRIES "
-                    "UNTIL VIX DATA RETURNS."
-                )
-
-                time.sleep(
-                    SCAN_INTERVAL_SECONDS
-                )
-
-                continue
-
-            log_print(
-                f"🌡 VIX: "
-                f"{vix:.2f} | "
-                f"{vix_status}"
+            panic, vix, vix_status = (
+                check_vix_volatility_regime()
             )
 
-            # ------------------------------------------------
-            # VIX PANIC
-            # ------------------------------------------------
+
+            if vix is not None:
+
+                log_print(
+                    f"🌡 VIX: "
+                    f"{vix:.2f} | "
+                    f"{vix_status}"
+                )
+
+            else:
+
+                log_print(
+                    f"🌡 VIX: "
+                    f"{vix_status} | "
+                    "⚠️ VIX NOT AVAILABLE"
+                )
+
 
             if panic:
 
@@ -3171,11 +3943,13 @@ def main():
                     "-> NO NEW ENTRIES"
                 )
 
+
                 time.sleep(
                     SCAN_INTERVAL_SECONDS
                 )
 
                 continue
+
 
             # ------------------------------------------------
             # SCAN
@@ -3183,18 +3957,13 @@ def main():
 
             found_trade = False
 
+
             log_print(
                 "🔎 STARTING SYMBOL SCAN..."
             )
 
-            for symbol in current_universe:
 
-                if any(
-                    p["underlying"] == symbol
-                    for p in
-                    state["positions"].values()
-                ):
-                    continue
+            for symbol in current_universe:
 
                 if scan_symbol(
                     symbol,
@@ -3204,6 +3973,11 @@ def main():
                     found_trade = True
 
                     break
+
+
+            # ------------------------------------------------
+            # RESULT
+            # ------------------------------------------------
 
             if found_trade:
 
@@ -3217,9 +3991,11 @@ def main():
                     "⏸ NO TRADE THIS SCAN."
                 )
 
+
             time.sleep(
                 SCAN_INTERVAL_SECONDS
             )
+
 
         except KeyboardInterrupt:
 
@@ -3229,12 +4005,14 @@ def main():
 
             break
 
+
         except Exception as e:
 
             log_print(
                 f"❌ MAIN ERROR: "
-                f"{str(e)[:180]}"
+                f"{str(e)[:150]}"
             )
+
 
             time.sleep(
                 ERROR_SLEEP_SECONDS
