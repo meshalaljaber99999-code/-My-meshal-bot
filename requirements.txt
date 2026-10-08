@@ -6,3 +6,4 @@ pandas
 scikit-learn
 flask
 gunicorn
+yfinance
