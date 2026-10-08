@@ -1,20 +1,17 @@
-# استخدام صورة بايثون الرسمية
 FROM python:3.10-slim
 
-# تعيين مجلد العمل داخل الحاوية
 WORKDIR /app
 
-# نسخ ملف المتطلبات أولاً لتثبيتها والاستفادة من الـ Caching
-COPY requirements.txt .
+# تثبيت مكتبات النظام اللازمة لعمل LightGBM والتعلم الآلي
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 
-# تثبيت الحزم المطلوبة بدون تخزين مؤقت لتجنب الأخطاء
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# نسخ باقي ملفات المشروع إلى الحاوية
 COPY . .
 
-# تعيين المنفذ الافتراضي للتطبيق
 EXPOSE 8080
 
-# تشغيل التطبيق باستخدام Gunicorn كخادم إنتاج
 CMD ["gunicorn", "main:app", "--bind", "0.0.0.0:8080"]
