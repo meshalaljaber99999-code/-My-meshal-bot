@@ -14,5 +14,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # نسخ باقي ملفات المشروع
 COPY . .
 
-# تشغيل البوت مع تفعيل المخرجات الفورية
+# تشغيل التطبيق عبر خادم الإنتاج Gunicorn
 CMD ["gunicorn", "main:app", "--bind", "0.0.0.0:8080"]
