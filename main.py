@@ -1,4 +1,4 @@
-import os
+Import os
 import sys
 import time
 import sqlite3
@@ -850,11 +850,31 @@ def main():
                 break
             time.sleep(ERROR_SLEEP_SECONDS)
 
-if __name__ == "__main__":
-    # تشغيل خادم الويب في الخلفية لإرضاء منصة Railway
-    server_thread = threading.Thread(target=run_web_server, daemon=True)
-    server_thread.start()
-    log_print("🌐 Background Web Server started for Railway health check.")
-    
-    # تشغيل البوت الأساسي
-    main()
+# ============================================================
+# RAILWAY STARTUP
+# ============================================================
+
+def start_trading_engine():
+    log_print("=" * 70)
+    log_print("🤖 TRADING ENGINE STARTING...")
+    log_print("📡 MARKET DATA ENGINE READY")
+    log_print("🧠 ML ENGINE READY")
+    log_print("💰 PAPER TRADING MODE ACTIVE")
+    log_print("🔄 AUTO BUY / SELL ENGINE STARTED")
+    log_print("=" * 70)
+
+    try:
+        main()
+    except Exception as e:
+        log_print(f"🚨 TRADING ENGINE CRASHED: {e}")
+        raise
+
+
+# Start the trading engine when Gunicorn imports main:app
+trading_thread = threading.Thread(
+    target=start_trading_engine,
+    daemon=True,
+    name="TradingEngine"
+)
+
+trading_thread.start()
