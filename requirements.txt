@@ -4,3 +4,4 @@ optuna
 numpy
 pandas
 scikit-learn
+flask
