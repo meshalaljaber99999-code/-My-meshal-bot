@@ -190,6 +190,71 @@ def log_decision(symbol, direction, confidence, reason):
 
 
 # ============================================================
+# ROBUST STOCK DATA LOADER
+# ============================================================
+def fetch_stock_bars_robust(symbol, timeframe, start, end, purpose="SCAN"):
+    """
+    Robust Alpaca stock-bar loader.
+    Tries the configured feed first, then a default-feed request, then a
+    shorter lookback. Never hides the actual API error from the logs.
+    """
+    attempts = []
+
+    feeds = [STOCK_FEED, None]
+    sip = getattr(DataFeed, "SIP", None)
+    if sip is not None and sip not in feeds:
+        feeds.append(sip)
+
+    # Keep the original window first; then retry with a shorter window.
+    windows = [(start, end), (max(start, end - timedelta(days=2)), end)]
+
+    for window_start, window_end in windows:
+        for feed in feeds:
+            try:
+                kwargs = dict(
+                    symbol_or_symbols=symbol,
+                    timeframe=timeframe,
+                    start=window_start,
+                    end=window_end,
+                )
+                if feed is not None:
+                    kwargs["feed"] = feed
+
+                feed_name = str(feed) if feed is not None else "DEFAULT"
+                log_print(
+                    f"      📡 DATA TRY | {purpose} | {symbol} | "
+                    f"{timeframe} | feed={feed_name}"
+                )
+
+                response = stock_data_client.get_stock_bars(
+                    StockBarsRequest(**kwargs)
+                )
+
+                if response and symbol in response:
+                    bars = response[symbol]
+                    if bars and len(bars) > 0:
+                        log_print(
+                            f"      ✅ DATA OK | {symbol} | bars={len(bars)} | "
+                            f"feed={feed_name}"
+                        )
+                        return bars, f"DATA OK ({feed_name}, {len(bars)} bars)"
+
+                attempts.append(f"{feed_name}: empty response")
+
+            except Exception as e:
+                msg = str(e).replace("\n", " ")[:180]
+                attempts.append(f"{feed_name}: {msg}")
+                log_print(
+                    f"      ⚠️ DATA FAIL | {purpose} | {symbol} | "
+                    f"feed={feed_name} | {msg}"
+                )
+
+    reason = " | ".join(attempts[-6:]) if attempts else "unknown data error"
+    log_print(f"      ❌ DATA UNAVAILABLE | {symbol} | {reason}")
+    return None, f"NO STOCK BAR DATA | {reason}"
+
+
+# ============================================================
 # DATABASE
 # ============================================================
 
@@ -859,33 +924,17 @@ def get_dynamic_universe():
     try:
         end = datetime.now(ET)
 
-        res = stock_data_client.get_stock_bars(
-            StockBarsRequest(
-                symbol_or_symbols=pool,
-                timeframe=TimeFrame.Hour,
-                start=end - timedelta(days=3),
-                end=end,
-                feed=STOCK_FEED,
-            )
-        )
-
-        if not res:
-            return pool
-
         volumes = {}
 
         for symbol in pool:
-            if symbol not in res:
-                continue
-
-            bars = res[symbol]
-
+            bars, _ = fetch_stock_bars_robust(
+                symbol, TimeFrame.Hour,
+                end - timedelta(days=3), end,
+                purpose="UNIVERSE",
+            )
             if not bars:
                 continue
-
-            volumes[symbol] = sum(
-                float(b.volume) for b in bars
-            )
+            volumes[symbol] = sum(float(b.volume) for b in bars)
 
         ranked = sorted(
             volumes,
@@ -2347,19 +2396,16 @@ def print_eod_summary():
 
 def scan_symbol(symbol, vix_val):
     try:
-        response = stock_data_client.get_stock_bars(
-            StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=TimeFrame.Minute,
-                start=datetime.now(ET)
-                - timedelta(days=5),
-                end=datetime.now(ET),
-                feed=STOCK_FEED,
-            )
+        bars, data_reason = fetch_stock_bars_robust(
+            symbol,
+            TimeFrame.Minute,
+            datetime.now(ET) - timedelta(days=5),
+            datetime.now(ET),
+            purpose="ML SCAN",
         )
 
-        if not response or symbol not in response:
-            reason = "NO STOCK BAR DATA"
+        if bars is None:
+            reason = data_reason
 
             save_scan(
                 symbol,
@@ -2378,8 +2424,6 @@ def scan_symbol(symbol, vix_val):
                 )
 
             return False
-
-        bars = response[symbol]
 
         if len(bars) < 80:
             reason = (
