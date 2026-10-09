@@ -1,43 +1,57 @@
 # ============================================================
-# SPX / STOCK OPTIONS PAPER BOT v16.4
+# SPX / STOCK OPTIONS PAPER BOT v16.5
 # PATIENT / TRANSPARENT / DATA-FIRST
 # ============================================================
 #
-# PAPER ONLY
+# PAPER ONLY - NO LIVE TRADING
 #
-# PRINCIPLES:
-#   1) Bad / short / stale data = WAIT
-#   2) No fake Delta
-#   3) No forced trades
-#   4) Minimum 250 ML bars
-#   5) Yahoo 1m fallback uses 7-day window
-#   6) Probability margin required
-#   7) Real option bid/ask + real Greek delta required
-#   8) Unfilled orders are cancelled
+# FIXES:
+#   1) Scan lookback increased to 72 hours
+#   2) UTC normalization before timestamp filtering
+#   3) Detailed Alpaca / Yahoo bar-count diagnostics
+#   4) Explicit data-source reporting
+#   5) Minimum 250 usable raw bars retained
+#   6) Separate insufficient-data and stale-data checks
+#   7) Training-row diagnostics after feature cleaning
+#   8) Yahoo 1m fallback limited by Yahoo's available history
+#   9) No fabricated option delta
+#  10) Unfilled orders are cancelled after timeout
 #
+# IMPORTANT:
+# This version scans STOCKS and their options.
+# It does not directly analyze the SPX index or SPX options.
 # ============================================================
 
 import os
-import sys
 import time
-import math
 import sqlite3
 import warnings
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    HistGradientBoostingClassifier,
+)
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, OptionSnapshotRequest
+from alpaca.data.historical import (
+    StockHistoricalDataClient,
+    OptionHistoricalDataClient,
+)
+
+from alpaca.data.requests import (
+    StockBarsRequest,
+    OptionSnapshotRequest,
+)
+
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed, OptionsFeed
 
@@ -55,14 +69,17 @@ API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 
 if not API_KEY or not API_SECRET:
     raise RuntimeError(
-        "Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY environment variables."
+        "Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY "
+        "environment variables. Configure them in your "
+        "deployment environment."
     )
 
 TZ = ZoneInfo("America/New_York")
 
-# ------------------------------------------------------------
-# Universe
-# ------------------------------------------------------------
+
+# ============================================================
+# UNIVERSE
+# ============================================================
 
 DEFAULT_TARGET_UNDERLYINGS = [
     "AAPL",
@@ -76,41 +93,45 @@ DEFAULT_TARGET_UNDERLYINGS = [
     "NFLX",
 ]
 
-# ------------------------------------------------------------
-# Data
-# ------------------------------------------------------------
+
+# ============================================================
+# DATA CONFIG
+# ============================================================
 
 STOCK_FEED = DataFeed.IEX
 OPTIONS_FEED = OptionsFeed.INDICATIVE
 
 TIMEFRAME = TimeFrame.Minute
 
-# THE BIG FIX
+# Minimum number of raw minute bars.
 MIN_ML_BARS = 250
 
-# During market hours the last usable bar should not be older
-# than this amount.
+# Main fix: request a longer history for the scan.
+SCAN_LOOKBACK_HOURS = 72
+
+# Health check should use the same adequate lookback.
+HEALTH_LOOKBACK_HOURS = 72
+
+# During regular market hours, latest usable bar age limit.
 MAX_DATA_AGE_MINUTES = 10
 
-# Yahoo fallback
+# Yahoo Finance intraday 1-minute fallback.
 YF_1M_PERIOD = "7d"
 
-# ------------------------------------------------------------
-# ML
-# ------------------------------------------------------------
+
+# ============================================================
+# ML CONFIG
+# ============================================================
 
 CONFIDENCE_THRESHOLD = 0.75
-
-# Winner probability must beat runner-up by at least 8%.
 MIN_PROBABILITY_MARGIN = 0.08
-
 REQUIRE_MODEL_AGREEMENT = True
-
 FUTURE_HORIZON_BARS = 2
 
-# ------------------------------------------------------------
-# Options
-# ------------------------------------------------------------
+
+# ============================================================
+# OPTIONS CONFIG
+# ============================================================
 
 MIN_DTE = 1
 MAX_DTE = 14
@@ -119,12 +140,12 @@ MIN_DELTA = 0.40
 MAX_DELTA = 0.60
 
 MAX_OPTION_PREMIUM = 15.00
-
 MAX_SPREAD_PCT = 0.10
 
-# ------------------------------------------------------------
-# Trading risk
-# ------------------------------------------------------------
+
+# ============================================================
+# PAPER TRADING RISK CONFIG
+# ============================================================
 
 BASE_CONTRACTS_PER_TRADE = 2
 MAX_CONTRACTS_PER_TRADE = 8
@@ -133,46 +154,42 @@ MAX_TRADES_PER_DAY = 5
 MAX_OPEN_POSITIONS = 2
 
 MAX_DAILY_LOSS_USD = -200
-
 MAX_VIX = 30
 
 STOP_LOSS_PCT = -0.30
-
 TARGET_PROFIT_USD = 70
 
 SCAN_INTERVAL_SECONDS = 60
-
 ORDER_FILL_TIMEOUT_SECONDS = 10
-
 SYMBOL_COOLDOWN_MINUTES = 20
-
 ERROR_SLEEP_SECONDS = 20
 
-# ------------------------------------------------------------
-# Database
-# ------------------------------------------------------------
-
-DB_FILE = "institutional_bot_v164.db"
+DB_FILE = "institutional_bot_v165.db"
 
 
 # ============================================================
-# CLIENTS
+# CLIENTS - PAPER MODE ONLY
 # ============================================================
+
+if not PAPER_MODE:
+    raise RuntimeError(
+        "SAFETY BLOCK: this script is configured for PAPER MODE only."
+    )
 
 trading_client = TradingClient(
     API_KEY,
     API_SECRET,
-    paper=True
+    paper=True,
 )
 
 stock_data_client = StockHistoricalDataClient(
     API_KEY,
-    API_SECRET
+    API_SECRET,
 )
 
 option_data_client = OptionHistoricalDataClient(
     API_KEY,
-    API_SECRET
+    API_SECRET,
 )
 
 
@@ -181,9 +198,7 @@ option_data_client = OptionHistoricalDataClient(
 # ============================================================
 
 def init_db():
-
     conn = sqlite3.connect(DB_FILE)
-
     cur = conn.cursor()
 
     cur.execute("""
@@ -239,14 +254,14 @@ def now_et():
 def log(msg):
     print(
         f"[{now_et().strftime('%Y-%m-%d %H:%M:%S ET')}] {msg}",
-        flush=True
+        flush=True,
     )
 
 
 def db_scan_log(symbol, status, bars, confidence, reason):
+    conn = None
 
     try:
-
         conn = sqlite3.connect(DB_FILE)
 
         conn.execute(
@@ -261,23 +276,25 @@ def db_scan_log(symbol, status, bars, confidence, reason):
                 status,
                 int(bars or 0),
                 float(confidence or 0),
-                reason
-            )
+                str(reason),
+            ),
         )
 
         conn.commit()
-        conn.close()
 
     except Exception as e:
         log(f"DB scan log error: {e}")
 
+    finally:
+        if conn is not None:
+            conn.close()
+
 
 # ============================================================
-# DATA NORMALIZATION
+# DATAFRAME NORMALIZATION
 # ============================================================
 
 def normalize_dataframe(df):
-
     if df is None:
         return None
 
@@ -289,60 +306,74 @@ def normalize_dataframe(df):
 
     df = df.copy()
 
-    # yfinance can return MultiIndex columns
+    # yfinance may return MultiIndex columns.
     if isinstance(df.columns, pd.MultiIndex):
-
         new_cols = []
 
-        for c in df.columns:
-
-            if isinstance(c, tuple):
-                new_cols.append(c[0])
+        for col in df.columns:
+            if isinstance(col, tuple):
+                # Usually the first level contains OHLCV names.
+                new_cols.append(col[0])
             else:
-                new_cols.append(c)
+                new_cols.append(col)
 
         df.columns = new_cols
 
-    required = ["Open", "High", "Low", "Close", "Volume"]
+    # Remove duplicate column names if present.
+    df = df.loc[:, ~pd.Index(df.columns).duplicated(keep="last")]
+
+    required = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+    ]
 
     missing = [
-        c for c in required
-        if c not in df.columns
+        col for col in required
+        if col not in df.columns
     ]
 
     if missing:
+        log(f"DATA NORMALIZATION | missing columns={missing}")
         return None
 
     df = df[required].copy()
 
-    for c in required:
-        df[c] = pd.to_numeric(
-            df[c],
-            errors="coerce"
+    for col in required:
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce",
         )
 
-    df = df.dropna()
+    df = df.dropna(subset=required)
 
     if df.empty:
         return None
 
     try:
-
-        idx = pd.to_datetime(
+        # Force every timestamp to UTC.
+        df.index = pd.to_datetime(
             df.index,
-            utc=True
+            utc=True,
+            errors="coerce",
         )
 
-        df.index = idx
+        df = df.loc[~df.index.isna()]
 
     except Exception:
         return None
 
+    if df.empty:
+        return None
+
     df = df.sort_index()
 
-    df = df[~df.index.duplicated(
-        keep="last"
-    )]
+    # Remove duplicate minute bars.
+    df = df.loc[
+        ~df.index.duplicated(keep="last")
+    ]
 
     return df
 
@@ -352,13 +383,12 @@ def normalize_dataframe(df):
 # ============================================================
 
 def assess_data_quality(bars):
-
     if bars is None:
         return {
             "status": "DOWN",
             "count": 0,
             "age_minutes": None,
-            "reason": "NO DATA"
+            "reason": "NO DATA",
         }
 
     count = len(bars)
@@ -368,82 +398,82 @@ def assess_data_quality(bars):
             "status": "DOWN",
             "count": 0,
             "age_minutes": None,
-            "reason": "EMPTY DATA"
-        }
-
-    if count < MIN_ML_BARS:
-
-        return {
-            "status": "INSUFFICIENT",
-            "count": count,
-            "age_minutes": None,
-            "reason": (
-                f"INSUFFICIENT BARS "
-                f"({count}) | NEED {MIN_ML_BARS}"
-            )
+            "reason": "EMPTY DATA",
         }
 
     try:
-
-        last_ts = bars.index[-1]
+        last_ts = pd.Timestamp(bars.index[-1])
 
         if last_ts.tzinfo is None:
             last_ts = last_ts.tz_localize("UTC")
+        else:
+            last_ts = last_ts.tz_convert("UTC")
 
-        last_ts_et = last_ts.astimezone(TZ)
+        now_utc = pd.Timestamp.now(tz="UTC")
 
-        age_seconds = (
-            now_et() - last_ts_et
-        ).total_seconds()
+        age_minutes = (
+            now_utc - last_ts
+        ).total_seconds() / 60.0
 
-        age_minutes = max(
-            0,
-            age_seconds / 60
-        )
+        # A timestamp in the future should not be accepted.
+        if age_minutes < -1:
+            return {
+                "status": "STALE",
+                "count": count,
+                "age_minutes": age_minutes,
+                "reason": "LATEST BAR TIMESTAMP IS IN THE FUTURE",
+            }
+
+        age_minutes = max(0.0, age_minutes)
 
     except Exception:
-
         return {
             "status": "STALE",
             "count": count,
             "age_minutes": None,
-            "reason": "TIMESTAMP INVALID"
+            "reason": "TIMESTAMP INVALID",
         }
 
-    # Outside market hours stale check should not kill
-    # historical preparation.
     current = now_et()
 
     market_open = current.replace(
         hour=9,
         minute=30,
         second=0,
-        microsecond=0
+        microsecond=0,
     )
 
     market_close = current.replace(
         hour=16,
         minute=0,
         second=0,
-        microsecond=0
+        microsecond=0,
     )
 
-    weekday = current.weekday() < 5
-
+    # Stale data during regular weekday trading hours
+    # must not pass the entry gate.
     if (
-        weekday
+        current.weekday() < 5
         and market_open <= current <= market_close
         and age_minutes > MAX_DATA_AGE_MINUTES
     ):
-
         return {
             "status": "STALE",
             "count": count,
             "age_minutes": age_minutes,
+            "reason": f"STALE DATA ({age_minutes:.1f}m old)",
+        }
+
+    if count < MIN_ML_BARS:
+        return {
+            "status": "INSUFFICIENT",
+            "count": count,
+            "age_minutes": age_minutes,
             "reason": (
-                f"STALE DATA "
-                f"({age_minutes:.1f}m old)"
-            )
+                f"INSUFFICIENT BARS ({count}) "
+                f"| NEED {MIN_ML_BARS} "
+                f"| AGE={age_minutes:.1f}m"
+            ),
         }
 
     return {
@@ -453,7 +483,7 @@ def assess_data_quality(bars):
         "reason": (
             f"READY | {count} bars | "
             f"age={age_minutes:.1f}m"
-        )
+        ),
     }
 
 
@@ -461,63 +491,63 @@ def assess_data_quality(bars):
 # STOCK DATA - ALPACA
 # ============================================================
 
-def fetch_alpaca_bars(
-    symbol,
-    start,
-    end
-):
-
+def fetch_alpaca_bars(symbol, start, end):
     try:
-
         request = StockBarsRequest(
             symbol_or_symbols=[symbol],
             timeframe=TIMEFRAME,
             start=start,
             end=end,
-            feed=STOCK_FEED
+            feed=STOCK_FEED,
         )
 
-        result = stock_data_client.get_stock_bars(
-            request
-        )
-
+        result = stock_data_client.get_stock_bars(request)
         df = result.df
 
         if df is None or df.empty:
+            log(f"{symbol}: ALPACA RETURNED ZERO ROWS")
             return None
 
-        # Multi-symbol response
+        # Multi-symbol response often has a symbol/time MultiIndex.
         if isinstance(df.index, pd.MultiIndex):
-
             try:
-                df = df.xs(
-                    symbol,
-                    level=0
+                df = df.xs(symbol, level=0)
+            except Exception as e:
+                log(
+                    f"{symbol}: ALPACA INDEX EXTRACTION WARNING | "
+                    f"{str(e)[:120]}"
                 )
-            except Exception:
-                pass
 
         rename = {
             "open": "Open",
             "high": "High",
             "low": "Low",
             "close": "Close",
-            "volume": "Volume"
+            "volume": "Volume",
         }
 
-        df = df.rename(
-            columns=rename
+        df = df.rename(columns=rename)
+
+        raw_count = len(df)
+
+        df = normalize_dataframe(df)
+
+        normalized_count = (
+            len(df) if df is not None else 0
         )
 
-        return normalize_dataframe(df)
+        log(
+            f"{symbol}: ALPACA BARS | "
+            f"raw={raw_count} | normalized={normalized_count}"
+        )
+
+        return df
 
     except Exception as e:
-
         log(
             f"{symbol}: Alpaca IEX failed -> "
             f"{str(e)[:180]}"
         )
-
         return None
 
 
@@ -526,12 +556,10 @@ def fetch_alpaca_bars(
 # ============================================================
 
 def fetch_yahoo_bars(symbol):
-
     try:
-
         log(
-            f"{symbol}: trying Yahoo 1m "
-            f"fallback ({YF_1M_PERIOD})"
+            f"{symbol}: YAHOO REQUEST | "
+            f"interval=1m | period={YF_1M_PERIOD}"
         )
 
         df = yf.download(
@@ -541,23 +569,34 @@ def fetch_yahoo_bars(symbol):
             auto_adjust=False,
             progress=False,
             prepost=False,
-            threads=False
+            threads=False,
+        )
+
+        raw_count = (
+            len(df) if isinstance(df, pd.DataFrame) else 0
+        )
+
+        log(
+            f"{symbol}: YAHOO RAW ROWS={raw_count}"
         )
 
         df = normalize_dataframe(df)
 
         if df is None:
+            log(f"{symbol}: YAHOO NORMALIZATION FAILED")
             return None
+
+        log(
+            f"{symbol}: YAHOO NORMALIZED ROWS={len(df)}"
+        )
 
         return df
 
     except Exception as e:
-
         log(
             f"{symbol}: Yahoo fallback failed -> "
             f"{str(e)[:180]}"
         )
-
         return None
 
 
@@ -567,17 +606,33 @@ def fetch_yahoo_bars(symbol):
 
 def fetch_stock_bars_robust(
     symbol,
-    lookback_hours=24,
-    purpose="SCAN"
+    lookback_hours=SCAN_LOOKBACK_HOURS,
+    purpose="SCAN",
 ):
-
     end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=lookback_hours)
 
-    start = (
-        end -
-        timedelta(
-            hours=lookback_hours
-        )
+    # Normalize filter timestamps to UTC explicitly.
+    start_ts = pd.Timestamp(start)
+
+    if start_ts.tzinfo is None:
+        start_ts = start_ts.tz_localize("UTC")
+    else:
+        start_ts = start_ts.tz_convert("UTC")
+
+    end_ts = pd.Timestamp(end)
+
+    if end_ts.tzinfo is None:
+        end_ts = end_ts.tz_localize("UTC")
+    else:
+        end_ts = end_ts.tz_convert("UTC")
+
+    log(
+        f"{symbol}: FETCH START | "
+        f"purpose={purpose} | "
+        f"lookback={lookback_hours}h | "
+        f"from={start_ts.isoformat()} | "
+        f"to={end_ts.isoformat()}"
     )
 
     # --------------------------------------------------------
@@ -587,31 +642,61 @@ def fetch_stock_bars_robust(
     alpaca_df = fetch_alpaca_bars(
         symbol,
         start,
-        end
+        end,
     )
 
-    if alpaca_df is not None:
+    alpaca_count = (
+        len(alpaca_df)
+        if alpaca_df is not None
+        else 0
+    )
 
-        quality = assess_data_quality(
-            alpaca_df
+    log(
+        f"{symbol}: ALPACA NORMALIZED BARS={alpaca_count}"
+    )
+
+    if alpaca_df is not None and not alpaca_df.empty:
+        alpaca_df = alpaca_df.copy()
+
+        alpaca_df.index = pd.to_datetime(
+            alpaca_df.index,
+            utc=True,
         )
 
-        if quality["status"] == "READY":
+        alpaca_df = alpaca_df.sort_index()
 
-            log(
-                f"{symbol}: "
-                f"DATA READY | "
-                f"{quality['count']} bars | "
-                f"Alpaca IEX"
-            )
+        alpaca_df = alpaca_df.loc[
+            ~alpaca_df.index.duplicated(keep="last")
+        ]
 
-            return alpaca_df, quality["reason"]
+        # Ensure bars are inside the requested window.
+        alpaca_before = len(alpaca_df)
+
+        alpaca_df = alpaca_df.loc[
+            (alpaca_df.index >= start_ts)
+            & (alpaca_df.index <= end_ts)
+        ].copy()
 
         log(
-            f"{symbol}: Alpaca data "
-            f"{quality['status']} | "
-            f"{quality['count']} bars"
+            f"{symbol}: ALPACA WINDOW FILTER | "
+            f"before={alpaca_before} | after={len(alpaca_df)}"
         )
+
+        alpaca_quality = assess_data_quality(alpaca_df)
+
+        log(
+            f"{symbol}: ALPACA QUALITY | "
+            f"{alpaca_quality['status']} | "
+            f"{alpaca_quality['reason']}"
+        )
+
+        if alpaca_quality["status"] == "READY":
+            log(
+                f"{symbol}: DATA SOURCE=ALPACA IEX | "
+                f"FINAL BARS={len(alpaca_df)}"
+            )
+
+            return alpaca_df, alpaca_quality["reason"]
 
     # --------------------------------------------------------
     # 2. Yahoo fallback
@@ -619,46 +704,75 @@ def fetch_stock_bars_robust(
 
     yahoo_df = fetch_yahoo_bars(symbol)
 
-    if yahoo_df is not None:
-
-        # Keep only requested recent area if possible (تم تعديل السطر لتجنب مشكلة tzinfo)
-        yahoo_df = yahoo_df[
-            yahoo_df.index >= pd.Timestamp(start)
-        ]
-
-        quality = assess_data_quality(
-            yahoo_df
-        )
-
-        if quality["status"] == "READY":
-
-            log(
-                f"{symbol}: "
-                f"DATA READY | "
-                f"{quality['count']} bars | "
-                f"YFINANCE FALLBACK"
-            )
-
-            return (
-                yahoo_df,
-                quality["reason"]
-            )
-
+    if yahoo_df is None or yahoo_df.empty:
         log(
-            f"{symbol}: "
-            f"YFINANCE {quality['status']} | "
-            f"{quality['count']} bars"
+            f"{symbol}: BOTH SOURCES FAILED OR EMPTY | "
+            f"ALPACA={alpaca_count} | YAHOO=0"
         )
 
-        return (
-            yahoo_df,
-            quality["reason"]
-        )
+        return None, "NO DATA FROM ALPACA OR YAHOO"
 
-    return (
-        None,
-        "NO DATA FROM ALPACA OR YAHOO"
+    yahoo_df = yahoo_df.copy()
+
+    # Force UTC before comparisons to prevent timezone errors.
+    yahoo_df.index = pd.to_datetime(
+        yahoo_df.index,
+        utc=True,
     )
+
+    yahoo_df = yahoo_df.sort_index()
+
+    yahoo_df = yahoo_df.loc[
+        ~yahoo_df.index.duplicated(keep="last")
+    ]
+
+    yahoo_raw_count = len(yahoo_df)
+
+    # Filter to requested window, including the end boundary.
+    yahoo_df = yahoo_df.loc[
+        (yahoo_df.index >= start_ts)
+        & (yahoo_df.index <= end_ts)
+    ].copy()
+
+    yahoo_filtered_count = len(yahoo_df)
+
+    log(
+        f"{symbol}: YAHOO FILTER | "
+        f"before={yahoo_raw_count} | "
+        f"after={yahoo_filtered_count} | "
+        f"removed={yahoo_raw_count - yahoo_filtered_count}"
+    )
+
+    if yahoo_df.empty:
+        log(
+            f"{symbol}: YAHOO HAS NO BARS IN REQUESTED WINDOW"
+        )
+
+        return None, "YAHOO EMPTY AFTER TIME FILTER"
+
+    yahoo_quality = assess_data_quality(yahoo_df)
+
+    log(
+        f"{symbol}: YAHOO QUALITY | "
+        f"{yahoo_quality['status']} | "
+        f"{yahoo_quality['reason']}"
+    )
+
+    if yahoo_quality["status"] == "READY":
+        log(
+            f"{symbol}: DATA SOURCE=YAHOO | "
+            f"FINAL BARS={len(yahoo_df)}"
+        )
+
+        return yahoo_df, yahoo_quality["reason"]
+
+    log(
+        f"{symbol}: YAHOO NOT READY | "
+        f"FINAL BARS={len(yahoo_df)} | "
+        f"REASON={yahoo_quality['reason']}"
+    )
+
+    return yahoo_df, yahoo_quality["reason"]
 
 
 # ============================================================
@@ -666,40 +780,21 @@ def fetch_stock_bars_robust(
 # ============================================================
 
 def calculate_rsi(series, period=14):
-
     delta = series.diff()
 
-    gain = delta.clip(
-        lower=0
-    )
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    loss = -delta.clip(
-        upper=0
-    )
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
 
-    avg_gain = gain.rolling(
-        period
-    ).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
 
-    avg_loss = loss.rolling(
-        period
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(
-        0,
-        np.nan
-    )
-
-    rsi = 100 - (
-        100 / (1 + rs)
-    )
-
-    return rsi
+    return 100 - (100 / (1 + rs))
 
 
 def build_features(bars):
-
-    if bars is None:
+    if bars is None or bars.empty:
         return None
 
     df = bars.copy()
@@ -709,131 +804,63 @@ def build_features(bars):
     low = df["Low"]
     volume = df["Volume"]
 
-    # --------------------------------------------------------
     # Trend
-    # --------------------------------------------------------
-
     df["ema9"] = close.ewm(
         span=9,
-        adjust=False
+        adjust=False,
     ).mean()
 
     df["ema20"] = close.ewm(
         span=20,
-        adjust=False
+        adjust=False,
     ).mean()
 
     df["ema50"] = close.ewm(
         span=50,
-        adjust=False
+        adjust=False,
     ).mean()
 
-    # --------------------------------------------------------
     # RSI
-    # --------------------------------------------------------
+    df["rsi"] = calculate_rsi(close, 14)
 
-    df["rsi"] = calculate_rsi(
-        close,
-        14
-    )
-
-    # --------------------------------------------------------
     # Returns
-    # --------------------------------------------------------
-
     df["return_1"] = close.pct_change(1)
-
     df["return_3"] = close.pct_change(3)
-
     df["return_5"] = close.pct_change(5)
-
     df["return_10"] = close.pct_change(10)
 
-    # --------------------------------------------------------
     # EMA distances
-    # --------------------------------------------------------
+    df["ema9_dist"] = close / df["ema9"] - 1
+    df["ema20_dist"] = close / df["ema20"] - 1
+    df["ema50_dist"] = close / df["ema50"] - 1
 
-    df["ema9_dist"] = (
-        close / df["ema9"] - 1
-    )
-
-    df["ema20_dist"] = (
-        close / df["ema20"] - 1
-    )
-
-    df["ema50_dist"] = (
-        close / df["ema50"] - 1
-    )
-
-    # --------------------------------------------------------
     # ATR
-    # --------------------------------------------------------
-
     prev_close = close.shift(1)
 
     tr1 = high - low
-
-    tr2 = (
-        high - prev_close
-    ).abs()
-
-    tr3 = (
-        low - prev_close
-    ).abs()
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
 
     true_range = pd.concat(
         [tr1, tr2, tr3],
-        axis=1
+        axis=1,
     ).max(axis=1)
 
-    df["atr"] = (
-        true_range
-        .rolling(14)
-        .mean()
-    )
+    df["atr"] = true_range.rolling(14).mean()
+    df["atr_pct"] = df["atr"] / close
 
-    df["atr_pct"] = (
-        df["atr"] / close
-    )
-
-    # --------------------------------------------------------
-    # Volume Z
-    # --------------------------------------------------------
-
-    vol_mean = (
-        volume
-        .rolling(30)
-        .mean()
-    )
-
-    vol_std = (
-        volume
-        .rolling(30)
-        .std()
-    )
+    # Volume Z-score
+    vol_mean = volume.rolling(30).mean()
+    vol_std = volume.rolling(30).std()
 
     df["volume_z"] = (
         (volume - vol_mean)
         / vol_std.replace(0, np.nan)
     )
 
-    # --------------------------------------------------------
     # Breakout
-    # --------------------------------------------------------
-
-    rolling_high = (
-        high
-        .rolling(20)
-        .max()
-        .shift(1)
-    )
-
-    rolling_low = (
-        low
-        .rolling(20)
-        .min()
-        .shift(1)
-    )
+    rolling_high = high.rolling(20).max().shift(1)
+    rolling_low = low.rolling(20).min().shift(1)
 
     df["breakout_up"] = (
         close > rolling_high
@@ -843,18 +870,15 @@ def build_features(bars):
         close < rolling_low
     ).astype(int)
 
-    # --------------------------------------------------------
     # Trend regime
-    # --------------------------------------------------------
-
     df["trend_up"] = (
-        (df["ema9"] > df["ema20"]) &
-        (df["ema20"] > df["ema50"])
+        (df["ema9"] > df["ema20"])
+        & (df["ema20"] > df["ema50"])
     ).astype(int)
 
     df["trend_down"] = (
-        (df["ema9"] < df["ema20"]) &
-        (df["ema20"] < df["ema50"])
+        (df["ema9"] < df["ema20"])
+        & (df["ema20"] < df["ema50"])
     ).astype(int)
 
     return df
@@ -882,28 +906,20 @@ FEATURE_COLUMNS = [
 ]
 
 
-def make_training_dataset(
-    feature_df
-):
+def make_training_dataset(feature_df):
+    if feature_df is None or feature_df.empty:
+        log("ML DATASET ERROR | feature dataframe is empty")
+        return None, None
 
     df = feature_df.copy()
 
-    # Future return
     df["future_return"] = (
-        df["Close"]
-        .shift(-FUTURE_HORIZON_BARS)
+        df["Close"].shift(-FUTURE_HORIZON_BARS)
         / df["Close"]
         - 1
     )
 
-    # --------------------------------------------------------
-    # 3 classes
-    #
-    #  1 = UP
-    #  0 = NEUTRAL
-    # -1 = DOWN
-    # --------------------------------------------------------
-
+    # 1 = UP, 0 = NEUTRAL, -1 = DOWN
     threshold = 0.0005
 
     df["target"] = np.where(
@@ -912,20 +928,21 @@ def make_training_dataset(
         np.where(
             df["future_return"] < -threshold,
             -1,
-            0
-        )
+            0,
+        ),
     )
+
+    rows_before_cleaning = len(df)
 
     df = df.dropna(
         subset=FEATURE_COLUMNS + ["target"]
     )
 
-    if len(df) < MIN_ML_BARS - 30:
-        return None, None
+    rows_after_cleaning = len(df)
 
     X = df[FEATURE_COLUMNS].replace(
         [np.inf, -np.inf],
-        np.nan
+        np.nan,
     )
 
     y = df["target"]
@@ -935,8 +952,30 @@ def make_training_dataset(
     X = X.loc[valid]
     y = y.loc[valid]
 
+    log(
+        f"ML DATASET | "
+        f"before_cleaning={rows_before_cleaning} | "
+        f"after_cleaning={rows_after_cleaning} | "
+        f"valid_rows={len(X)} | "
+        f"features={len(FEATURE_COLUMNS)}"
+    )
+
+    # Keep the original hard requirement of at least 150
+    # cleaned training rows, while logging the 250-bar
+    # preference separately.
     if len(X) < 150:
+        log(
+            f"ML DATASET REJECTED | "
+            f"valid_rows={len(X)} | minimum=150"
+        )
         return None, None
+
+    if len(X) < MIN_ML_BARS - 30:
+        log(
+            f"ML DATASET WARNING | "
+            f"valid_rows={len(X)} | "
+            f"preferred minimum={MIN_ML_BARS - 30}"
+        )
 
     return X, y
 
@@ -948,13 +987,12 @@ def make_training_dataset(
 class MultiModelEnsembleEngine:
 
     def __init__(self):
-
         self.lgb_like = HistGradientBoostingClassifier(
             max_iter=80,
             learning_rate=0.05,
             max_leaf_nodes=15,
             l2_regularization=1.0,
-            random_state=42
+            random_state=42,
         )
 
         self.rf = RandomForestClassifier(
@@ -963,126 +1001,78 @@ class MultiModelEnsembleEngine:
             min_samples_leaf=4,
             class_weight="balanced_subsample",
             random_state=42,
-            n_jobs=-1
+            n_jobs=-1,
         )
 
     def train(self, X, y):
-
-        # Time-series style split.
-        # We do not use future observations to train
-        # the decision model for the current bar.
-
-        split = int(
-            len(X) * 0.80
-        )
+        split = int(len(X) * 0.80)
 
         if split < 100:
+            log(
+                f"MODEL TRAINING FAILED | "
+                f"training split too small ({split})"
+            )
             return False
 
         X_train = X.iloc[:split]
         y_train = y.iloc[:split]
 
-        # Need at least two classes
         if y_train.nunique() < 2:
+            log(
+                "MODEL TRAINING FAILED | "
+                "training data contains fewer than 2 classes"
+            )
             return False
 
-        self.lgb_like.fit(
-            X_train,
-            y_train
-        )
+        try:
+            self.lgb_like.fit(X_train, y_train)
+            self.rf.fit(X_train, y_train)
+            return True
 
-        self.rf.fit(
-            X_train,
-            y_train
-        )
-
-        return True
+        except Exception as e:
+            log(f"MODEL TRAINING ERROR | {str(e)[:180]}")
+            return False
 
     @staticmethod
     def probabilities(model, X):
-
         raw = model.predict_proba(X)[0]
-
         classes = model.classes_
 
         result = {
             -1: 0.0,
             0: 0.0,
-            1: 0.0
+            1: 0.0,
         }
 
-        for cls, prob in zip(
-            classes,
-            raw
-        ):
+        for cls, prob in zip(classes, raw):
             result[int(cls)] = float(prob)
 
         return result
 
     def predict(self, X):
+        p1 = self.probabilities(self.lgb_like, X)
+        p2 = self.probabilities(self.rf, X)
 
-        p1 = self.probabilities(
-            self.lgb_like,
-            X
-        )
+        direction1 = max(p1, key=p1.get)
+        direction2 = max(p2, key=p2.get)
 
-        p2 = self.probabilities(
-            self.rf,
-            X
-        )
-
-        # ----------------------------------------------------
-        # Model agreement
-        # ----------------------------------------------------
-
-        direction1 = max(
-            p1,
-            key=p1.get
-        )
-
-        direction2 = max(
-            p2,
-            key=p2.get
-        )
-
-        agreement = (
-            direction1 == direction2
-        )
-
-        # ----------------------------------------------------
-        # Ensemble probabilities
-        # ----------------------------------------------------
+        agreement = direction1 == direction2
 
         combined = {
-            k: (
-                p1[k] +
-                p2[k]
-            ) / 2
+            k: (p1[k] + p2[k]) / 2
             for k in [-1, 0, 1]
         }
 
-        direction = max(
-            combined,
-            key=combined.get
-        )
+        direction = max(combined, key=combined.get)
 
         sorted_probs = sorted(
             combined.values(),
-            reverse=True
+            reverse=True,
         )
 
         confidence = sorted_probs[0]
-
-        second = (
-            sorted_probs[1]
-            if len(sorted_probs) > 1
-            else 0
-        )
-
-        margin = (
-            confidence -
-            second
-        )
+        second = sorted_probs[1] if len(sorted_probs) > 1 else 0.0
+        margin = confidence - second
 
         return {
             "direction": direction,
@@ -1091,7 +1081,7 @@ class MultiModelEnsembleEngine:
             "agreement": agreement,
             "model1": p1,
             "model2": p2,
-            "combined": combined
+            "combined": combined,
         }
 
 
@@ -1099,120 +1089,102 @@ class MultiModelEnsembleEngine:
 # ML SIGNAL
 # ============================================================
 
-def get_ml_signal(
-    bars
-):
-
-    quality = assess_data_quality(
-        bars
-    )
+def get_ml_signal(bars):
+    quality = assess_data_quality(bars)
 
     if quality["status"] != "READY":
-
         return {
             "trade": False,
             "direction": 0,
-            "confidence": 0,
-            "margin": 0,
-            "reason": quality["reason"]
+            "confidence": 0.0,
+            "margin": 0.0,
+            "reason": quality["reason"],
         }
 
-    features = build_features(
-        bars
+    log(
+        f"ML INPUT | raw_bars={len(bars)} | "
+        f"minimum={MIN_ML_BARS}"
     )
+
+    features = build_features(bars)
 
     if features is None:
-
         return {
             "trade": False,
             "direction": 0,
-            "confidence": 0,
-            "margin": 0,
-            "reason": "FEATURE BUILD FAILED"
+            "confidence": 0.0,
+            "margin": 0.0,
+            "reason": "FEATURE BUILD FAILED",
         }
 
-    X, y = make_training_dataset(
-        features
+    log(
+        f"ML FEATURES | rows={len(features)} | "
+        f"columns={len(features.columns)}"
     )
 
-    if X is None:
+    X, y = make_training_dataset(features)
 
+    if X is None or y is None:
         return {
             "trade": False,
             "direction": 0,
-            "confidence": 0,
-            "margin": 0,
-            "reason": "TRAINING DATA INSUFFICIENT"
+            "confidence": 0.0,
+            "margin": 0.0,
+            "reason": "TRAINING DATA INSUFFICIENT",
+        }
+
+    if len(X) < 150:
+        return {
+            "trade": False,
+            "direction": 0,
+            "confidence": 0.0,
+            "margin": 0.0,
+            "reason": f"INSUFFICIENT TRAINING ROWS ({len(X)})",
         }
 
     engine = MultiModelEnsembleEngine()
 
-    trained = engine.train(
-        X,
-        y
-    )
-
-    if not trained:
-
+    if not engine.train(X, y):
         return {
             "trade": False,
             "direction": 0,
-            "confidence": 0,
-            "margin": 0,
-            "reason": "MODEL TRAINING FAILED"
+            "confidence": 0.0,
+            "margin": 0.0,
+            "reason": "MODEL TRAINING FAILED",
         }
 
-    latest = features[
-        FEATURE_COLUMNS
-    ].replace(
+    latest = features[FEATURE_COLUMNS].replace(
         [np.inf, -np.inf],
-        np.nan
+        np.nan,
     ).dropna()
 
     if latest.empty:
-
         return {
             "trade": False,
             "direction": 0,
-            "confidence": 0,
-            "margin": 0,
-            "reason": "LATEST FEATURES INVALID"
+            "confidence": 0.0,
+            "margin": 0.0,
+            "reason": "LATEST FEATURES INVALID",
         }
 
     X_live = latest.tail(1)
-
-    result = engine.predict(
-        X_live
-    )
+    result = engine.predict(X_live)
 
     direction = result["direction"]
     confidence = result["confidence"]
     margin = result["margin"]
     agreement = result["agreement"]
 
-    # --------------------------------------------------------
-    # Neutral
-    # --------------------------------------------------------
-
     if direction == 0:
-
         return {
             "trade": False,
             "direction": 0,
             "confidence": confidence,
             "margin": margin,
-            "reason": (
-                f"NEUTRAL | "
-                f"confidence={confidence:.1%}"
-            )
+            "reason": f"NEUTRAL | confidence={confidence:.1%}",
         }
 
-    # --------------------------------------------------------
-    # Confidence
-    # --------------------------------------------------------
-
     if confidence < CONFIDENCE_THRESHOLD:
-
         return {
             "trade": False,
             "direction": direction,
@@ -1220,17 +1192,11 @@ def get_ml_signal(
             "margin": margin,
             "reason": (
                 f"CONFIDENCE LOW | "
-                f"{confidence:.1%} < "
-                f"{CONFIDENCE_THRESHOLD:.1%}"
-            )
+                f"{confidence:.1%} < {CONFIDENCE_THRESHOLD:.1%}"
+            ),
         }
 
-    # --------------------------------------------------------
-    # Probability margin
-    # --------------------------------------------------------
-
     if margin < MIN_PROBABILITY_MARGIN:
-
         return {
             "trade": False,
             "direction": direction,
@@ -1238,26 +1204,17 @@ def get_ml_signal(
             "margin": margin,
             "reason": (
                 f"PROBABILITY MARGIN LOW | "
-                f"{margin:.1%} < "
-                f"{MIN_PROBABILITY_MARGIN:.1%}"
-            )
+                f"{margin:.1%} < {MIN_PROBABILITY_MARGIN:.1%}"
+            ),
         }
 
-    # --------------------------------------------------------
-    # Model agreement
-    # --------------------------------------------------------
-
-    if (
-        REQUIRE_MODEL_AGREEMENT
-        and not agreement
-    ):
-
+    if REQUIRE_MODEL_AGREEMENT and not agreement:
         return {
             "trade": False,
             "direction": direction,
             "confidence": confidence,
             "margin": margin,
-            "reason": "MODEL DISAGREEMENT"
+            "reason": "MODEL DISAGREEMENT",
         }
 
     return {
@@ -1271,16 +1228,15 @@ def get_ml_signal(
             f"confidence={confidence:.1%} | "
             f"margin={margin:.1%} | "
             f"agreement={agreement}"
-        )
+        ),
     }
 
 
 # ============================================================
-# BASIC MARKET FILTERS
+# MARKET / ACCOUNT
 # ============================================================
 
 def get_market_clock():
-
     try:
         return trading_client.get_clock()
     except Exception as e:
@@ -1289,7 +1245,6 @@ def get_market_clock():
 
 
 def market_is_open():
-
     clock = get_market_clock()
 
     if clock is None:
@@ -1299,7 +1254,6 @@ def market_is_open():
 
 
 def get_account():
-
     try:
         return trading_client.get_account()
     except Exception as e:
@@ -1308,7 +1262,6 @@ def get_account():
 
 
 def get_open_positions():
-
     try:
         return trading_client.get_all_positions()
     except Exception as e:
@@ -1317,53 +1270,39 @@ def get_open_positions():
 
 
 def get_open_position_count():
-
-    return len(
-        get_open_positions()
-    )
+    return len(get_open_positions())
 
 
 def get_today_trade_count():
-
     try:
-
-        orders = trading_client.get_orders(
-            filter=None
-        )
-
+        orders = trading_client.get_orders(filter=None)
         today = now_et().date()
-
         count = 0
 
         for order in orders:
-
-            created = getattr(
-                order,
-                "created_at",
-                None
-            )
+            created = getattr(order, "created_at", None)
 
             if created is None:
                 continue
 
             try:
-                d = created.astimezone(
-                    TZ
-                ).date()
+                created_ts = pd.Timestamp(created)
+
+                if created_ts.tzinfo is None:
+                    created_ts = created_ts.tz_localize("UTC")
+
+                order_date = created_ts.tz_convert(TZ).date()
+
             except Exception:
                 continue
 
-            if d == today:
+            if order_date == today:
                 count += 1
 
         return count
 
     except Exception as e:
-
-        log(
-            f"Trade count error: {e}"
-        )
-
+        log(f"Trade count error: {e}")
         return 0
 
 
@@ -1372,58 +1311,38 @@ def get_today_trade_count():
 # ============================================================
 
 def get_vix():
-
     try:
-
         df = yf.download(
             "^VIX",
             period="2d",
             interval="5m",
             auto_adjust=False,
             progress=False,
-            threads=False
+            threads=False,
         )
 
-        df = normalize_dataframe(
-            df
-        )
+        df = normalize_dataframe(df)
 
         if df is None or df.empty:
             return None
 
-        return float(
-            df["Close"].iloc[-1]
-        )
+        return float(df["Close"].iloc[-1])
 
     except Exception as e:
-
-        log(
-            f"VIX unavailable: {str(e)[:150]}"
-        )
-
+        log(f"VIX unavailable: {str(e)[:150]}")
         return None
 
 
 def vix_filter():
-
     vix = get_vix()
 
     if vix is None:
-
-        # Conservative:
-        # unknown VIX = do not trade.
         return False, "VIX UNKNOWN"
 
     if vix > MAX_VIX:
+        return False, f"VIX TOO HIGH {vix:.2f} > {MAX_VIX}"
 
-        return False, (
-            f"VIX TOO HIGH "
-            f"{vix:.2f} > {MAX_VIX}"
-        )
-
-    return True, (
-        f"VIX OK {vix:.2f}"
-    )
+    return True, f"VIX OK {vix:.2f}"
 
 
 # ============================================================
@@ -1431,22 +1350,14 @@ def vix_filter():
 # ============================================================
 
 def get_daily_pnl():
-
     account = get_account()
 
     if account is None:
         return None
 
     try:
-
-        equity = float(
-            account.equity
-        )
-
-        last_equity = float(
-            account.last_equity
-        )
-
+        equity = float(account.equity)
+        last_equity = float(account.last_equity)
         return equity - last_equity
 
     except Exception:
@@ -1454,23 +1365,15 @@ def get_daily_pnl():
 
 
 def daily_loss_filter():
-
     pnl = get_daily_pnl()
 
     if pnl is None:
-
         return False, "DAILY PNL UNKNOWN"
 
     if pnl <= MAX_DAILY_LOSS_USD:
+        return False, f"DAILY LOSS LIMIT {pnl:.2f}"
 
-        return False, (
-            f"DAILY LOSS LIMIT "
-            f"{pnl:.2f}"
-        )
-
-    return True, (
-        f"DAILY PNL {pnl:+.2f}"
-    )
+    return True, f"DAILY PNL {pnl:+.2f}"
 
 
 # ============================================================
@@ -1480,27 +1383,16 @@ def daily_loss_filter():
 def get_option_contracts(
     underlying,
     option_type,
-    underlying_price
+    underlying_price,
 ):
-
     try:
-
         from alpaca.trading.requests import GetOptionContractsRequest
 
         today = now_et().date()
 
-        exp_min = (
-            today +
-            timedelta(days=MIN_DTE)
-        )
+        exp_min = today + timedelta(days=MIN_DTE)
+        exp_max = today + timedelta(days=MAX_DTE)
 
-        exp_max = (
-            today +
-            timedelta(days=MAX_DTE)
-        )
-
-        # Approximate strike window.
-        # Delta is checked later using REAL Greeks.
         strike_low = underlying_price * 0.92
         strike_high = underlying_price * 1.08
 
@@ -1512,32 +1404,24 @@ def get_option_contracts(
             type=option_type,
             strike_price_gte=strike_low,
             strike_price_lte=strike_high,
-            limit=1000
+            limit=1000,
         )
 
-        result = trading_client.get_option_contracts(
-            req
-        )
+        result = trading_client.get_option_contracts(req)
 
         contracts = getattr(
             result,
             "option_contracts",
-            None
+            None,
         )
 
-        if contracts is None:
-            return []
-
-        return contracts
+        return contracts if contracts is not None else []
 
     except Exception as e:
-
         log(
-            f"{underlying}: "
-            f"contract search failed -> "
+            f"{underlying}: contract search failed -> "
             f"{str(e)[:180]}"
         )
-
         return []
 
 
@@ -1545,29 +1429,21 @@ def get_option_contracts(
 # OPTION SNAPSHOT
 # ============================================================
 
-def get_option_snapshot(
-    symbol
-):
-
+def get_option_snapshot(symbol):
     try:
-
         req = OptionSnapshotRequest(
             symbol_or_symbols=[symbol],
-            feed=OPTIONS_FEED
+            feed=OPTIONS_FEED,
         )
 
-        result = option_data_client.get_option_snapshot(
-            req
-        )
+        result = option_data_client.get_option_snapshot(req)
 
-        # SDK versions may return dict-like
         if hasattr(result, "get"):
             snap = result.get(symbol)
         else:
             snap = None
 
         if snap is None:
-
             try:
                 snap = result[symbol]
             except Exception:
@@ -1576,13 +1452,10 @@ def get_option_snapshot(
         return snap
 
     except Exception as e:
-
         log(
-            f"{symbol}: "
-            f"snapshot failed -> "
+            f"{symbol}: snapshot failed -> "
             f"{str(e)[:160]}"
         )
-
         return None
 
 
@@ -1591,20 +1464,12 @@ def get_option_snapshot(
 # ============================================================
 
 def attr(obj, name, default=None):
-
     if obj is None:
         return default
 
     try:
-        value = getattr(
-            obj,
-            name
-        )
-
-        if value is None:
-            return default
-
-        return value
+        value = getattr(obj, name)
+        return default if value is None else value
 
     except Exception:
         return default
@@ -1617,74 +1482,45 @@ def attr(obj, name, default=None):
 def select_option_contract(
     underlying,
     direction,
-    underlying_price
+    underlying_price,
 ):
-
-    option_type = (
-        "call"
-        if direction == 1
-        else "put"
-    )
+    option_type = "call" if direction == 1 else "put"
 
     contracts = get_option_contracts(
         underlying,
         option_type,
-        underlying_price
+        underlying_price,
     )
 
     if not contracts:
-
         return None, "NO CONTRACTS"
 
     candidates = []
 
     for contract in contracts:
-
-        symbol = attr(
-            contract,
-            "symbol"
-        )
+        symbol = attr(contract, "symbol")
 
         if not symbol:
             continue
 
-        expiration = attr(
-            contract,
-            "expiration_date"
-        )
+        expiration = attr(contract, "expiration_date")
+        strike = attr(contract, "strike_price")
 
-        strike = attr(
-            contract,
-            "strike_price"
-        )
-
-        if expiration is None:
-            continue
-
-        if strike is None:
+        if expiration is None or strike is None:
             continue
 
         try:
-
-            if isinstance(
-                expiration,
-                datetime
-            ):
+            if isinstance(expiration, datetime):
                 exp_date = expiration.date()
             else:
                 exp_date = expiration
 
-            dte = (
-                exp_date -
-                now_et().date()
-            ).days
+            dte = (exp_date - now_et().date()).days
 
         except Exception:
             continue
 
-        if not (
-            MIN_DTE <= dte <= MAX_DTE
-        ):
+        if not MIN_DTE <= dte <= MAX_DTE:
             continue
 
         try:
@@ -1692,39 +1528,19 @@ def select_option_contract(
         except Exception:
             continue
 
-        snap = get_option_snapshot(
-            symbol
-        )
+        snap = get_option_snapshot(symbol)
 
         if snap is None:
             continue
 
-        quote = attr(
-            snap,
-            "latest_quote"
-        )
+        quote = attr(snap, "latest_quote")
+        greeks = attr(snap, "greeks")
 
-        greeks = attr(
-            snap,
-            "greeks"
-        )
-
-        # ----------------------------------------------------
-        # REAL DELTA ONLY
-        # ----------------------------------------------------
-
-        delta = attr(
-            greeks,
-            "delta"
-        )
+        # Require a real Greek value from the data source.
+        delta = attr(greeks, "delta")
 
         if delta is None:
-
-            log(
-                f"{symbol}: "
-                f"REJECT | NO REAL DELTA"
-            )
-
+            log(f"{symbol}: REJECT | NO REAL DELTA")
             continue
 
         try:
@@ -1732,289 +1548,68 @@ def select_option_contract(
         except Exception:
             continue
 
-        if option_type == "put":
-            abs_delta = abs(delta)
-        else:
-            abs_delta = abs(delta)
+        abs_delta = abs(delta)
 
-        if not (
-            MIN_DELTA
-            <= abs_delta
-            <= MAX_DELTA
-        ):
+        if not MIN_DELTA <= abs_delta <= MAX_DELTA:
             continue
 
-        # ----------------------------------------------------
-        # REAL BID / ASK
-        # ----------------------------------------------------
-
-        bid = attr(
-            quote,
-            "bid_price"
-        )
-
-        ask = attr(
-            quote,
-            "ask_price"
-        )
+        bid = attr(quote, "bid_price")
+        ask = attr(quote, "ask_price")
 
         if bid is None or ask is None:
             continue
 
         try:
-
             bid = float(bid)
             ask = float(ask)
-
         except Exception:
             continue
 
-        if bid <= 0 or ask <= 0:
+        if bid <= 0 or ask <= 0 or ask < bid:
             continue
 
-        if ask < bid:
-            continue
-
-        mid = (
-            bid + ask
-        ) / 2
+        mid = (bid + ask) / 2
 
         if mid <= 0:
             continue
 
-        spread_pct = (
-            (ask - bid)
-            / mid
-        )
+        spread_pct = (ask - bid) / mid
 
         if spread_pct > MAX_SPREAD_PCT:
-
             continue
 
         if ask > MAX_OPTION_PREMIUM:
-
             continue
 
-        candidates.append(
-            {
-                "symbol": symbol,
-                "type": option_type,
-                "strike": strike,
-                "expiration": exp_date,
-                "dte": dte,
-                "delta": delta,
-                "bid": bid,
-                "ask": ask,
-                "mid": mid,
-                "spread_pct": spread_pct
-            }
-        )
+        candidates.append({
+            "symbol": symbol,
+            "type": option_type,
+            "strike": strike,
+            "expiration": exp_date,
+            "dte": dte,
+            "delta": delta,
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "spread_pct": spread_pct,
+        })
 
     if not candidates:
-
         return (
             None,
-            "NO OPTION PASSED REAL DELTA / QUOTE FILTER"
+            "NO OPTION PASSED REAL DELTA / QUOTE FILTER",
         )
 
-    # --------------------------------------------------------
-    # Rank
-    # --------------------------------------------------------
+    def score(item):
+        delta_score = abs(abs(item["delta"]) - 0.50)
+        spread_score = item["spread_pct"]
+        dte_score = abs(item["dte"] - 5) * 0.01
 
-    def score(x):
+        return delta_score * 2 + spread_score + dte_score
 
-        delta_score = abs(
-            abs(x["delta"]) - 0.50
-        )
+    candidates.sort(key=score)
 
-        spread_score = x[
-            "spread_pct"
-        ]
-
-        dte_score = abs(
-            x["dte"] - 5
-        ) * 0.01
-
-        return (
-            delta_score * 2
-            + spread_score
-            + dte_score
-        )
-
-    candidates.sort(
-        key=score
-    )
-
-    return (
-        candidates[0],
-        "OPTION SELECTED"
-    )
-
-
-# ============================================================
-# ORDER
-# ============================================================
-
-def submit_option_order(
-    option,
-    confidence,
-    margin,
-    direction
-):
-
-    if not PAPER_MODE:
-        raise RuntimeError(
-            "SAFETY BLOCK: PAPER_MODE must remain True."
-        )
-
-    qty = min(
-        BASE_CONTRACTS_PER_TRADE,
-        MAX_CONTRACTS_PER_TRADE
-    )
-
-    symbol = option["symbol"]
-
-    ask = option["ask"]
-
-    # Buy at ask.
-    limit_price = round(
-        ask,
-        2
-    )
-
-    log(
-        f"ORDER PREP | "
-        f"{symbol} | "
-        f"qty={qty} | "
-        f"limit=${limit_price:.2f} | "
-        f"delta={option['delta']:.3f} | "
-        f"confidence={confidence:.1%} | "
-        f"margin={margin:.1%}"
-    )
-
-    try:
-
-        order_req = LimitOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-            limit_price=limit_price
-        )
-
-        order = trading_client.submit_order(
-            order_data=order_req
-        )
-
-        order_id = str(
-            order.id
-        )
-
-        log(
-            f"ORDER SUBMITTED | "
-            f"{symbol} | "
-            f"id={order_id}"
-        )
-
-        # ----------------------------------------------------
-        # Wait for fill
-        # ----------------------------------------------------
-
-        deadline = (
-            time.time()
-            + ORDER_FILL_TIMEOUT_SECONDS
-        )
-
-        while time.time() < deadline:
-
-            time.sleep(2)
-
-            try:
-
-                current = (
-                    trading_client
-                    .get_order_by_id(
-                        order_id
-                    )
-                )
-
-                status = str(
-                    current.status
-                ).lower()
-
-                if "filled" in status:
-
-                    log(
-                        f"ORDER FILLED | "
-                        f"{symbol} | "
-                        f"qty={qty}"
-                    )
-
-                    save_trade(
-                        symbol,
-                        option,
-                        qty,
-                        confidence,
-                        margin,
-                        direction
-                    )
-
-                    return True
-
-                if (
-                    "canceled" in status
-                    or "rejected" in status
-                    or "expired" in status
-                ):
-
-                    log(
-                        f"ORDER ENDED | "
-                        f"{status}"
-                    )
-
-                    return False
-
-            except Exception as e:
-
-                log(
-                    f"Order status error: "
-                    f"{str(e)[:150]}"
-                )
-
-        # ----------------------------------------------------
-        # CRITICAL FIX:
-        # Cancel unfilled order
-        # ----------------------------------------------------
-
-        try:
-
-            trading_client.cancel_order_by_id(
-                order_id
-            )
-
-            log(
-                f"ORDER CANCELLED | "
-                f"NOT FILLED WITHIN "
-                f"{ORDER_FILL_TIMEOUT_SECONDS}s"
-            )
-
-        except Exception as e:
-
-            log(
-                f"URGENT: cancel failed | "
-                f"{str(e)[:180]}"
-            )
-
-        return False
-
-    except Exception as e:
-
-        log(
-            f"ORDER ERROR | "
-            f"{str(e)[:200]}"
-        )
-
-        return False
+    return candidates[0], "OPTION SELECTED"
 
 
 # ============================================================
@@ -2027,14 +1622,12 @@ def save_trade(
     qty,
     confidence,
     margin,
-    direction
+    direction,
 ):
+    conn = None
 
     try:
-
-        conn = sqlite3.connect(
-            DB_FILE
-        )
+        conn = sqlite3.connect(DB_FILE)
 
         conn.execute(
             """
@@ -2063,18 +1656,156 @@ def save_trade(
                 option["delta"],
                 confidence,
                 margin,
-                "v16.4 PAPER"
-            )
+                "v16.5 PAPER",
+            ),
         )
 
         conn.commit()
-        conn.close()
 
     except Exception as e:
+        log(f"Trade DB error: {e}")
+
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+# ============================================================
+# PAPER ORDER
+# ============================================================
+
+def submit_option_order(
+    option,
+    confidence,
+    margin,
+    direction,
+):
+    if not PAPER_MODE:
+        raise RuntimeError(
+            "SAFETY BLOCK: PAPER_MODE must remain True."
+        )
+
+    qty = min(
+        BASE_CONTRACTS_PER_TRADE,
+        MAX_CONTRACTS_PER_TRADE,
+    )
+
+    symbol = option["symbol"]
+    ask = option["ask"]
+
+    limit_price = round(ask, 2)
+
+    log(
+        f"ORDER PREP | "
+        f"{symbol} | "
+        f"qty={qty} | "
+        f"limit=${limit_price:.2f} | "
+        f"delta={option['delta']:.3f} | "
+        f"confidence={confidence:.1%} | "
+        f"margin={margin:.1%} | PAPER"
+    )
+
+    try:
+        order_req = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            limit_price=limit_price,
+        )
+
+        order = trading_client.submit_order(
+            order_data=order_req
+        )
+
+        order_id = str(order.id)
 
         log(
-            f"Trade DB error: {e}"
+            f"ORDER SUBMITTED | "
+            f"{symbol} | id={order_id} | PAPER"
         )
+
+        deadline = time.time() + ORDER_FILL_TIMEOUT_SECONDS
+
+        while time.time() < deadline:
+            time.sleep(2)
+
+            try:
+                current = trading_client.get_order_by_id(
+                    order_id
+                )
+
+                status = str(current.status).lower()
+
+                if "filled" in status:
+                    filled_qty = int(
+                        float(
+                            getattr(
+                                current,
+                                "filled_qty",
+                                qty,
+                            ) or qty
+                        )
+                    )
+
+                    log(
+                        f"ORDER FILLED | "
+                        f"{symbol} | qty={filled_qty}"
+                    )
+
+                    save_trade(
+                        symbol,
+                        option,
+                        filled_qty,
+                        confidence,
+                        margin,
+                        direction,
+                    )
+
+                    return True
+
+                if any(
+                    state in status
+                    for state in (
+                        "canceled",
+                        "rejected",
+                        "expired",
+                    )
+                ):
+                    log(
+                        f"ORDER ENDED | "
+                        f"status={status}"
+                    )
+                    return False
+
+            except Exception as e:
+                log(
+                    f"Order status error: {str(e)[:150]}"
+                )
+
+        # Cancel the unfilled order after the timeout.
+        try:
+            trading_client.cancel_order_by_id(order_id)
+
+            log(
+                f"ORDER CANCEL REQUESTED | "
+                f"not filled within "
+                f"{ORDER_FILL_TIMEOUT_SECONDS}s"
+            )
+
+        except Exception as e:
+            log(
+                f"URGENT: cancel request failed | "
+                f"{str(e)[:180]}"
+            )
+
+        return False
+
+    except Exception as e:
+        log(
+            f"ORDER ERROR | {str(e)[:200]}"
+        )
+        return False
 
 
 # ============================================================
@@ -2084,33 +1815,19 @@ def save_trade(
 last_trade_by_symbol = {}
 
 
-def symbol_on_cooldown(
-    symbol
-):
-
-    ts = last_trade_by_symbol.get(
-        symbol
-    )
+def symbol_on_cooldown(symbol):
+    ts = last_trade_by_symbol.get(symbol)
 
     if ts is None:
         return False
 
-    age = (
-        now_et() - ts
-    ).total_seconds() / 60
+    age = (now_et() - ts).total_seconds() / 60
 
-    return (
-        age < SYMBOL_COOLDOWN_MINUTES
-    )
+    return age < SYMBOL_COOLDOWN_MINUTES
 
 
-def mark_symbol_trade(
-    symbol
-):
-
-    last_trade_by_symbol[
-        symbol
-    ] = now_et()
+def mark_symbol_trade(symbol):
+    last_trade_by_symbol[symbol] = now_et()
 
 
 # ============================================================
@@ -2118,45 +1835,30 @@ def mark_symbol_trade(
 # ============================================================
 
 def global_filters():
-
-    # Market
     if not market_is_open():
-
         return False, "MARKET CLOSED"
 
-    # Open positions
-    open_count = (
-        get_open_position_count()
-    )
+    open_count = get_open_position_count()
 
     if open_count >= MAX_OPEN_POSITIONS:
-
         return False, (
             f"MAX OPEN POSITIONS "
             f"{open_count}/{MAX_OPEN_POSITIONS}"
         )
 
-    # Daily trades
-    trade_count = (
-        get_today_trade_count()
-    )
+    trade_count = get_today_trade_count()
 
     if trade_count >= MAX_TRADES_PER_DAY:
-
         return False, (
             f"MAX DAILY TRADES "
             f"{trade_count}/{MAX_TRADES_PER_DAY}"
         )
 
-    # Daily loss
-    ok, reason = (
-        daily_loss_filter()
-    )
+    ok, reason = daily_loss_filter()
 
     if not ok:
         return False, reason
 
-    # VIX
     ok, reason = vix_filter()
 
     if not ok:
@@ -2169,54 +1871,34 @@ def global_filters():
 # SCAN SYMBOL
 # ============================================================
 
-def scan_symbol(
-    symbol
-):
-
-    log(
-        f"--------------------------------------------------"
-    )
-
-    log(
-        f"SCAN {symbol}"
-    )
+def scan_symbol(symbol):
+    log("--------------------------------------------------")
+    log(f"SCAN {symbol}")
 
     if symbol_on_cooldown(symbol):
-
-        log(
-            f"{symbol}: "
-            f"WAIT | SYMBOL COOLDOWN"
-        )
-
+        log(f"{symbol}: WAIT | SYMBOL COOLDOWN")
         return False
 
-    bars, data_reason = (
-        fetch_stock_bars_robust(
-            symbol,
-            lookback_hours=12,
-            purpose="SCAN"
-        )
+    bars, data_reason = fetch_stock_bars_robust(
+        symbol,
+        lookback_hours=SCAN_LOOKBACK_HOURS,
+        purpose="SCAN",
     )
 
-    count = (
-        len(bars)
-        if bars is not None
-        else 0
+    count = len(bars) if bars is not None else 0
+
+    log(
+        f"{symbol}: SCAN DATA SUMMARY | "
+        f"bars={count} | "
+        f"minimum={MIN_ML_BARS} | "
+        f"reason={data_reason}"
     )
 
-    quality = assess_data_quality(
-        bars
-    )
-
-    # --------------------------------------------------------
-    # HARD DATA GATE
-    # --------------------------------------------------------
+    quality = assess_data_quality(bars)
 
     if quality["status"] != "READY":
-
         log(
-            f"{symbol}: "
-            f"ML=NO TRADE | "
+            f"{symbol}: ML=NO TRADE | "
             f"{quality['status']} | "
             f"{quality['reason']}"
         )
@@ -2226,30 +1908,16 @@ def scan_symbol(
             quality["status"],
             count,
             0,
-            quality["reason"]
+            quality["reason"],
         )
 
         return False
 
-    # --------------------------------------------------------
-    # ML
-    # --------------------------------------------------------
+    signal = get_ml_signal(bars)
 
-    signal = get_ml_signal(
-        bars
-    )
-
-    direction = signal[
-        "direction"
-    ]
-
-    confidence = signal[
-        "confidence"
-    ]
-
-    margin = signal[
-        "margin"
-    ]
+    direction = signal["direction"]
+    confidence = signal["confidence"]
+    margin = signal["margin"]
 
     log(
         f"{symbol}: "
@@ -2265,55 +1933,33 @@ def scan_symbol(
         "SIGNAL" if signal["trade"] else "WAIT",
         count,
         confidence,
-        signal["reason"]
+        signal["reason"],
     )
 
     if not signal["trade"]:
         return False
 
-    # --------------------------------------------------------
-    # Current underlying price
-    # --------------------------------------------------------
-
     try:
-
         underlying_price = float(
             bars["Close"].iloc[-1]
         )
 
     except Exception:
-
-        log(
-            f"{symbol}: "
-            f"WAIT | PRICE INVALID"
-        )
-
+        log(f"{symbol}: WAIT | PRICE INVALID")
         return False
 
-    # --------------------------------------------------------
-    # Option
-    # --------------------------------------------------------
-
-    option, option_reason = (
-        select_option_contract(
-            symbol,
-            direction,
-            underlying_price
-        )
+    option, option_reason = select_option_contract(
+        symbol,
+        direction,
+        underlying_price,
     )
 
     if option is None:
-
-        log(
-            f"{symbol}: "
-            f"WAIT | {option_reason}"
-        )
-
+        log(f"{symbol}: WAIT | {option_reason}")
         return False
 
     log(
-        f"{symbol}: "
-        f"OPTION PASS | "
+        f"{symbol}: OPTION PASS | "
         f"{option['symbol']} | "
         f"{option['type'].upper()} | "
         f"strike={option['strike']} | "
@@ -2324,35 +1970,19 @@ def scan_symbol(
         f"spread={option['spread_pct']:.1%}"
     )
 
-    # --------------------------------------------------------
-    # Order
-    # --------------------------------------------------------
-
     filled = submit_option_order(
         option,
         confidence,
         margin,
-        direction
+        direction,
     )
 
     if filled:
-
-        mark_symbol_trade(
-            symbol
-        )
-
-        log(
-            f"{symbol}: "
-            f"TRADE COMPLETE"
-        )
-
+        mark_symbol_trade(symbol)
+        log(f"{symbol}: TRADE COMPLETE")
         return True
 
-    log(
-        f"{symbol}: "
-        f"ORDER NOT FILLED -> WAIT"
-    )
-
+    log(f"{symbol}: ORDER NOT FILLED -> WAIT")
     return False
 
 
@@ -2361,79 +1991,55 @@ def scan_symbol(
 # ============================================================
 
 def health_check():
-
-    log(
-        "================ DATA HEALTH ================"
-    )
+    log("================ DATA HEALTH ================")
 
     for symbol in DEFAULT_TARGET_UNDERLYINGS:
-
         try:
-
-            bars, reason = (
-                fetch_stock_bars_robust(
-                    symbol,
-                    lookback_hours=6,
-                    purpose="HEALTH"
-                )
+            bars, reason = fetch_stock_bars_robust(
+                symbol,
+                lookback_hours=HEALTH_LOOKBACK_HOURS,
+                purpose="HEALTH",
             )
 
-            count = (
-                len(bars)
-                if bars is not None
-                else 0
-            )
+            count = len(bars) if bars is not None else 0
 
-            quality = assess_data_quality(
-                bars
-            )
+            quality = assess_data_quality(bars)
 
             if quality["status"] == "READY":
-
                 log(
-                    f"{symbol}: "
-                    f"🟢 READY | "
+                    f"{symbol}: READY | "
                     f"{count} bars | "
                     f"{reason}"
                 )
 
             elif quality["status"] == "INSUFFICIENT":
-
                 log(
-                    f"{symbol}: "
-                    f"🟡 INSUFFICIENT | "
+                    f"{symbol}: INSUFFICIENT | "
                     f"{count} bars | "
-                    f"need {MIN_ML_BARS}"
+                    f"need {MIN_ML_BARS} | "
+                    f"{reason}"
                 )
 
             elif quality["status"] == "STALE":
-
                 log(
-                    f"{symbol}: "
-                    f"🟠 STALE | "
+                    f"{symbol}: STALE | "
                     f"{count} bars | "
                     f"{reason}"
                 )
 
             else:
-
                 log(
-                    f"{symbol}: "
-                    f"🔴 DOWN | "
+                    f"{symbol}: DOWN | "
                     f"{reason}"
                 )
 
         except Exception as e:
-
             log(
-                f"{symbol}: "
-                f"HEALTH ERROR | "
+                f"{symbol}: HEALTH ERROR | "
                 f"{str(e)[:150]}"
             )
 
-    log(
-        "============================================="
-    )
+    log("=============================================")
 
 
 # ============================================================
@@ -2441,158 +2047,73 @@ def health_check():
 # ============================================================
 
 def main():
-
+    log("==================================================")
+    log("SPX / STOCK OPTIONS PAPER BOT v16.5")
+    log("PATIENT / TRANSPARENT / DATA-FIRST")
+    log("PAPER MODE = TRUE")
+    log(f"MIN ML BARS = {MIN_ML_BARS}")
+    log(f"SCAN LOOKBACK = {SCAN_LOOKBACK_HOURS} HOURS")
+    log(f"HEALTH LOOKBACK = {HEALTH_LOOKBACK_HOURS} HOURS")
+    log(f"CONFIDENCE >= {CONFIDENCE_THRESHOLD:.1%}")
     log(
-        "=================================================="
+        f"PROBABILITY MARGIN >= "
+        f"{MIN_PROBABILITY_MARGIN:.1%}"
     )
-
-    log(
-        "SPX / STOCK OPTIONS PAPER BOT v16.4"
-    )
-
-    log(
-        "PATIENT / TRANSPARENT / DATA-FIRST"
-    )
-
-    log(
-        "PAPER MODE = TRUE"
-    )
-
-    log(
-        f"MIN ML BARS = {MIN_ML_BARS}"
-    )
-
-    log(
-        f"CONFIDENCE >= {CONFIDENCE_THRESHOLD:.1%}"
-    )
-
-    log(
-        f"PROBABILITY MARGIN >= {MIN_PROBABILITY_MARGIN:.1%}"
-    )
-
-    log(
-        f"DELTA = {MIN_DELTA:.2f} - {MAX_DELTA:.2f}"
-    )
-
-    log(
-        f"MAX SPREAD = {MAX_SPREAD_PCT:.1%}"
-    )
-
-    log(
-        "=================================================="
-    )
+    log(f"DELTA = {MIN_DELTA:.2f} - {MAX_DELTA:.2f}")
+    log(f"MAX SPREAD = {MAX_SPREAD_PCT:.1%}")
+    log("UNDERLYINGS = " + ", ".join(DEFAULT_TARGET_UNDERLYINGS))
+    log("==================================================")
 
     last_health_check = 0
-
     consecutive_errors = 0
 
     while True:
-
         try:
-
-            # ------------------------------------------------
-            # Health every 10 minutes
-            # ------------------------------------------------
-
-            if (
-                time.time()
-                - last_health_check
-                > 600
-            ):
-
+            # Health check every 10 minutes.
+            if time.time() - last_health_check > 600:
                 health_check()
+                last_health_check = time.time()
 
-                last_health_check = (
-                    time.time()
-                )
-
-            # ------------------------------------------------
-            # Global gate
-            # ------------------------------------------------
-
-            ok, reason = (
-                global_filters()
-            )
+            # Global gate.
+            ok, reason = global_filters()
 
             if not ok:
-
-                log(
-                    f"GLOBAL WAIT | {reason}"
-                )
-
-                time.sleep(
-                    SCAN_INTERVAL_SECONDS
-                )
-
+                log(f"GLOBAL WAIT | {reason}")
+                time.sleep(SCAN_INTERVAL_SECONDS)
                 continue
 
-            log(
-                f"GLOBAL PASS | {reason}"
-            )
-
-            # ------------------------------------------------
-            # Scan
-            # ------------------------------------------------
+            log(f"GLOBAL PASS | {reason}")
 
             trade_done = False
 
-            for symbol in (
-                DEFAULT_TARGET_UNDERLYINGS
-            ):
-
+            for symbol in DEFAULT_TARGET_UNDERLYINGS:
                 try:
-
-                    if scan_symbol(
-                        symbol
-                    ):
-
+                    if scan_symbol(symbol):
                         trade_done = True
-
-                        # One trade per scan cycle
                         break
 
                 except Exception as e:
-
                     log(
-                        f"{symbol}: "
-                        f"SCAN ERROR | "
+                        f"{symbol}: SCAN ERROR | "
                         f"{str(e)[:200]}"
                     )
 
                     consecutive_errors += 1
-
                     time.sleep(2)
 
             if trade_done:
-
-                log(
-                    "TRADE FOUND -> "
-                    "waiting for next cycle"
-                )
-
+                log("TRADE FOUND -> waiting for next cycle")
             else:
-
-                log(
-                    "PATIENT MODE: "
-                    "لا توجد فرصة مؤكدة."
-                )
+                log("PATIENT MODE: لا توجد فرصة مؤكدة.")
 
             consecutive_errors = 0
-
-            time.sleep(
-                SCAN_INTERVAL_SECONDS
-            )
+            time.sleep(SCAN_INTERVAL_SECONDS)
 
         except KeyboardInterrupt:
-
-            log(
-                "BOT STOPPED BY USER"
-            )
-
+            log("BOT STOPPED BY USER")
             break
 
         except Exception as e:
-
             consecutive_errors += 1
 
             log(
@@ -2600,9 +2121,7 @@ def main():
                 f"{str(e)[:250]}"
             )
 
-            time.sleep(
-                ERROR_SLEEP_SECONDS
-            )
+            time.sleep(ERROR_SLEEP_SECONDS)
 
 
 # ============================================================
