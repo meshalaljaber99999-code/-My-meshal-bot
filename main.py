@@ -621,12 +621,9 @@ def fetch_stock_bars_robust(
 
     if yahoo_df is not None:
 
-        # Keep only requested recent area if possible
+        # Keep only requested recent area if possible (تم تعديل السطر لتجنب مشكلة tzinfo)
         yahoo_df = yahoo_df[
-            yahoo_df.index >= pd.Timestamp(
-                start,
-                tz="UTC"
-            )
+            yahoo_df.index >= pd.Timestamp(start)
         ]
 
         quality = assess_data_quality(
