@@ -382,24 +382,17 @@ def normalize_dataframe(df):
 # DATA QUALITY
 # ============================================================
 
+
 def assess_data_quality(bars):
-    if bars is None:
+    if bars is None or len(bars) == 0:
         return {
             "status": "DOWN",
             "count": 0,
             "age_minutes": None,
-            "reason": "NO DATA",
+            "reason": "NO DATA" if bars is None else "EMPTY DATA",
         }
 
     count = len(bars)
-
-    if count == 0:
-        return {
-            "status": "DOWN",
-            "count": 0,
-            "age_minutes": None,
-            "reason": "EMPTY DATA",
-        }
 
     try:
         last_ts = pd.Timestamp(bars.index[-1])
@@ -410,12 +403,8 @@ def assess_data_quality(bars):
             last_ts = last_ts.tz_convert("UTC")
 
         now_utc = pd.Timestamp.now(tz="UTC")
+        age_minutes = (now_utc - last_ts).total_seconds() / 60.0
 
-        age_minutes = (
-            now_utc - last_ts
-        ).total_seconds() / 60.0
-
-        # A timestamp in the future should not be accepted.
         if age_minutes < -1:
             return {
                 "status": "STALE",
@@ -437,32 +426,16 @@ def assess_data_quality(bars):
     current = now_et()
 
     market_open = current.replace(
-        hour=9,
-        minute=30,
-        second=0,
-        microsecond=0,
+        hour=9, minute=30, second=0, microsecond=0
     )
-
     market_close = current.replace(
-        hour=16,
-        minute=0,
-        second=0,
-        microsecond=0,
+        hour=16, minute=0, second=0, microsecond=0
     )
 
-    # Stale data during regular weekday trading hours
-    # must not pass the entry gate.
-    if (
-        current.weekday() < 5
-        and market_open <= current <= market_close
-        and age_minutes > MAX_DATA_AGE_MINUTES
-    ):
-        return {
-            "status": "STALE",
-            "count": count,
-            "age_minutes": age_minutes,
-            "reason": f"STALE DATA ({age_minutes:.1f}m old)",
-        }
+    weekday = current.weekday() < 5
+    in_regular_session = (
+        weekday and market_open <= current <= market_close
+    )
 
     if count < MIN_ML_BARS:
         return {
@@ -476,15 +449,36 @@ def assess_data_quality(bars):
             ),
         }
 
+    # During regular trading hours, stale data must block entry.
+    if in_regular_session and age_minutes > MAX_DATA_AGE_MINUTES:
+        return {
+            "status": "STALE",
+            "count": count,
+            "age_minutes": age_minutes,
+            "reason": f"STALE DATA DURING SESSION ({age_minutes:.1f}m old)",
+        }
+
+    # Outside regular hours, historical bars may be used for analysis,
+    # but must not be treated as permission to enter a trade.
+    if not in_regular_session:
+        return {
+            "status": "HISTORICAL_ONLY",
+            "count": count,
+            "age_minutes": age_minutes,
+            "reason": (
+                f"MARKET OUTSIDE REGULAR SESSION "
+                f"| {count} bars | age={age_minutes:.1f}m "
+                f"| ENTRY NOT AUTHORIZED"
+            ),
+        }
+
     return {
         "status": "READY",
         "count": count,
         "age_minutes": age_minutes,
-        "reason": (
-            f"READY | {count} bars | "
-            f"age={age_minutes:.1f}m"
-        ),
+        "reason": f"FRESH DATA | {count} bars | age={age_minutes:.1f}m",
     }
+
 
 
 # ============================================================
