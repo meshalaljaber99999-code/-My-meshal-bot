@@ -1,0 +1,551 @@
+
+# ============================================================
+# ALPACA AI OPTIONS BOT v17.0
+# PART 1/4 — CONFIG, CLIENTS, LOGGING, DATABASE, MARKET DATA
+# PAPER MODE ONLY — AUTOMATED OPTIONS TRADING
+# ============================================================
+
+import os
+import sys
+import time
+import json
+import math
+import sqlite3
+import logging
+import traceback
+from datetime import datetime, timedelta, date, timezone
+from zoneinfo import ZoneInfo
+from typing import Optional, Dict, List, Tuple, Any
+
+import requests
+import numpy as np
+import pandas as pd
+
+from alpaca.trading.client import TradingClient
+from alpaca.data.historical import (
+    StockHistoricalDataClient,
+    OptionHistoricalDataClient,
+)
+from alpaca.data.requests import (
+    StockBarsRequest,
+    OptionChainRequest,
+)
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed, OptionsFeed
+
+
+# =========================
+# 1. SAFETY / CONFIGURATION
+# =========================
+
+BOT_NAME = "ALPACA AI OPTIONS BOT v17.0"
+PAPER_MODE = True  # DO NOT CHANGE TO FALSE
+
+API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
+API_SECRET = os.getenv("ALPACA_API_SECRET", "").strip()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+TIMEZONE_NY = ZoneInfo("America/New_York")
+TIMEFRAME = TimeFrame.Minute
+HISTORY_DAYS = 10
+BAR_LIMIT = 10000
+MIN_TRAIN_ROWS = 150
+MAX_DATA_AGE_MINUTES = 10
+
+# Underlying stocks — this version does NOT trade SPX/SPXW.
+TRADE_SYMBOLS = [
+    "AAPL", "TSLA", "NVDA", "MSFT", "AMZN",
+    "AMD", "META", "GOOGL", "NFLX",
+]
+
+MARKET_CONFIRMATION_SYMBOLS = ["SPY", "QQQ"]
+
+# Data source. IEX may have less coverage than SIP.
+STOCK_FEED_NAME = os.getenv("ALPACA_STOCK_FEED", "iex").lower()
+OPTIONS_FEED_NAME = os.getenv("ALPACA_OPTIONS_FEED", "opra").lower()
+
+if STOCK_FEED_NAME == "sip":
+    STOCK_FEED = DataFeed.SIP
+else:
+    STOCK_FEED = DataFeed.IEX
+
+# For actual option-entry validation, prefer OPRA.
+# If the account cannot access OPRA, the bot should WAIT
+# rather than silently treating indicative quotes as executable.
+OPTIONS_FEED = (
+    OptionsFeed.OPRA
+    if OPTIONS_FEED_NAME == "opra"
+    else OptionsFeed.INDICATIVE
+)
+
+# ML / signal filters — deliberately conservative initially.
+HORIZON_BARS = 2
+TARGET_MOVE_PCT = 0.0005
+MIN_PROBABILITY = 0.75
+MIN_PROBABILITY_MARGIN = 0.08
+MIN_MODEL_AGREEMENT = True
+
+# Option selection filters.
+MIN_DTE = 0
+MAX_DTE = 7
+MIN_ABS_DELTA = 0.40
+MAX_ABS_DELTA = 0.60
+MAX_OPTION_PREMIUM = 15.00
+MAX_SPREAD_PERCENT = 0.10
+MIN_OPTION_PREMIUM = 0.50
+MAX_QUOTE_AGE_SECONDS = 60
+
+# Risk limits. Dollar amounts are per account, not guarantees.
+BASE_CONTRACTS = 1
+MAX_CONTRACTS = 2
+MAX_OPEN_POSITIONS = 2
+MAX_TRADES_PER_DAY = 5
+MAX_DAILY_LOSS_USD = 200.00
+STOP_LOSS_PCT = 0.30
+TAKE_PROFIT_PCT = 0.40
+MAX_HOLD_MINUTES = 45
+
+# Execution controls.
+POLL_SECONDS = 30
+ORDER_FILL_TIMEOUT_SECONDS = 15
+SYMBOL_COOLDOWN_MINUTES = 20
+MAX_ENTRY_NOTIONAL_USD = 1500.00
+
+DB_PATH = "alpaca_ai_bot_v17.db"
+LOG_PATH = "alpaca_ai_bot_v17.log"
+
+
+# =========================
+# 2. LOGGING
+# =========================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger("alpaca_ai_bot")
+
+
+def log(message: str, level: str = "info") -> None:
+    """Unified console + file logger."""
+    fn = getattr(logger, level.lower(), logger.info)
+    fn(str(message))
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def ny_now() -> datetime:
+    return datetime.now(TIMEZONE_NY)
+
+
+def parse_datetime(value: Any) -> Optional[datetime]:
+    """Convert API timestamps to timezone-aware UTC datetimes."""
+    if value is None:
+        return None
+
+    try:
+        result = pd.Timestamp(value).to_pydatetime()
+        if result.tzinfo is None:
+            result = result.replace(tzinfo=timezone.utc)
+        return result.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def data_age_seconds(timestamp: Any) -> Optional[float]:
+    ts = parse_datetime(timestamp)
+    if ts is None:
+        return None
+    return max(0.0, (utc_now() - ts).total_seconds())
+
+
+# =========================
+# 3. ALPACA CLIENTS
+# =========================
+
+if not API_KEY or not API_SECRET:
+    raise RuntimeError(
+        "Missing ALPACA_API_KEY or ALPACA_API_SECRET. "
+        "Set them as environment variables; do not paste keys into code."
+    )
+
+if not PAPER_MODE:
+    raise RuntimeError(
+        "SAFETY STOP: This program is designed for PAPER MODE only."
+    )
+
+trading_client = TradingClient(
+    api_key=API_KEY,
+    secret_key=API_SECRET,
+    paper=True,
+)
+
+stock_data_client = StockHistoricalDataClient(
+    api_key=API_KEY,
+    secret_key=API_SECRET,
+)
+
+option_data_client = OptionHistoricalDataClient(
+    api_key=API_KEY,
+    secret_key=API_SECRET,
+)
+
+
+# =========================
+# 4. TELEGRAM
+# =========================
+
+def telegram_send(message: str) -> bool:
+    """Telegram is optional; failure never bypasses trading safety."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log("TELEGRAM | not configured; message skipped", "warning")
+        return False
+
+    url = (
+        "https://api.telegram.org/bot"
+        f"{TELEGRAM_TOKEN}/sendMessage"
+    )
+
+    try:
+        response = requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+        if response.status_code != 200:
+            log(
+                f"TELEGRAM ERROR | HTTP {response.status_code}: "
+                f"{response.text[:250]}",
+                "error",
+            )
+            return False
+        return True
+    except Exception as exc:
+        log(f"TELEGRAM ERROR | {exc}", "error")
+        return False
+
+
+# =========================
+# 5. SQLITE JOURNAL
+# =========================
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_database() -> None:
+    with db_connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_utc TEXT NOT NULL,
+                category TEXT NOT NULL,
+                symbol TEXT,
+                reason TEXT,
+                details_json TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_orders (
+                order_id TEXT PRIMARY KEY,
+                client_order_id TEXT,
+                symbol TEXT NOT NULL,
+                underlying TEXT,
+                side TEXT,
+                qty INTEGER,
+                submitted_at TEXT NOT NULL,
+                status TEXT,
+                filled_qty REAL DEFAULT 0,
+                avg_fill_price REAL,
+                note TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                option_symbol TEXT NOT NULL,
+                underlying TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty INTEGER NOT NULL,
+                entry_price REAL NOT NULL,
+                entry_time TEXT NOT NULL,
+                exit_price REAL,
+                exit_time TEXT,
+                exit_reason TEXT,
+                realized_pnl REAL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS symbol_cooldowns (
+                symbol TEXT PRIMARY KEY,
+                last_entry_utc TEXT NOT NULL
+            )
+        """)
+
+
+def record_event(
+    category: str,
+    symbol: Optional[str] = None,
+    reason: str = "",
+    details: Optional[dict] = None,
+) -> None:
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO events
+                (ts_utc, category, symbol, reason, details_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    utc_now().isoformat(),
+                    category,
+                    symbol,
+                    reason,
+                    json.dumps(details or {}, default=str),
+                ),
+            )
+    except Exception as exc:
+        log(f"DB EVENT ERROR | {exc}", "error")
+
+
+def record_order(
+    order_id: str,
+    client_order_id: str,
+    symbol: str,
+    underlying: str,
+    side: str,
+    qty: int,
+    status: str,
+    filled_qty: float = 0,
+    avg_fill_price: Optional[float] = None,
+    note: str = "",
+) -> None:
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO bot_orders (
+                    order_id, client_order_id, symbol, underlying,
+                    side, qty, submitted_at, status, filled_qty,
+                    avg_fill_price, note
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(order_id) DO UPDATE SET
+                    status=excluded.status,
+                    filled_qty=excluded.filled_qty,
+                    avg_fill_price=excluded.avg_fill_price,
+                    note=excluded.note
+                """,
+                (
+                    order_id,
+                    client_order_id,
+                    symbol,
+                    underlying,
+                    side,
+                    qty,
+                    utc_now().isoformat(),
+                    status,
+                    filled_qty,
+                    avg_fill_price,
+                    note,
+                ),
+            )
+    except Exception as exc:
+        log(f"DB ORDER ERROR | {exc}", "error")
+
+
+# =========================
+# 6. STOCK MARKET DATA
+# =========================
+
+def fetch_stock_bars(
+    symbol: str,
+    history_days: int = HISTORY_DAYS,
+    limit: int = BAR_LIMIT,
+) -> pd.DataFrame:
+    """
+    Return real Alpaca stock bars.
+    No SPY x 10 substitution is used.
+    """
+    start = utc_now() - timedelta(days=history_days)
+    end = utc_now()
+
+    try:
+        request = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TIMEFRAME,
+            start=start,
+            end=end,
+            limit=limit,
+            feed=STOCK_FEED,
+        )
+
+        response = stock_data_client.get_stock_bars(request)
+        frame = response.df
+
+        if frame is None or frame.empty:
+            record_event(
+                "DATA_WAIT", symbol,
+                "NO_BARS",
+                {"feed": STOCK_FEED_NAME},
+            )
+            log(
+                f"DATA WAIT | {symbol} | no bars | "
+                f"feed={STOCK_FEED_NAME}",
+                "warning",
+            )
+            return pd.DataFrame()
+
+        # Alpaca may return a MultiIndex (symbol, timestamp).
+        if isinstance(frame.index, pd.MultiIndex):
+            try:
+                frame = frame.xs(symbol, level=0)
+            except KeyError:
+                log(f"DATA WAIT | {symbol} | symbol missing from response",
+                    "warning")
+                return pd.DataFrame()
+
+        frame = frame.copy()
+        frame.index = pd.to_datetime(frame.index, utc=True)
+        frame = frame[~frame.index.duplicated(keep="last")]
+        frame = frame.sort_index()
+
+        required = {"open", "high", "low", "close", "volume"}
+        missing = required - set(frame.columns)
+        if missing:
+            log(
+                f"DATA WAIT | {symbol} | missing columns={sorted(missing)}",
+                "warning",
+            )
+            return pd.DataFrame()
+
+        frame = frame.dropna(subset=["open", "high", "low", "close"])
+        frame = frame[
+            (frame["close"] > 0)
+            & (frame["high"] >= frame["low"])
+        ]
+
+        if frame.empty:
+            log(f"DATA WAIT | {symbol} | no valid bars", "warning")
+            return pd.DataFrame()
+
+        last_ts = frame.index[-1].to_pydatetime()
+        age = data_age_seconds(last_ts)
+
+        log(
+            f"DATA | {symbol} | bars={len(frame)} | "
+            f"last={last_ts.isoformat()} | "
+            f"age_sec={age:.0f} | feed={STOCK_FEED_NAME}"
+        )
+
+        if age is None or age > MAX_DATA_AGE_MINUTES * 60:
+            record_event(
+                "DATA_WAIT",
+                symbol,
+                "STALE_DATA",
+                {
+                    "bars": len(frame),
+                    "last_timestamp": last_ts.isoformat(),
+                    "age_seconds": age,
+                    "feed": STOCK_FEED_NAME,
+                },
+            )
+            log(
+                f"DATA WAIT | {symbol} | STALE DATA "
+                f"| age={age} seconds",
+                "warning",
+            )
+            return pd.DataFrame()
+
+        return frame
+
+    except Exception as exc:
+        record_event(
+            "DATA_ERROR",
+            symbol,
+            str(exc),
+            {"feed": STOCK_FEED_NAME},
+        )
+        log(
+            f"DATA ERROR | {symbol} | {type(exc).__name__}: {exc}",
+            "error",
+        )
+        return pd.DataFrame()
+
+
+# =========================
+# 7. BASIC MARKET STATUS
+# =========================
+
+def market_is_open() -> bool:
+    """Use Alpaca's clock rather than assuming local time."""
+    try:
+        clock = trading_client.get_clock()
+        is_open = bool(clock.is_open)
+        log(
+            f"MARKET | open={is_open} | "
+            f"next_open={clock.next_open} | next_close={clock.next_close}"
+        )
+        return is_open
+    except Exception as exc:
+        record_event("MARKET_STATUS_ERROR", reason=str(exc))
+        log(
+            f"MARKET STATUS UNKNOWN | {exc} | trading disabled",
+            "error",
+        )
+        return False
+
+
+# =========================
+# 8. INITIALIZATION
+# =========================
+
+def initialize_part1() -> None:
+    init_database()
+
+    log("=" * 65)
+    log(BOT_NAME)
+    log("SAFETY | PAPER MODE ENABLED")
+    log(f"STOCK FEED | {STOCK_FEED_NAME}")
+    log(f"OPTIONS FEED | {OPTIONS_FEED_NAME}")
+    log(f"SYMBOLS | {', '.join(TRADE_SYMBOLS)}")
+    log("PART 1 INITIALIZED | no orders are sent by this part")
+    log("=" * 65)
+
+    try:
+        account = trading_client.get_account()
+        log(
+            f"ACCOUNT CHECK | status={account.status} | "
+            f"equity={account.equity} | "
+            f"buying_power={account.buying_power}"
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Alpaca account connection failed: {exc}"
+        ) from exc
+
+
+if __name__ == "__main__":
+    initialize_part1()
+    log(
+        "PART 1 TEST COMPLETE. "
+        "Do not expect trading yet; remaining parts are required."
+    )
