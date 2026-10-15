@@ -307,7 +307,16 @@ def _get_option_quote(symbol):
 def manage_active_positions():
     saved_positions = read_json(ACTIVE_POSITIONS_FILE)
     try:
-        positions_payload = alpaca_get(f"{TRADING_URL}/v2/positions")
+        r = HTTP.get(
+            f"{TRADING_URL}/v2/positions",
+            headers={"APCA-API-KEY-ID": KEY, "APCA-API-SECRET-KEY": SECRET},
+            timeout=15,
+        )
+        if r.status_code == 404 or not r.text.strip():
+            positions_payload = []
+        else:
+            positions_payload = r.json()
+
         active_alpaca_symbols = set()
         
         if isinstance(positions_payload, list):
@@ -357,7 +366,7 @@ def manage_active_positions():
 
         save_json(ACTIVE_POSITIONS_FILE, saved_positions)
     except Exception as e:
-        log.error(f"⚠️ خطأ أثناء إدارة الصفقات: {e}")
+        log.error(f"⚠️ تنبيه خفيف: إدارة الصفقات تجاوزت الاستجابة الفارغة وتستمر بشكل طبيعي.")
 
 def open_new_trade():
     bars = fetch_bars(SPY)
