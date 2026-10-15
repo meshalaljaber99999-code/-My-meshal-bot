@@ -61,12 +61,12 @@ SPIKE_THRESHOLD_POINTS = 5.0
 
 MAX_STRIKE_DISTANCE = 10.0  
 MAX_SPREAD_PCT = 0.35      
-COOLDOWN_MINUTES = 2       # تقليل وقت الانتظار للسماح بصفقات متكررة
+COOLDOWN_MINUTES = 2       
 
 POLL_SECONDS = 30
-PAPER_TAKE_PROFIT_PCT = 0.30  # ربح مستهدف ابتدائي 30%
-PAPER_STOP_LOSS_PCT = 0.25    # وقف خسارة ابتدائي 25%
-TRAILING_LOCK_PCT = 0.20      # حماية الأرباح المتصاعدة (ترك مسافة 20% تراجع عن أعلى قمة)
+PAPER_TAKE_PROFIT_PCT = 0.30  # ربح مستهدف 30%
+PAPER_STOP_LOSS_PCT = 0.25    # وقف خسارة 25%
+TRAILING_LOCK_PCT = 0.20      # حماية الأرباح المتصاعدة
 
 ROOT = Path(os.getenv("DATA_DIR", "."))
 ROOT.mkdir(parents=True, exist_ok=True)
@@ -112,15 +112,6 @@ def save_json(filepath, data):
         tmp.replace(filepath)
     except Exception:
         log.exception(f"Failed to save {filepath}")
-
-def parse_ts(value):
-    try:
-        t = pd.Timestamp(value)
-        if t.tzinfo is None:
-            t = t.tz_localize("UTC")
-        return t.tz_convert("UTC")
-    except Exception:
-        return None
 
 def alpaca_get(url, params=None):
     if not KEY or not SECRET:
@@ -185,7 +176,6 @@ def in_signal_window():
 
 # -------------------- BROKER ORDER EXECUTION --------------------
 def execute_order(symbol, qty=1, side="buy", order_type="market"):
-    """تنفيذ أمر حقيقي في حساب Paper Trading"""
     try:
         payload = {
             "symbol": symbol,
@@ -315,11 +305,8 @@ def _get_option_quote(symbol):
     return {"bid": bid, "ask": ask, "mid": (bid + ask) / 2}
 
 def manage_active_positions():
-    """متابعة الصفقات المفتوحة مع نظام تتبع القمة (Trailing High-Water Mark) وجني الأرباح التلقائي"""
     saved_positions = read_json(ACTIVE_POSITIONS_FILE)
-    
     try:
-        # سحب الصفقات الحقيقية المفتوحة من منصة Alpaca مباشرة لضمان المزامنة الدقيقة
         positions_payload = alpaca_get(f"{TRADING_URL}/v2/positions")
         active_alpaca_symbols = set()
         
@@ -335,16 +322,14 @@ def manage_active_positions():
                     if not math.isfinite(entry_price) or entry_price <= 0 or not math.isfinite(current_price) or current_price <= 0:
                         continue
                     
-                    # استرجاع أو تهيئة أعلى سعر وصل إليه العقد لتحديث الهدف والوقف بشكل تصاعدي
                     pos_data = saved_positions.get(sym, {})
                     highest_price = max(pos_data.get("highest_price", current_price), current_price)
                     
                     pnl_pct = (current_price - entry_price) / entry_price
                     peak_pnl_pct = (highest_price - entry_price) / entry_price
 
-                    log.info(f"📊 متابعة صفقة {sym} | الدخول: ${entry_price:.2f} | الحالي: ${current_price:.2f} | الأعلى: ${highest_price:.2f} | الربح الحالي: {pnl_pct*100:+.2f}%")
+                    log.info(f"📊 متابعة صفقة {sym} | الدخول: ${entry_price:.2f} | الحالي: ${current_price:.2f} | الأعلى: ${highest_price:.2f} | الربح: {pnl_pct*100:+.2f}%")
 
-                    # تحديث البيانات المحفوظة للقمة الجديدة
                     saved_positions[sym] = {
                         "symbol": sym,
                         "entry_price": entry_price,
@@ -353,30 +338,26 @@ def manage_active_positions():
                         "time": pos_data.get("time", stamp())
                     }
 
-                    # شرط 1: تحقيق الأهداف أو التراجع بنسبة 20% من القمة المحققة (Trailing Stop)
                     if pnl_pct >= PAPER_TAKE_PROFIT_PCT:
-                        log.info(f"🎯 تم تحقيق الهدف الرئيسي على {sym}! جاري بيع الصفقة جني أرباح...")
+                        log.info(f"🎯 تحقيق الهدف الرئيسي على {sym}! جاري بيع الصفقة جني أرباح...")
                         execute_order(sym, qty=abs(int(qty)), side="sell" if qty > 0 else "buy", order_type="market")
                         saved_positions.pop(sym, None)
                     elif peak_pnl_pct >= 0.15 and pnl_pct <= (peak_pnl_pct - TRAILING_LOCK_PCT):
-                        log.info(f"📈 تفعيل جني الأرباح المتحرك (Trailing) بعد الوصول لقمة ربح على {sym}! جاري الإغلاق...")
+                        log.info(f"📈 تفعيل جني الأرباح المتحرك (Trailing) بعد الوصول للقمة على {sym}! جاري الإغلاق...")
                         execute_order(sym, qty=abs(int(qty)), side="sell" if qty > 0 else "buy", order_type="market")
                         saved_positions.pop(sym, None)
-                    # شرط 2: وقف الخسارة التقليدي (-25%)
                     elif pnl_pct <= -PAPER_STOP_LOSS_PCT:
-                        log.info(f"🛑 بلوغ حد وقف الخسارة (-25%) على {sym}! جاري إغلاق الصفقة حفاظاً على رأس المال...")
+                        log.info(f"🛑 بلوغ وقف الخسارة (-25%) على {sym}! جاري الإغلاق...")
                         execute_order(sym, qty=abs(int(qty)), side="sell" if qty > 0 else "buy", order_type="market")
                         saved_positions.pop(sym, None)
 
-        # تنظيف الملف من الصفقات التي أُغلقت من المنصة
         to_remove = [s for s in saved_positions if s not in active_alpaca_symbols]
         for s in to_remove:
             saved_positions.pop(s, None)
 
         save_json(ACTIVE_POSITIONS_FILE, saved_positions)
-
     except Exception as e:
-        log.error(f"⚠️ خطأ أثناء إدارة الصفقات النشطة: {e}")
+        log.error(f"⚠️ خطأ أثناء إدارة الصفقات: {e}")
 
 def open_new_trade():
     bars = fetch_bars(SPY)
@@ -399,7 +380,6 @@ def open_new_trade():
         if spread > MAX_SPREAD_PCT:
             continue
 
-        # تنفيذ شراء العقد
         order = execute_order(sym, qty=1, side="buy")
         if order:
             positions = read_json(ACTIVE_POSITIONS_FILE)
@@ -411,7 +391,7 @@ def open_new_trade():
                 "time": stamp()
             }
             save_json(ACTIVE_POSITIONS_FILE, positions)
-            log.info(f"🚀 تم فتح صفقة جديدة لـ {sym} بسعر ${q['ask']:.2f} بناءً على توقع: {pred['signal']}")
+            log.info(f"🚀 فتح صفقة جديدة لـ {sym} بسعر ${q['ask']:.2f} بناءً على: {pred['signal']}")
             break
 
 # -------------------- MAIN LOOP --------------------
@@ -421,10 +401,7 @@ if __name__ == "__main__":
     while True:
         try:
             if market_open():
-                # 1. إدارة ومتابعة الصفقات المفتوحة لكل توقع جديد ومحاولة جني الأرباح وقف الخسارة المتحرك
                 manage_active_positions()
-                
-                # 2. البحث عن فرص جديدة وفتح صفقات (عدد لامحدود حسب التوقعات)
                 if in_signal_window():
                     open_new_trade()
             else:
