@@ -1,10 +1,9 @@
 # ============================================================
-# صَفاء التحليل v25.4-Points-Speed-MegaCaps | Live Trading Mode
-# التنفيذ الآلي الحقيقي (Paper) • بدون تيليجرام • متابعة مستمرة للصفقات
+# صَفاء التحليل v28.1-HyperYield-Fixed | Live Trading Engine
+# البوت المكتمل والمصحح برمجياً: التداول المتعدد + الفائدة المركبة + Breakeven
 # ============================================================
 import os
 import sys
-import csv
 import json
 import time
 import math
@@ -18,28 +17,13 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
-from sklearn.metrics import roc_auc_score, brier_score_loss
-import yfinance as yf
 
 # -------------------- CONFIG --------------------
-NAME, VERSION = "صَفاء التحليل", "25.4-Points-Speed-MegaCaps-Live"
+NAME, VERSION = "صَفاء التحليل", "28.1-HyperYield-Fixed"
 NY, UTC = ZoneInfo("America/New_York"), timezone.utc
-SPY, TF = "SPY", "5Min"
-BAR_MINUTES = 5
+TF = "5Min"
 
-TOP_LEADERS = {
-    "AAPL": 0.070,
-    "MSFT": 0.065,
-    "NVDA": 0.060,
-    "AMZN": 0.040,
-    "GOOGL": 0.035,
-    "META": 0.030,
-    "TSLA": 0.020,
-    "BRK-B": 0.020,
-    "AVGO": 0.020,
-    "LLY": 0.020,
-    "JPM": 0.015
-}
+HYPER_ASSETS = ["SPY", "QQQ", "NVDA", "TSLA"]
 
 DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
 TRADING_URL = os.getenv("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
@@ -52,25 +36,11 @@ HISTORY_DAYS = 120
 MIN_ROWS = 300
 HORIZON = 6
 
-MIN_PROB = 0.52            
-MIN_AUC = 0.47             
-MIN_SIGNAL_ACCURACY = 0.48 
-MAX_BRIER = 0.32           
-MOVE_POINTS = 3.0          
-SPIKE_THRESHOLD_POINTS = 5.0 
-
-MAX_STRIKE_DISTANCE = 10.0  
-MAX_SPREAD_PCT = 0.35      
-COOLDOWN_MINUTES = 2       
-
-POLL_SECONDS = 30
-PAPER_TAKE_PROFIT_PCT = 0.30  # ربح مستهدف 30%
-PAPER_STOP_LOSS_PCT = 0.25    # وقف خسارة 25%
-TRAILING_LOCK_PCT = 0.20      # حماية الأرباح المتصاعدة
+MAX_SPREAD_PCT = 0.15          
+POLL_SECONDS = 20
 
 ROOT = Path(os.getenv("DATA_DIR", "."))
 ROOT.mkdir(parents=True, exist_ok=True)
-STATE_FILE = ROOT / "safa_state_live_v254.json"
 ACTIVE_POSITIONS_FILE = ROOT / "safa_active_positions.json"
 
 logging.basicConfig(
@@ -79,11 +49,11 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("safaa_live")
+log = logging.getLogger("safaa_hyperyield")
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": f"SafaaAnalysisLive/{VERSION}"})
 
-# -------------------- GENERAL HELPERS --------------------
+# -------------------- HELPERS & API --------------------
 def now_ny():
     return datetime.now(NY)
 
@@ -115,7 +85,7 @@ def save_json(filepath, data):
 
 def alpaca_get(url, params=None):
     if not KEY or not SECRET:
-        raise RuntimeError("APCA_API_KEY_ID / APCA_API_SECRET_KEY غير مضبوطين")
+        raise RuntimeError("مفاتيح APCA_API_KEY_ID / APCA_API_SECRET_KEY غير مضبوطة")
     last = None
     for attempt in range(3):
         try:
@@ -125,13 +95,8 @@ def alpaca_get(url, params=None):
                 params=params,
                 timeout=15,
             )
-            if r.status_code in (401, 403):
-                raise RuntimeError(f"Alpaca authentication error: {r.status_code}")
             r.raise_for_status()
-            result = r.json()
-            if not isinstance(result, dict):
-                raise RuntimeError("Unexpected Alpaca response")
-            return result
+            return r.json()
         except Exception as exc:
             last = exc
             if attempt < 2:
@@ -140,7 +105,7 @@ def alpaca_get(url, params=None):
 
 def alpaca_post(url, payload=None):
     if not KEY or not SECRET:
-        raise RuntimeError("APCA_API_KEY_ID / APCA_API_SECRET_KEY غير مضبوطين")
+        raise RuntimeError("مفاتيح APCA_API_KEY_ID / APCA_API_SECRET_KEY غير مضبوطة")
     last = None
     for attempt in range(3):
         try:
@@ -160,39 +125,58 @@ def alpaca_post(url, payload=None):
 
 def market_open():
     n = now_ny()
-    return (
-        n.weekday() < 5
-        and (n.hour, n.minute) >= (9, 30)
-        and (n.hour, n.minute) < (16, 0)
-    )
+    return n.weekday() < 5 and (n.hour, n.minute) >= (9, 30) and (n.hour, n.minute) < (16, 0)
 
 def in_signal_window():
     n = now_ny()
-    return (
-        n.weekday() < 5
-        and (n.hour, n.minute) >= (9, 40)
-        and (n.hour, n.minute) < (15, 50)
-    )
+    return n.weekday() < 5 and (n.hour, n.minute) >= (9, 35) and (n.hour, n.minute) < (15, 45)
 
-# -------------------- BROKER ORDER EXECUTION --------------------
-def execute_order(symbol, qty=1, side="buy", order_type="market"):
+# -------------------- COMPOUND ENGINE --------------------
+def calculate_dynamic_qty(option_mid_price):
+    try:
+        acc = alpaca_get(f"{TRADING_URL}/v2/account")
+        equity = num(acc.get("equity"), 1000.0)
+
+        if equity < 10000:
+            risk_pct = 0.18      
+        elif equity < 100000:
+            risk_pct = 0.12      
+        elif equity < 1000000:
+            risk_pct = 0.07      
+        else:
+            risk_pct = 0.03      
+
+        trade_budget = equity * risk_pct
+        contract_cost = option_mid_price * 100
+
+        qty = math.floor(trade_budget / contract_cost)
+        final_qty = min(max(1, qty), 60)  
+        
+        log.info(f"💰 رأس المال: ${equity:,.2f} | نسبة الصفقة: {risk_pct*100}% | عدد العقود: {final_qty}")
+        return final_qty
+    except Exception as e:
+        log.error(f"⚠️ فشل حساب حجم الصفقة التلقائي: {e}")
+        return 1
+
+# -------------------- ORDERS & DATA --------------------
+def execute_limit_order(symbol, qty=1, side="buy", limit_price=None):
     try:
         payload = {
             "symbol": symbol,
             "qty": str(qty),
             "side": side,
-            "type": order_type,
+            "type": "limit",
+            "limit_price": str(round(limit_price, 2)),
             "time_in_force": "day"
         }
         res = alpaca_post(f"{TRADING_URL}/v2/orders", payload)
-        log.info(f"✅ تم تنفيذ أمر {side.upper()} بنجاح لعقد {symbol} - الكمية: {qty}")
+        log.info(f"✅ أمر محدد ({side.upper()}) بسعر ${limit_price:.2f} | العقد: {symbol} (كمية: {qty})")
         return res
     except Exception as e:
         log.error(f"❌ فشل تنفيذ الأمر لـ {symbol}: {e}")
         return None
 
-# -------------------- STOCK & DATA --------------------
-def fetch_bars(symbol=SPY, days=HISTORY_DAYS):
+def fetch_bars(symbol, days=HISTORY_DAYS):
     end = datetime.now(UTC)
     params = {
         "timeframe": TF,
@@ -225,7 +209,7 @@ def fetch_bars(symbol=SPY, days=HISTORY_DAYS):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.dropna(subset=["timestamp", "open", "high", "low", "close"]).drop_duplicates("timestamp", keep="last").sort_values("timestamp").set_index("timestamp")
 
-FEATURES = ["ret1", "ret3", "ret6", "ret12", "ema_spread", "ema_trend", "rsi", "atr_pct", "range_pct", "body_pct", "close_location", "volume_ratio"]
+FEATURES = ["ret1", "ret3", "ret6", "ret12", "ema_spread", "ema_trend", "rsi", "atr_pct", "body_pct"]
 
 def features_for(bars):
     f = bars.copy()
@@ -234,24 +218,20 @@ def features_for(bars):
     f["ret3"] = c.pct_change(3)
     f["ret6"] = c.pct_change(6)
     f["ret12"] = c.pct_change(12)
-    e9 = c.ewm(span=9, adjust=False, min_periods=9).mean()
-    e20 = c.ewm(span=20, adjust=False, min_periods=20).mean()
-    e50 = c.ewm(span=50, adjust=False, min_periods=50).mean()
+    e9 = c.ewm(span=9, adjust=False).mean()
+    e20 = c.ewm(span=20, adjust=False).mean()
+    e50 = c.ewm(span=50, adjust=False).mean()
     f["ema_spread"] = (e9 - e20) / c
     f["ema_trend"] = (e20 - e50) / c
     d = c.diff()
-    gain = d.clip(lower=0).ewm(alpha=1/14, adjust=False, min_periods=14).mean()
-    loss = (-d.clip(upper=0)).ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    gain = d.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-d.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     f["rsi"] = ((100 - 100 / (1 + rs)) / 100).fillna(0.5)
     prev = c.shift()
     tr = pd.concat([f["high"] - f["low"], (f["high"] - prev).abs(), (f["low"] - prev).abs()], axis=1).max(axis=1)
-    f["atr_pct"] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / c
-    rng = (f["high"] - f["low"]).clip(lower=0)
-    f["range_pct"] = rng / c
+    f["atr_pct"] = tr.ewm(alpha=1/14, adjust=False).mean() / c
     f["body_pct"] = (f["close"] - f["open"]) / c
-    f["close_location"] = ((c - f["low"]) / rng.replace(0, np.nan)).fillna(0.5)
-    f["volume_ratio"] = f["volume"] / f["volume"].rolling(20, min_periods=20).mean().replace(0, np.nan)
     return f.replace([np.inf, -np.inf], np.nan)
 
 def train_predict(bars):
@@ -264,26 +244,26 @@ def train_predict(bars):
     if len(ds) < MIN_ROWS or ds["target"].nunique() < 2:
         return {"ok": False}
     
-    model = make_pipeline(SimpleImputer(strategy="median"), RandomForestClassifier(n_estimators=180, max_depth=7, min_samples_leaf=4, class_weight="balanced", random_state=42, n_jobs=-1))
+    model = make_pipeline(SimpleImputer(strategy="median"), RandomForestClassifier(n_estimators=200, max_depth=6, class_weight="balanced", random_state=42, n_jobs=-1))
     model.fit(ds[FEATURES], ds["target"].astype(int))
     prob_up = float(model.predict_proba(f[FEATURES].iloc[[-1]])[0, 1])
     
     return {
         "ok": True,
-        "signal": "صعود 🚀" if prob_up >= 0.5 else "نزول 📉",
-        "probability": max(prob_up, 1 - prob_up) * 100,
+        "signal": "صعود 🚀" if prob_up >= 0.58 else ("نزول 📉" if prob_up <= 0.42 else "محايد ⏳"),
+        "probability": prob_up,
         "current_price": float(bars["close"].iloc[-1]),
     }
 
-# -------------------- OPTIONS & ACTIVE MANAGEMENT --------------------
+# -------------------- OPTIONS CONTRACTS --------------------
 def fetch_contracts(symbol, direction, price):
-    today = now_ny().date()
+    target_exp = (now_ny() + timedelta(days=4)).date()
     params = {
         "underlying_symbols": symbol,
         "status": "active",
         "type": "call" if direction == "صعود 🚀" else "put",
-        "expiration_date": today.isoformat(),
-        "limit": 200,
+        "expiration_date_gte": target_exp.isoformat(),
+        "limit": 30,
     }
     payload = alpaca_get(f"{TRADING_URL}/v2/options/contracts", params)
     contracts = payload.get("option_contracts") or payload.get("contracts") or []
@@ -291,10 +271,10 @@ def fetch_contracts(symbol, direction, price):
     for c in contracts:
         strike = num(c.get("strike_price"))
         sym = c.get("symbol")
-        if sym and math.isfinite(strike) and abs(strike - price) <= MAX_STRIKE_DISTANCE:
+        if sym and math.isfinite(strike) and abs(strike - price) <= (price * 0.03):
             candidates.append((abs(strike - price), c))
     candidates.sort(key=lambda x: x[0])
-    return [c for _, c in candidates[:5]]
+    return [c for _, c in candidates[:3]]
 
 def _get_option_quote(symbol):
     payload = alpaca_get(f"{DATA_URL}/v1beta1/options/quotes/latest", {"symbols": symbol, "feed": OPTION_FEED})
@@ -304,19 +284,12 @@ def _get_option_quote(symbol):
         return None
     return {"bid": bid, "ask": ask, "mid": (bid + ask) / 2}
 
+# -------------------- POSITION MANAGEMENT --------------------
 def manage_active_positions():
     saved_positions = read_json(ACTIVE_POSITIONS_FILE)
     try:
-        r = HTTP.get(
-            f"{TRADING_URL}/v2/positions",
-            headers={"APCA-API-KEY-ID": KEY, "APCA-API-SECRET-KEY": SECRET},
-            timeout=15,
-        )
-        if r.status_code == 404 or not r.text.strip():
-            positions_payload = []
-        else:
-            positions_payload = r.json()
-
+        r = HTTP.get(f"{TRADING_URL}/v2/positions", headers={"APCA-API-KEY-ID": KEY, "APCA-API-SECRET-KEY": SECRET}, timeout=15)
+        positions_payload = r.json() if r.status_code == 200 else []
         active_alpaca_symbols = set()
         
         if isinstance(positions_payload, list):
@@ -324,7 +297,7 @@ def manage_active_positions():
                 sym = pos.get("symbol")
                 if sym:
                     active_alpaca_symbols.add(sym)
-                    qty = num(pos.get("qty"))
+                    qty = abs(int(num(pos.get("qty"))))
                     entry_price = num(pos.get("avg_entry_price"))
                     current_price = num(pos.get("current_price"))
                     
@@ -337,7 +310,7 @@ def manage_active_positions():
                     pnl_pct = (current_price - entry_price) / entry_price
                     peak_pnl_pct = (highest_price - entry_price) / entry_price
 
-                    log.info(f"📊 متابعة صفقة {sym} | الدخول: ${entry_price:.2f} | الحالي: ${current_price:.2f} | الأعلى: ${highest_price:.2f} | الربح: {pnl_pct*100:+.2f}%")
+                    log.info(f"📊 صفقة {sym} | دخول: ${entry_price:.2f} | حالي: ${current_price:.2f} | الربح: {pnl_pct*100:+.2f}%")
 
                     saved_positions[sym] = {
                         "symbol": sym,
@@ -347,17 +320,31 @@ def manage_active_positions():
                         "time": pos_data.get("time", stamp())
                     }
 
-                    if pnl_pct >= PAPER_TAKE_PROFIT_PCT:
-                        log.info(f"🎯 تحقيق الهدف الرئيسي على {sym}! جاري بيع الصفقة جني أرباح...")
-                        execute_order(sym, qty=abs(int(qty)), side="sell" if qty > 0 else "buy", order_type="market")
+                    q = _get_option_quote(sym)
+                    exit_limit_price = q["mid"] if q else current_price
+
+                    # 1. اقتناص الربح الخرافي (+100% ثم هبوط 30% من القمة)
+                    if peak_pnl_pct >= 1.00 and pnl_pct <= (peak_pnl_pct - 0.30):
+                        log.info(f"🚀 جني أرباح خرافية (+100%) لـ {sym}!")
+                        execute_limit_order(sym, qty=qty, side="sell", limit_price=exit_limit_price)
                         saved_positions.pop(sym, None)
-                    elif peak_pnl_pct >= 0.15 and pnl_pct <= (peak_pnl_pct - TRAILING_LOCK_PCT):
-                        log.info(f"📈 تفعيل جني الأرباح المتحرك (Trailing) بعد الوصول للقمة على {sym}! جاري الإغلاق...")
-                        execute_order(sym, qty=abs(int(qty)), side="sell" if qty > 0 else "buy", order_type="market")
+
+                    # 2. تأمين +35% أرباح عند الوصول لـ +50%
+                    elif peak_pnl_pct >= 0.50 and pnl_pct <= 0.35:
+                        log.info(f"📈 تأمين ربح ممتاز (+35%) لـ {sym}!")
+                        execute_limit_order(sym, qty=qty, side="sell", limit_price=exit_limit_price)
                         saved_positions.pop(sym, None)
-                    elif pnl_pct <= -PAPER_STOP_LOSS_PCT:
-                        log.info(f"🛑 بلوغ وقف الخسارة (-25%) على {sym}! جاري الإغلاق...")
-                        execute_order(sym, qty=abs(int(qty)), side="sell" if qty > 0 else "buy", order_type="market")
+
+                    # 3. تفعيل Breakeven عند الوصول لـ +15%
+                    elif peak_pnl_pct >= 0.15 and pnl_pct <= 0.02:
+                        log.info(f"🛡️ تفعيل Breakeven لـ {sym}! إغلاق بدون خسارة.")
+                        execute_limit_order(sym, qty=qty, side="sell", limit_price=exit_limit_price)
+                        saved_positions.pop(sym, None)
+
+                    # 4. وقف خسارة صارم (-10%)
+                    elif pnl_pct <= -0.10:
+                        log.info(f"🛑 وقف خسارة خاطف (-10%) لـ {sym}! حماية الحساب.")
+                        execute_limit_order(sym, qty=qty, side="sell", limit_price=exit_limit_price)
                         saved_positions.pop(sym, None)
 
         to_remove = [s for s in saved_positions if s not in active_alpaca_symbols]
@@ -366,46 +353,59 @@ def manage_active_positions():
 
         save_json(ACTIVE_POSITIONS_FILE, saved_positions)
     except Exception as e:
-        log.error(f"⚠️ تنبيه خفيف: إدارة الصفقات تجاوزت الاستجابة الفارغة وتستمر بشكل طبيعي.")
+        log.error(f"⚠️ خطأ أثناء متابعة الصفقات: {e}")
 
 def open_new_trade():
-    bars = fetch_bars(SPY)
-    if bars.empty:
-        return
-    pred = train_predict(bars)
-    if not pred.get("ok"):
+    positions = read_json(ACTIVE_POSITIONS_FILE)
+    if len(positions) >= 2: 
         return
 
-    contracts = fetch_contracts(SPY, pred["signal"], pred["current_price"])
-    for c in contracts:
-        sym = c.get("symbol")
-        if not sym:
+    # استخراج الأصول التي توجد لها صفقات مفتوحة حالياً لمنع التكرار على نفس الأصل
+    active_underlying_symbols = set(pos_data.get("underlying", "") for pos_data in positions.values())
+
+    for asset in HYPER_ASSETS:
+        if asset in active_underlying_symbols:
+            continue # تجنب فتح صفتين على نفس الأصل
+
+        bars = fetch_bars(asset)
+        if bars.empty:
             continue
-        q = _get_option_quote(sym)
-        if not q:
-            continue
-        
-        spread = (q["ask"] - q["bid"]) / q["mid"]
-        if spread > MAX_SPREAD_PCT:
+        pred = train_predict(bars)
+        if not pred.get("ok") or pred["signal"] == "محايد ⏳":
             continue
 
-        order = execute_order(sym, qty=1, side="buy")
-        if order:
-            positions = read_json(ACTIVE_POSITIONS_FILE)
-            positions[sym] = {
-                "symbol": sym,
-                "entry_price": q["ask"],
-                "highest_price": q["ask"],
-                "qty": 1,
-                "time": stamp()
-            }
-            save_json(ACTIVE_POSITIONS_FILE, positions)
-            log.info(f"🚀 فتح صفقة جديدة لـ {sym} بسعر ${q['ask']:.2f} بناءً على: {pred['signal']}")
-            break
+        contracts = fetch_contracts(asset, pred["signal"], pred["current_price"])
+        for c in contracts:
+            sym = c.get("symbol")
+            if not sym or sym in positions:
+                continue
+            q = _get_option_quote(sym)
+            if not q:
+                continue
+            
+            spread = (q["ask"] - q["bid"]) / q["mid"]
+            if spread > MAX_SPREAD_PCT:
+                continue
+
+            trade_qty = calculate_dynamic_qty(q["mid"])
+
+            order = execute_limit_order(sym, qty=trade_qty, side="buy", limit_price=q["mid"])
+            if order:
+                positions[sym] = {
+                    "symbol": sym,
+                    "underlying": asset,
+                    "entry_price": q["mid"],
+                    "highest_price": q["mid"],
+                    "qty": trade_qty,
+                    "time": stamp()
+                }
+                save_json(ACTIVE_POSITIONS_FILE, positions)
+                log.info(f"🚀 فتح صفقة لـ {sym} (أصل: {asset}) | كمية: {trade_qty} | Mid: ${q['mid']:.2f} | إشارة: {pred['signal']}")
+                return 
 
 # -------------------- MAIN LOOP --------------------
 if __name__ == "__main__":
-    log.info(f"🚀 بدء تشغيل نظام التنفيذ الذكي والمتابعة المستمرة {NAME} v{VERSION}")
+    log.info(f"🚀 بدء تشغيل {NAME} v{VERSION} (الكود المصحح والجاهز بالكامل)")
     
     while True:
         try:
