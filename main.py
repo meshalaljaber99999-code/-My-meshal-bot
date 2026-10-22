@@ -1,6 +1,6 @@
 # ============================================================
 # صَفاء التحليل v31.0-SPY-TrendRider | Live Quantitative Engine
-# الإصدار الكامل: صائد تحركات الهبوط والصعود الحادة (ORB) + تتبع الأرباح المفتوحة
+# الإصدار الكامل المحسّن: ORB + Meta-Labeling AI + Telegram Alerts
 # ============================================================
 import os
 import sys
@@ -31,6 +31,9 @@ KEY = (os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY") or "").strip(
 SECRET = (os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY") or "").strip()
 STOCK_FEED = os.getenv("ALPACA_DATA_FEED", "iex").lower()
 OPTION_FEED = os.getenv("OPTIONS_FEED", "indicative").lower()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 HISTORY_DAYS = 45         
 MIN_ROWS = 250
@@ -69,6 +72,17 @@ def num(value, default=np.nan):
         return x if math.isfinite(x) else default
     except (TypeError, ValueError):
         return default
+
+def send_telegram(msg):
+    """إرسال إشعارات عملية إلى تلجرام إذا كانت الإعدادات متوفرة"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+        HTTP.post(url, json=payload, timeout=5)
+    except Exception as e:
+        log.error(f"⚠️ فشل إرسال إشعار تلجرام: {e}")
 
 def read_json(filepath):
     try:
@@ -151,7 +165,6 @@ def market_open():
 
 def in_signal_window():
     n = now_ny()
-    # فتح الصفقات مسموح به من 9:45 AM إلى 3:30 PM بتوقيت نيويورك
     return n.weekday() < 5 and (n.hour, n.minute) >= (9, 45) and (n.hour, n.minute) < (15, 30)
 
 def is_eod_close_time():
@@ -248,21 +261,22 @@ def generate_institutional_features(bars):
     rs = gain / loss.replace(0, np.nan)
     f["rsi"] = ((100 - 100 / (1 + rs)) / 100).fillna(0.5)
     
-    f.drop(columns=['trade_date', 'pv', 'sq_diff'], inplace=True, errors='ignore')
+    f = f.drop(columns=['trade_date', 'pv', 'sq_diff'], errors='ignore')
     return f.replace([np.inf, -np.inf], np.nan)
 
 # -------------------- OPENING RANGE BREAKOUT (ORB) --------------------
 def detect_opening_range_breakout(bars):
     """رصد كسر نطاق أول 15 دقيقة مصحوباً بضخ سيولة مؤسسية للسيطرة على الأيام الحادة"""
-    if bars.empty or len(bars) < 15:
+    if bars.empty or len(bars) < 20:
         return "NONE"
         
     f = bars.copy()
+    # حساب المتوسط المتحرك للحجم على البيانات كاملة قبل الفلترة لمنع NaN
+    f['vol_mean20'] = f['volume'].rolling(20).mean()
     f['ny_time'] = f.index.tz_convert(NY)
     today_date = now_ny().date()
     today_bars = f[f['ny_time'].dt.date == today_date]
     
-    # تحديد نطاق أول 15 دقيقة (9:30 AM - 9:45 AM)
     orb_bars = today_bars[(today_bars['ny_time'].dt.hour == 9) & (today_bars['ny_time'].dt.minute >= 30) & (today_bars['ny_time'].dt.minute < 45)]
     if len(orb_bars) < 3:
         return "NONE"
@@ -271,14 +285,12 @@ def detect_opening_range_breakout(bars):
     orb_low = orb_bars['low'].min()
     
     latest_close = float(today_bars['close'].iloc[-1])
-    vol_mean = today_bars['volume'].rolling(20).mean().iloc[-1]
+    vol_mean = float(today_bars['vol_mean20'].iloc[-1])
     vol_surge = float(today_bars['volume'].iloc[-1] / vol_mean) if vol_mean > 0 else 1.0
 
-    # كسر القاع وسيولة عالية (مؤشر هبوط حاد)
     if latest_close < orb_low and vol_surge >= 2.0:
         log.info(f"⚡ [ORB Breakout] كسر قاع أول 15 دقيقة (${orb_low:.2f}) مع ضخ سيولة ({vol_surge:.1f}x)!")
         return "DOWN"
-    # كسر القمة وسيولة عالية (مؤشر صعود حاد)
     elif latest_close > orb_high and vol_surge >= 2.0:
         log.info(f"⚡ [ORB Breakout] كسر قمة أول 15 دقيقة (${orb_high:.2f}) مع ضخ سيولة ({vol_surge:.1f}x)!")
         return "UP"
@@ -296,47 +308,48 @@ def train_institutional_quant_model(bars):
     f["primary_target"] = np.where(future_ret > 0.0015, 1, (np.where(future_ret < -0.0015, -1, 0)))
     
     ds = f[FEATURES + ["primary_target"]].dropna()
-    ds_valid = ds[ds["primary_target"] != 0]
+    ds_valid = ds[ds["primary_target"] != 0].copy()
     
     if len(ds_valid) < MIN_ROWS:
         return {"ok": False}
         
-    # 1. Primary Directional Classifier
-    primary_model = GradientBoostingClassifier(n_estimators=150, learning_rate=0.04, max_depth=4, random_state=42)
-    primary_model.fit(ds_valid[FEATURES], ds_valid["primary_target"])
+    # 1. Primary Directional Classifier (مغلف بـ Pipeline للقيم المفقودة)
+    primary_pipeline = make_pipeline(
+        SimpleImputer(strategy="median"),
+        GradientBoostingClassifier(n_estimators=150, learning_rate=0.04, max_depth=4, random_state=42)
+    )
+    primary_pipeline.fit(ds_valid[FEATURES], ds_valid["primary_target"])
     
     latest_feat = f[FEATURES].iloc[[-1]]
-    primary_pred = primary_model.predict(latest_feat)[0]
-    probs = primary_model.predict_proba(latest_feat)[0]
+    primary_pred = primary_pipeline.predict(latest_feat)[0]
+    probs = primary_pipeline.predict_proba(latest_feat)[0]
     
-    classes = list(primary_model.classes_)
+    classes = list(primary_pipeline.named_steps["gradientboostingclassifier"].classes_)
     prob_max = probs[classes.index(primary_pred)] if primary_pred in classes else 0.5
 
     # 2. Meta-Labeler
-    ds_valid = ds_valid.copy()
-    ds_valid["pred_signal"] = primary_model.predict(ds_valid[FEATURES])
+    ds_valid["pred_signal"] = primary_pipeline.predict(ds_valid[FEATURES])
     ds_valid["meta_target"] = np.where((ds_valid["pred_signal"] == ds_valid["primary_target"]), 1, 0)
     
     meta_prob = 0.50
     if ds_valid["meta_target"].nunique() >= 2:
-        meta_model = RandomForestClassifier(n_estimators=80, max_depth=3, random_state=42)
-        meta_model.fit(ds_valid[FEATURES], ds_valid["meta_target"])
-        meta_classes = list(meta_model.classes_)
+        meta_pipeline = make_pipeline(
+            SimpleImputer(strategy="median"),
+            RandomForestClassifier(n_estimators=80, max_depth=3, random_state=42)
+        )
+        meta_pipeline.fit(ds_valid[FEATURES], ds_valid["meta_target"])
+        meta_classes = list(meta_pipeline.named_steps["randomforestclassifier"].classes_)
         if 1 in meta_classes:
             idx1 = meta_classes.index(1)
-            meta_prob = float(meta_model.predict_proba(latest_feat)[0, idx1])
+            meta_prob = float(meta_pipeline.predict_proba(latest_feat)[0, idx1])
 
     curr_price = float(bars["close"].iloc[-1])
-    efficiency = float(f["regime_efficiency"].iloc[-1])
     zscore = float(f["vwap_zscore"].iloc[-1])
     trend_200 = float(f["trend_200"].iloc[-1])
     
-    # فحص صائد الكسر اليومي ORB
     orb_signal = detect_opening_range_breakout(bars)
-    
     signal = "محايد ⏳"
     
-    # دمج إشارات التعلم الآلي مع الكسر اليومي ORB
     if (primary_pred == 1 or orb_signal == "UP") and prob_max >= 0.55 and meta_prob >= 0.52 and trend_200 > -0.003:
         if -1.8 <= zscore <= 2.2:
             signal = "صعود 🚀"
@@ -447,9 +460,11 @@ def close_all_positions_immediately():
             qty = pos.get("qty")
             if sym and qty:
                 q = _get_option_quote(sym)
-                price = q["mid"] if q else num(pos.get("current_price"), 0.1)
+                # استخدام سعر الـ Bid للبيع لضمان التنفيذ المباشر
+                price = q["bid"] if q else num(pos.get("current_price"), 0.1)
                 execute_limit_order(sym, qty=abs(int(qty)), side="sell", limit_price=price)
         save_json(ACTIVE_POSITIONS_FILE, {})
+        send_telegram("🛑 <b>تنبيه نظام:</b> تم إغلاق جميع الصفقات المفتوحة فوراً عبر كاسر الحماية.")
     except Exception as e:
         log.error(f"خطأ أثناء الإغلاق الشامل للمحفظة: {e}")
 
@@ -519,7 +534,8 @@ def manage_active_positions():
                     continue
 
                 q = _get_option_quote(sym)
-                exit_price = q["mid"] if q else current_price
+                # استخدام سعر Bid عند إرسال أمر البيع لضمان السرعة والالتزام بالخروج
+                exit_price = q["bid"] if q else current_price
 
                 should_close = False
                 reason = ""
@@ -557,6 +573,7 @@ def manage_active_positions():
                 if should_close:
                     log.info(f"{reason} | العقد: {sym}")
                     execute_limit_order(sym, qty=qty, side="sell", limit_price=exit_price)
+                    send_telegram(f"📉 <b>إغلاق صفقة:</b> {sym}\nالسبب: {reason}\nالربح/الخسارة: {pnl_pct*100:+.2f}%")
 
         to_remove = [s for s in saved_positions if s not in active_alpaca_symbols]
         for s in to_remove:
@@ -614,7 +631,14 @@ def open_new_trade():
                 "time": stamp()
             }
             save_json(ACTIVE_POSITIONS_FILE, positions)
-            log.info(f"🚀 [صفقة TrendRider جديدة] {sym} | كمية: {trade_qty} | السعر: ${q['mid']:.2f} | إشارة: {pred['signal']} (ثقة: {win_prob*100:.1f}%)")
+            msg = (
+                f"🚀 <b>فتح صفقة جديدة ({NAME}):</b>\n"
+                f"العقد: <code>{sym}</code>\n"
+                f"الكمية: {trade_qty} | السعر: ${q['mid']:.2f}\n"
+                f"الإشارة: {pred['signal']} (مستوى الثقة: {win_prob*100:.1f}%)"
+            )
+            log.info(msg)
+            send_telegram(msg)
             return
 
 # -------------------- MAIN LOOP --------------------
