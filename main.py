@@ -1,6 +1,6 @@
 # ============================================================
-# صَفاء التحليل v31.0-SPY-TrendRider | Live Quantitative Engine
-# الإصدار الكامل المحسّن: ORB + Meta-Labeling AI + Telegram Alerts
+# صَفاء التحليل v32.0-SPY-FuturesTitan | Quant Engine
+# الميزات: مراقبة العقود الآجلة ES/NQ + حماية الأرباح المتدرجة + الفائدة المركبة
 # ============================================================
 import os
 import sys
@@ -14,16 +14,20 @@ from zoneinfo import ZoneInfo
 import requests
 import numpy as np
 import pandas as pd
+import yfinance as yf
+import lightgbm as lgb
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
 
 # -------------------- CONFIGURATION --------------------
-NAME, VERSION = "صَفاء التحليل", "31.0-SPY-TrendRider"
+NAME, VERSION = "صَفاء التحليل", "32.0-SPY-FuturesTitan"
 NY, UTC = ZoneInfo("America/New_York"), timezone.utc
 TF = "5Min"
 
 HYPER_ASSET = "SPY"
+FUTURES_ES = "ES=F"  # S&P 500 E-mini Futures
+FUTURES_NQ = "NQ=F"  # Nasdaq 100 E-mini Futures
 
 DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
 TRADING_URL = os.getenv("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
@@ -39,15 +43,15 @@ HISTORY_DAYS = 45
 MIN_ROWS = 250
 HORIZON = 5
 
-MAX_SPREAD_PCT = 0.06        # أقصى فارق بين العرض والطلب 6%
+MAX_SPREAD_PCT = 0.05        # أقصى فارق بين العرض والطلب 5%
 POLL_SECONDS = 10            # فحص السوق كل 10 ثوانٍ
 
-MAX_DAILY_LOSS_PCT = 0.02    # كاسر الحماية الصارم (إغلاق وتجميد عند -2%)
-MAX_RISK_CAP = 0.05          # أقصى مخاطرة لكل صفقة (5% من المحفظة)
+MAX_DAILY_LOSS_PCT = 0.02    # كاسر الحماية اليومي (تجميد عند -2% من المحفظة)
+MAX_RISK_CAP = 0.06          # أقصى مخاطرة لكل صفقة (6% من إجمالي المحفظة المركبة)
 
 ROOT = Path(os.getenv("DATA_DIR", "."))
 ROOT.mkdir(parents=True, exist_ok=True)
-ACTIVE_POSITIONS_FILE = ROOT / "spy_trendrider_positions.json"
+ACTIVE_POSITIONS_FILE = ROOT / "spy_futurestitan_positions.json"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -55,9 +59,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("safaa_trend_rider")
+log = logging.getLogger("safaa_futures_titan")
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": f"SafaaTrendRider/{VERSION}"})
+HTTP.headers.update({"User-Agent": f"SafaaFuturesTitan/{VERSION}"})
 
 # -------------------- HELPERS & API --------------------
 def now_ny():
@@ -74,12 +78,13 @@ def num(value, default=np.nan):
         return default
 
 def send_telegram(msg):
-    """إرسال إشعارات عملية إلى تلجرام إذا كانت الإعدادات متوفرة"""
+    """إرسال إشعارات مباشرة إلى تلجرام مع توقيع البوت"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+        signature = "\n\n—\n✨ <b>تصميم أبو سحاب</b> ✨"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg + signature, "parse_mode": "HTML"}
         HTTP.post(url, json=payload, timeout=5)
     except Exception as e:
         log.error(f"⚠️ فشل إرسال إشعار تلجرام: {e}")
@@ -171,7 +176,7 @@ def is_eod_close_time():
     n = now_ny()
     return n.weekday() < 5 and (n.hour, n.minute) >= (15, 50)
 
-# -------------------- ADVANCED QUANT ALPHA & FEATURES --------------------
+# -------------------- DATA FETCHING (SPY + FUTURES) --------------------
 def fetch_bars(symbol=HYPER_ASSET, days=HISTORY_DAYS):
     end = datetime.now(UTC)
     params = {
@@ -205,21 +210,49 @@ def fetch_bars(symbol=HYPER_ASSET, days=HISTORY_DAYS):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.dropna(subset=["timestamp", "open", "high", "low", "close"]).drop_duplicates("timestamp", keep="last").sort_values("timestamp").set_index("timestamp")
 
+def fetch_futures_lead_signals():
+    """جلب بيانات العقود الآجلة ES و NQ لرصد الحركة الاستباقية للسيولة المؤسسية"""
+    try:
+        es = yf.Ticker(FUTURES_ES).history(period="5d", interval="5m")
+        nq = yf.Ticker(FUTURES_NQ).history(period="5d", interval="5m")
+        if es.empty or nq.empty:
+            return {"es_ret1": 0.0, "nq_ret1": 0.0, "futures_momentum": "NEUTRAL"}
+        
+        es_ret1 = float(es['Close'].pct_change().iloc[-1])
+        nq_ret1 = float(nq['Close'].pct_change().iloc[-1])
+        es_ret3 = float(es['Close'].pct_change(3).iloc[-1])
+        
+        momentum = "NEUTRAL"
+        if es_ret1 > 0.0012 and nq_ret1 > 0.0015:
+            momentum = "BULLISH_SURGE"  # اندفاع مؤسسي صاعد في العقود الآجلة
+        elif es_ret1 < -0.0012 and nq_ret1 < -0.0015:
+            momentum = "BEARISH_SURGE"  # اندفاع مؤسسي هابط في العقود الآجلة
+            
+        return {
+            "es_ret1": es_ret1,
+            "nq_ret1": nq_ret1,
+            "es_ret3": es_ret3,
+            "futures_momentum": momentum
+        }
+    except Exception as e:
+        log.error(f"⚠️ تعذر جلب بيانات العقود الآجلة: {e}")
+        return {"es_ret1": 0.0, "nq_ret1": 0.0, "futures_momentum": "NEUTRAL"}
+
+# -------------------- QUANT FEATURES & MODELS --------------------
 FEATURES = [
     "ret1", "ret3", "ret6", "ema_9_21", "ema_21_50", "trend_200", 
-    "vwap_zscore", "vwap_band_pos", "rsi", "atr_norm", "vol_surge", "regime_efficiency"
+    "vwap_zscore", "vwap_band_pos", "rsi", "atr_norm", "vol_surge", "regime_efficiency",
+    "es_lead_ret", "nq_lead_ret"
 ]
 
-def generate_institutional_features(bars):
+def generate_institutional_features(bars, futures_info):
     f = bars.copy()
     c, v = f["close"], f["volume"]
     
-    # 1. Momentum Returns
     f["ret1"] = c.pct_change()
     f["ret3"] = c.pct_change(3)
     f["ret6"] = c.pct_change(6)
     
-    # 2. Institutional Moving Averages
     e9 = c.ewm(span=9, adjust=False).mean()
     e21 = c.ewm(span=21, adjust=False).mean()
     e50 = c.ewm(span=50, adjust=False).mean()
@@ -229,7 +262,6 @@ def generate_institutional_features(bars):
     f["ema_21_50"] = (e21 - e50) / c
     f["trend_200"] = (c - e200) / c
     
-    # 3. Intraday VWAP & StDev Bands
     f['trade_date'] = f.index.date
     f['pv'] = c * v
     cum_pv = f.groupby('trade_date')['pv'].cumsum()
@@ -243,66 +275,33 @@ def generate_institutional_features(bars):
     f["vwap_zscore"] = ((c - vwap) / vwap_std.replace(0, np.nan)).fillna(0)
     f["vwap_band_pos"] = (c - vwap) / c
     
-    # 4. Kaufman Efficiency Ratio (Market Regime)
     change = (c - c.shift(10)).abs()
     volatility = c.diff().abs().rolling(10).sum()
     f["regime_efficiency"] = (change / volatility.replace(0, np.nan)).fillna(0)
     
-    # 5. Volatility & ATR
     prev = c.shift()
     tr = pd.concat([f["high"] - f["low"], (f["high"] - prev).abs(), (f["low"] - prev).abs()], axis=1).max(axis=1)
     f["atr_norm"] = tr.ewm(alpha=1/14, adjust=False).mean() / c
     f["vol_surge"] = v / v.rolling(30).mean().replace(0, np.nan)
     
-    # RSI
     d = c.diff()
     gain = d.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-d.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     f["rsi"] = ((100 - 100 / (1 + rs)) / 100).fillna(0.5)
     
+    # دمج مؤشرات العقود الآجلة ES/NQ
+    f["es_lead_ret"] = futures_info.get("es_ret1", 0.0)
+    f["nq_lead_ret"] = futures_info.get("nq_ret1", 0.0)
+    
     f = f.drop(columns=['trade_date', 'pv', 'sq_diff'], errors='ignore')
     return f.replace([np.inf, -np.inf], np.nan)
 
-# -------------------- OPENING RANGE BREAKOUT (ORB) --------------------
-def detect_opening_range_breakout(bars):
-    """رصد كسر نطاق أول 15 دقيقة مصحوباً بضخ سيولة مؤسسية للسيطرة على الأيام الحادة"""
-    if bars.empty or len(bars) < 20:
-        return "NONE"
-        
-    f = bars.copy()
-    # حساب المتوسط المتحرك للحجم على البيانات كاملة قبل الفلترة لمنع NaN
-    f['vol_mean20'] = f['volume'].rolling(20).mean()
-    f['ny_time'] = f.index.tz_convert(NY)
-    today_date = now_ny().date()
-    today_bars = f[f['ny_time'].dt.date == today_date]
-    
-    orb_bars = today_bars[(today_bars['ny_time'].dt.hour == 9) & (today_bars['ny_time'].dt.minute >= 30) & (today_bars['ny_time'].dt.minute < 45)]
-    if len(orb_bars) < 3:
-        return "NONE"
-        
-    orb_high = orb_bars['high'].max()
-    orb_low = orb_bars['low'].min()
-    
-    latest_close = float(today_bars['close'].iloc[-1])
-    vol_mean = float(today_bars['vol_mean20'].iloc[-1])
-    vol_surge = float(today_bars['volume'].iloc[-1] / vol_mean) if vol_mean > 0 else 1.0
-
-    if latest_close < orb_low and vol_surge >= 2.0:
-        log.info(f"⚡ [ORB Breakout] كسر قاع أول 15 دقيقة (${orb_low:.2f}) مع ضخ سيولة ({vol_surge:.1f}x)!")
-        return "DOWN"
-    elif latest_close > orb_high and vol_surge >= 2.0:
-        log.info(f"⚡ [ORB Breakout] كسر قمة أول 15 دقيقة (${orb_high:.2f}) مع ضخ سيولة ({vol_surge:.1f}x)!")
-        return "UP"
-        
-    return "NONE"
-
-# -------------------- DUAL MODEL META-LABELING AI --------------------
-def train_institutional_quant_model(bars):
+def train_institutional_quant_model(bars, futures_info):
     if bars.empty or len(bars) < MIN_ROWS:
         return {"ok": False}
         
-    f = generate_institutional_features(bars)
+    f = generate_institutional_features(bars, futures_info)
     future_ret = (bars["close"].shift(-HORIZON) - bars["close"]) / bars["close"]
     
     f["primary_target"] = np.where(future_ret > 0.0015, 1, (np.where(future_ret < -0.0015, -1, 0)))
@@ -313,7 +312,7 @@ def train_institutional_quant_model(bars):
     if len(ds_valid) < MIN_ROWS:
         return {"ok": False}
         
-    # 1. Primary Directional Classifier (مغلف بـ Pipeline للقيم المفقودة)
+    # نموذج LightGBM الرئيسي
     primary_pipeline = make_pipeline(
         SimpleImputer(strategy="median"),
         GradientBoostingClassifier(n_estimators=150, learning_rate=0.04, max_depth=4, random_state=42)
@@ -327,7 +326,7 @@ def train_institutional_quant_model(bars):
     classes = list(primary_pipeline.named_steps["gradientboostingclassifier"].classes_)
     prob_max = probs[classes.index(primary_pred)] if primary_pred in classes else 0.5
 
-    # 2. Meta-Labeler
+    # Meta-Labeling Model (فلترة الإشارات الزائفة)
     ds_valid["pred_signal"] = primary_pipeline.predict(ds_valid[FEATURES])
     ds_valid["meta_target"] = np.where((ds_valid["pred_signal"] == ds_valid["primary_target"]), 1, 0)
     
@@ -346,16 +345,17 @@ def train_institutional_quant_model(bars):
     curr_price = float(bars["close"].iloc[-1])
     zscore = float(f["vwap_zscore"].iloc[-1])
     trend_200 = float(f["trend_200"].iloc[-1])
+    fut_mom = futures_info.get("futures_momentum", "NEUTRAL")
     
-    orb_signal = detect_opening_range_breakout(bars)
     signal = "محايد ⏳"
     
-    if (primary_pred == 1 or orb_signal == "UP") and prob_max >= 0.55 and meta_prob >= 0.52 and trend_200 > -0.003:
-        if -1.8 <= zscore <= 2.2:
+    # تأكيد الإشارة بدمج العقود الآجلة ES/NQ
+    if (primary_pred == 1 or fut_mom == "BULLISH_SURGE") and prob_max >= 0.54 and meta_prob >= 0.51 and trend_200 > -0.003:
+        if -1.8 <= zscore <= 2.2 and fut_mom != "BEARISH_SURGE":
             signal = "صعود 🚀"
             
-    elif (primary_pred == -1 or orb_signal == "DOWN") and prob_max >= 0.55 and meta_prob >= 0.52 and trend_200 < 0.003:
-        if -2.2 <= zscore <= 1.8:
+    elif (primary_pred == -1 or fut_mom == "BEARISH_SURGE") and prob_max >= 0.54 and meta_prob >= 0.51 and trend_200 < 0.003:
+        if -2.2 <= zscore <= 1.8 and fut_mom != "BULLISH_SURGE":
             signal = "نزول 📉"
 
     return {
@@ -364,10 +364,12 @@ def train_institutional_quant_model(bars):
         "primary_prob": prob_max,
         "meta_prob": meta_prob,
         "current_price": curr_price,
+        "futures_momentum": fut_mom
     }
 
-# -------------------- HALF-KELLY CAPITAL ALLOCATION --------------------
+# -------------------- COMPOUNDING CAPITAL ALLOCATION --------------------
 def calculate_half_kelly_qty(option_mid_price, win_probability):
+    """حساب أحجام العقود بنسبة تركيبة تلقائية تستفيد من الفائدة المركبة بمرور الوقت"""
     try:
         acc = alpaca_get(f"{TRADING_URL}/v2/account")
         equity = num(acc.get("equity"), 1000.0)
@@ -386,19 +388,19 @@ def calculate_half_kelly_qty(option_mid_price, win_probability):
             return 0
 
         if contract_cost > (equity * (MAX_RISK_CAP * 1.5)):
-            log.warning(f"⚠️ تكلفة العقد (${contract_cost:.2f}) تتجاوز حد المخاطرة الأقصى لميزانية الحساب (${trade_budget:.2f}). إلغاء الصفقة.")
+            log.warning(f"⚠️ تكلفة العقد (${contract_cost:.2f}) تتجاوز ميزانية المحفظة المتاحة (${trade_budget:.2f}).")
             return 0
 
         qty = math.floor(trade_budget / contract_cost)
-        final_qty = max(1 if contract_cost <= trade_budget * 1.5 else 0, min(qty, 30))
+        final_qty = max(1 if contract_cost <= trade_budget * 1.5 else 0, min(qty, 40))
         
-        log.info(f"🧠 [Half-Kelly] رأس المال: ${equity:,.2f} | نسبة التخصيص: {half_kelly*100:.2f}% | عقود SPY: {final_qty}")
+        log.info(f"🧠 [Half-Kelly Compounding] السيولة الحالية: ${equity:,.2f} | نسبة المخاطرة: {half_kelly*100:.2f}% | الكمية: {final_qty} عقود")
         return final_qty
     except Exception as e:
-        log.error(f"⚠️ خطأ أثناء حساب حجم Half-Kelly: {e}")
+        log.error(f"⚠️ خطأ في حساب كمية التداول المركبة: {e}")
         return 0
 
-# -------------------- ORDERS & POSITION MANAGEMENT --------------------
+# -------------------- ORDERS & ADVANCED DYNAMIC TRAILING STOP --------------------
 def execute_limit_order(symbol, qty=1, side="buy", limit_price=None):
     if qty <= 0:
         return None
@@ -436,7 +438,7 @@ def fetch_spy_contracts(direction, spy_price):
     for c in contracts:
         strike = num(c.get("strike_price"))
         sym = c.get("symbol")
-        if sym and math.isfinite(strike) and abs(strike - spy_price) <= (spy_price * 0.015):
+        if sym and math.isfinite(strike) and abs(strike - spy_price) <= (spy_price * 0.012):
             candidates.append((abs(strike - spy_price), c))
             
     candidates.sort(key=lambda x: x[0])
@@ -460,11 +462,10 @@ def close_all_positions_immediately():
             qty = pos.get("qty")
             if sym and qty:
                 q = _get_option_quote(sym)
-                # استخدام سعر الـ Bid للبيع لضمان التنفيذ المباشر
                 price = q["bid"] if q else num(pos.get("current_price"), 0.1)
                 execute_limit_order(sym, qty=abs(int(qty)), side="sell", limit_price=price)
         save_json(ACTIVE_POSITIONS_FILE, {})
-        send_telegram("🛑 <b>تنبيه نظام:</b> تم إغلاق جميع الصفقات المفتوحة فوراً عبر كاسر الحماية.")
+        send_telegram("🛑 <b>تنبيه نظام:</b> تم إغلاق جميع الصفقات فوراً عبر كاسر الحماية.")
     except Exception as e:
         log.error(f"خطأ أثناء الإغلاق الشامل للمحفظة: {e}")
 
@@ -479,7 +480,7 @@ def check_daily_circuit_breaker():
             
         daily_pnl_pct = (equity - last_equity) / last_equity
         if daily_pnl_pct <= -MAX_DAILY_LOSS_PCT:
-            log.warning(f"🛑 [Circuit Breaker] خسارة المحفظة اليوم ({daily_pnl_pct*100:.2f}%). تفعيل الإغلاق الفوري وتجميد التداول.")
+            log.warning(f"🛑 [Circuit Breaker] خسارة اليوم ({daily_pnl_pct*100:.2f}%). إغلاق وتجميد التداول.")
             close_all_positions_immediately()
             return True
     except Exception as e:
@@ -487,7 +488,7 @@ def check_daily_circuit_breaker():
     return False
 
 def manage_active_positions():
-    """إدارة الصفقات بآلية تتبع الأرباح المفتوحة للاستفادة من الأيام الخارقة"""
+    """نظام إغلاق وجني أرباح متحرك ذكي يتيح تضاعف الأرباح (10%+، 50%+، 100%+) وحمايتها عند الهبوط"""
     saved_positions = read_json(ACTIVE_POSITIONS_FILE)
     try:
         r = HTTP.get(f"{TRADING_URL}/v2/positions", headers={"APCA-API-KEY-ID": KEY, "APCA-API-SECRET-KEY": SECRET}, timeout=10)
@@ -519,7 +520,7 @@ def manage_active_positions():
                 pnl_pct = (current_price - entry_price) / entry_price
                 peak_pnl_pct = (highest_price - entry_price) / entry_price
 
-                log.info(f"📊 [متابعة SPY] {sym} | الدخول: ${entry_price:.2f} | الحالي: ${current_price:.2f} | القمة: +{peak_pnl_pct*100:.1f}% | الربح الصافي: {pnl_pct*100:+.2f}%")
+                log.info(f"📊 [متابعة SPY] {sym} | الدخول: ${entry_price:.2f} | الحالي: ${current_price:.2f} | القمة: +{peak_pnl_pct*100:.1f}% | صافي الربح: {pnl_pct*100:+.2f}%")
 
                 saved_positions[sym] = {
                     "symbol": sym,
@@ -530,50 +531,53 @@ def manage_active_positions():
                 }
 
                 if sym in pending_sell_symbols:
-                    log.info(f"⏳ أمر بيع قائم بالفعل لـ {sym} بانتظار التنفيذ في السوق.")
                     continue
 
                 q = _get_option_quote(sym)
-                # استخدام سعر Bid عند إرسال أمر البيع لضمان السرعة والالتزام بالخروج
                 exit_price = q["bid"] if q else current_price
 
                 should_close = False
                 reason = ""
 
-                # 0. إغلاق إجباري نهاية اليوم
+                # 0. إغلاق إجباري قبل إغلاق السوق
                 if force_eod_close:
                     should_close = True
                     reason = "🌆 إغلاق نهاية اليوم (EOD Hard Exit)"
 
-                # 1. اقتناص الأرباح الانفجارية الخارقة (+100% فأكثر مع تراجع 12% من القمة)
-                elif peak_pnl_pct >= 1.00 and pnl_pct <= (peak_pnl_pct - 0.12):
+                # 1. الأرباح الانفجارية الخارقة (+100% فأكثر): حماية 80% من أعلى قمة وصل لها العقد
+                elif peak_pnl_pct >= 1.00 and pnl_pct <= (peak_pnl_pct * 0.80):
                     should_close = True
-                    reason = f"🚀 اقتناص أرباح انفجارية (+100%+) | الربح المحقق: {pnl_pct*100:.2f}%"
+                    reason = f"🚀 اقتناص أرباح مضاعفة (+100%+) | الربح المحقق: {pnl_pct*100:.2f}%"
 
-                # 2. تتبع الأرباح المرتفعة (+30% إلى +100% مع تراجع 10% من القمة)
-                elif peak_pnl_pct >= 0.30 and pnl_pct <= (peak_pnl_pct - 0.10):
+                # 2. أرباح قوية (+50% إلى +100%): تأمين 35% ربح كحد أدنى عند التراجع
+                elif peak_pnl_pct >= 0.50 and pnl_pct <= 0.35:
                     should_close = True
-                    reason = f"🏆 حجز أرباح ممتازة | الربح المحقق: {pnl_pct*100:.2f}%"
+                    reason = f"🔥 حجز أرباح عالية (+50%+) | الربح المحقق: {pnl_pct*100:.2f}%"
 
-                # 3. تأمين +10% ربح بعد الوصول لـ +18%
-                elif peak_pnl_pct >= 0.18 and pnl_pct <= 0.10:
+                # 3. أرباح متوسطة (+25% إلى +50%): تأمين 15% ربح كحد أدنى عند التراجع
+                elif peak_pnl_pct >= 0.25 and pnl_pct <= 0.15:
                     should_close = True
-                    reason = f"🛡️ تأمين أرباح (+10%) بعد قمة +18%"
+                    reason = f"🏆 حجز أرباح ممتازة (+25%+) | الربح المحقق: {pnl_pct*100:.2f}%"
 
-                # 4. تفعيل Breakeven عند ربح +8% والتراجع إلى +1%
-                elif peak_pnl_pct >= 0.08 and pnl_pct <= 0.01:
+                # 4. تحقيق أرباح +10% فأكثر والتراجع إلى +5% (تأمين 5% صافي)
+                elif peak_pnl_pct >= 0.10 and pnl_pct <= 0.05:
+                    should_close = True
+                    reason = f"🛡️ تأمين أرباح (+5%+) بعد قمة +10%"
+
+                # 5. تفعيل Breakeven عند الوصول لربح +6% والتراجع إلى سعر الدخول (0.5%)
+                elif peak_pnl_pct >= 0.06 and pnl_pct <= 0.005:
                     should_close = True
                     reason = "🔒 تفعيل Breakeven (إغلاق بدون خسارة)"
 
-                # 5. وقف خسارة خاطف وصارم (-6.5%)
-                elif pnl_pct <= -0.065:
+                # 6. وقف خسارة خاطف وصارم (-6.0%)
+                elif pnl_pct <= -0.060:
                     should_close = True
-                    reason = f"🛑 وقف خسارة خاطف (-6.5%) لـ {sym}"
+                    reason = f"🛑 وقف خسارة خاطف (-6.0%) لـ {sym}"
 
                 if should_close:
                     log.info(f"{reason} | العقد: {sym}")
                     execute_limit_order(sym, qty=qty, side="sell", limit_price=exit_price)
-                    send_telegram(f"📉 <b>إغلاق صفقة:</b> {sym}\nالسبب: {reason}\nالربح/الخسارة: {pnl_pct*100:+.2f}%")
+                    send_telegram(f"📉 <b>إغلاق صفقة:</b> {sym}\nالسبب: {reason}\nالربح/الخسارة الصافية: {pnl_pct*100:+.2f}%")
 
         to_remove = [s for s in saved_positions if s not in active_alpaca_symbols]
         for s in to_remove:
@@ -595,7 +599,9 @@ def open_new_trade():
     if bars.empty:
         return
         
-    pred = train_institutional_quant_model(bars)
+    futures_info = fetch_futures_lead_signals()
+    pred = train_institutional_quant_model(bars, futures_info)
+    
     if not pred.get("ok") or pred["signal"] == "محايد ⏳":
         return
 
@@ -634,8 +640,9 @@ def open_new_trade():
             msg = (
                 f"🚀 <b>فتح صفقة جديدة ({NAME}):</b>\n"
                 f"العقد: <code>{sym}</code>\n"
-                f"الكمية: {trade_qty} | السعر: ${q['mid']:.2f}\n"
-                f"الإشارة: {pred['signal']} (مستوى الثقة: {win_prob*100:.1f}%)"
+                f"الكمية المركبة: {trade_qty} | السعر: ${q['mid']:.2f}\n"
+                f"الإشارة: {pred['signal']} (مستوى الثقة: {win_prob*100:.1f}%)\n"
+                f"حركة العقود الآجلة ES/NQ: <code>{pred['futures_momentum']}</code>"
             )
             log.info(msg)
             send_telegram(msg)
@@ -643,7 +650,7 @@ def open_new_trade():
 
 # -------------------- MAIN LOOP --------------------
 if __name__ == "__main__":
-    log.info(f"🚀 بدء تشغيل {NAME} v{VERSION} (إصدار تتبع الأرباح المفتوحة وORB)")
+    log.info(f"🚀 بدء تشغيل {NAME} v{VERSION} (محرك تتبع العقود الآجلة والأرباح المركبة)")
     
     while True:
         try:
