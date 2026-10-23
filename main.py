@@ -1,6 +1,7 @@
 # ============================================================
-# صَفاء التحليل v32.0-SPY-FuturesTitan | Quant Engine
-# الميزات: مراقبة العقود الآجلة ES/NQ + حماية الأرباح المتدرجة + الفائدة المركبة
+# صَفاء التحليل v33.1-SPY-UltraTitan | Super-Quant Engine
+# الميزات: تداول حصري لـ SPY + حماية الأرباح المفتوحة (تجاوز الدبل)
+# تأمين أرباح +10% + دمج زخم ناسداك (QQQ) عبر Alpaca + ذكاء كمي معزز
 # ============================================================
 import os
 import sys
@@ -14,20 +15,24 @@ from zoneinfo import ZoneInfo
 import requests
 import numpy as np
 import pandas as pd
-import yfinance as yf
-import lightgbm as lgb
+
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except ImportError:
+    HAS_LGB = False
+
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
 
 # -------------------- CONFIGURATION --------------------
-NAME, VERSION = "صَفاء التحليل", "32.0-SPY-FuturesTitan"
+NAME, VERSION = "صَفاء التحليل", "33.1-SPY-UltraTitan"
 NY, UTC = ZoneInfo("America/New_York"), timezone.utc
 TF = "5Min"
 
 HYPER_ASSET = "SPY"
-FUTURES_ES = "ES=F"  # S&P 500 E-mini Futures
-FUTURES_NQ = "NQ=F"  # Nasdaq 100 E-mini Futures
+NASDAQ_ASSET = "QQQ"     # استخدام QQQ كمؤشر مرجعي لقطاع التكنولوجيا وناسداك
 
 DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
 TRADING_URL = os.getenv("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
@@ -43,15 +48,15 @@ HISTORY_DAYS = 45
 MIN_ROWS = 250
 HORIZON = 5
 
-MAX_SPREAD_PCT = 0.05        # أقصى فارق بين العرض والطلب 5%
+MAX_SPREAD_PCT = 0.045       # أقصى فارق بين العرض والطلب 4.5%
 POLL_SECONDS = 10            # فحص السوق كل 10 ثوانٍ
 
-MAX_DAILY_LOSS_PCT = 0.02    # كاسر الحماية اليومي (تجميد عند -2% من المحفظة)
-MAX_RISK_CAP = 0.06          # أقصى مخاطرة لكل صفقة (6% من إجمالي المحفظة المركبة)
+MAX_DAILY_LOSS_PCT = 0.02    # كاسر الحماية اليومي (-2% من المحفظة)
+MAX_RISK_CAP = 0.065         # أقصى مخاطرة لكل صفقة (6.5% من إجمالي المحفظة المركبة)
 
 ROOT = Path(os.getenv("DATA_DIR", "."))
 ROOT.mkdir(parents=True, exist_ok=True)
-ACTIVE_POSITIONS_FILE = ROOT / "spy_futurestitan_positions.json"
+ACTIVE_POSITIONS_FILE = ROOT / "spy_ultratitan_positions.json"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -59,9 +64,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("safaa_futures_titan")
+log = logging.getLogger("safaa_spy_ultratitan")
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": f"SafaaFuturesTitan/{VERSION}"})
+HTTP.headers.update({"User-Agent": f"SafaaUltraTitan/{VERSION}"})
 
 # -------------------- HELPERS & API --------------------
 def now_ny():
@@ -176,7 +181,7 @@ def is_eod_close_time():
     n = now_ny()
     return n.weekday() < 5 and (n.hour, n.minute) >= (15, 50)
 
-# -------------------- DATA FETCHING (SPY + FUTURES) --------------------
+# -------------------- DATA FETCHING (SPY + NASDAQ BAR ALIGNMENT) --------------------
 def fetch_bars(symbol=HYPER_ASSET, days=HISTORY_DAYS):
     end = datetime.now(UTC)
     params = {
@@ -210,48 +215,44 @@ def fetch_bars(symbol=HYPER_ASSET, days=HISTORY_DAYS):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.dropna(subset=["timestamp", "open", "high", "low", "close"]).drop_duplicates("timestamp", keep="last").sort_values("timestamp").set_index("timestamp")
 
-def fetch_futures_lead_signals():
-    """جلب بيانات العقود الآجلة ES و NQ لرصد الحركة الاستباقية للسيولة المؤسسية"""
-    try:
-        es = yf.Ticker(FUTURES_ES).history(period="5d", interval="5m")
-        nq = yf.Ticker(FUTURES_NQ).history(period="5d", interval="5m")
-        if es.empty or nq.empty:
-            return {"es_ret1": 0.0, "nq_ret1": 0.0, "futures_momentum": "NEUTRAL"}
+def get_nasdaq_regime_info(spy_bars, qqq_bars):
+    """تحليل الحركة الاستباقية والقوة النسبية لمؤشر ناسداك (QQQ)"""
+    if spy_bars.empty or qqq_bars.empty:
+        return {"nq_ret1": 0.0, "nq_rel_strength": 0.0, "nasdaq_regime": "NEUTRAL"}
+    
+    spy_ret1 = float(spy_bars["close"].pct_change().iloc[-1])
+    qqq_ret1 = float(qqq_bars["close"].pct_change().iloc[-1])
+    nq_rel_strength = qqq_ret1 - spy_ret1
+    
+    regime = "NEUTRAL"
+    if qqq_ret1 > 0.0012 and nq_rel_strength > 0.0003:
+        regime = "BULLISH_SURGE"     # اندفاع صاعد قوي في القطاع التكنولوجي وناسداك
+    elif qqq_ret1 < -0.0012 and nq_rel_strength < -0.0003:
+        regime = "BEARISH_SURGE"    # هبوط حاد وضغط بيعي في ناسداك
         
-        es_ret1 = float(es['Close'].pct_change().iloc[-1])
-        nq_ret1 = float(nq['Close'].pct_change().iloc[-1])
-        es_ret3 = float(es['Close'].pct_change(3).iloc[-1])
-        
-        momentum = "NEUTRAL"
-        if es_ret1 > 0.0012 and nq_ret1 > 0.0015:
-            momentum = "BULLISH_SURGE"  # اندفاع مؤسسي صاعد في العقود الآجلة
-        elif es_ret1 < -0.0012 and nq_ret1 < -0.0015:
-            momentum = "BEARISH_SURGE"  # اندفاع مؤسسي هابط في العقود الآجلة
-            
-        return {
-            "es_ret1": es_ret1,
-            "nq_ret1": nq_ret1,
-            "es_ret3": es_ret3,
-            "futures_momentum": momentum
-        }
-    except Exception as e:
-        log.error(f"⚠️ تعذر جلب بيانات العقود الآجلة: {e}")
-        return {"es_ret1": 0.0, "nq_ret1": 0.0, "futures_momentum": "NEUTRAL"}
+    return {
+        "nq_ret1": qqq_ret1,
+        "nq_rel_strength": nq_rel_strength,
+        "nasdaq_regime": regime
+    }
 
-# -------------------- QUANT FEATURES & MODELS --------------------
+# -------------------- ADVANCED QUANT FEATURES & MODELS --------------------
 FEATURES = [
-    "ret1", "ret3", "ret6", "ema_9_21", "ema_21_50", "trend_200", 
-    "vwap_zscore", "vwap_band_pos", "rsi", "atr_norm", "vol_surge", "regime_efficiency",
-    "es_lead_ret", "nq_lead_ret"
+    "ret1", "ret3", "ret6", "ret12", 
+    "ema_9_21", "ema_21_50", "trend_200", 
+    "vwap_zscore", "vwap_band_pos", "rsi", "rsi_slope",
+    "macd_hist", "bollinger_pos", "atr_norm", "vol_surge", "regime_efficiency",
+    "nq_lead_ret", "nq_rel_strength"
 ]
 
-def generate_institutional_features(bars, futures_info):
-    f = bars.copy()
+def generate_institutional_features(spy_bars, qqq_bars=None):
+    f = spy_bars.copy()
     c, v = f["close"], f["volume"]
     
     f["ret1"] = c.pct_change()
     f["ret3"] = c.pct_change(3)
     f["ret6"] = c.pct_change(6)
+    f["ret12"] = c.pct_change(12)
     
     e9 = c.ewm(span=9, adjust=False).mean()
     e21 = c.ewm(span=21, adjust=False).mean()
@@ -262,6 +263,7 @@ def generate_institutional_features(bars, futures_info):
     f["ema_21_50"] = (e21 - e50) / c
     f["trend_200"] = (c - e200) / c
     
+    # VWAP & Bands
     f['trade_date'] = f.index.date
     f['pv'] = c * v
     cum_pv = f.groupby('trade_date')['pv'].cumsum()
@@ -275,58 +277,82 @@ def generate_institutional_features(bars, futures_info):
     f["vwap_zscore"] = ((c - vwap) / vwap_std.replace(0, np.nan)).fillna(0)
     f["vwap_band_pos"] = (c - vwap) / c
     
+    # Bollinger Bands Position
+    ma20 = c.rolling(20).mean()
+    std20 = c.rolling(20).std()
+    f["bollinger_pos"] = ((c - (ma20 - 2 * std20)) / (4 * std20.replace(0, np.nan))).fillna(0.5)
+    
+    # MACD Histogram
+    ema12 = c.ewm(span=12, adjust=False).mean()
+    ema26 = c.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    f["macd_hist"] = (macd - signal) / c
+
+    # Kaufman Efficiency Ratio
     change = (c - c.shift(10)).abs()
     volatility = c.diff().abs().rolling(10).sum()
     f["regime_efficiency"] = (change / volatility.replace(0, np.nan)).fillna(0)
     
+    # ATR & Volume
     prev = c.shift()
     tr = pd.concat([f["high"] - f["low"], (f["high"] - prev).abs(), (f["low"] - prev).abs()], axis=1).max(axis=1)
     f["atr_norm"] = tr.ewm(alpha=1/14, adjust=False).mean() / c
     f["vol_surge"] = v / v.rolling(30).mean().replace(0, np.nan)
     
+    # RSI & Momentum Slope
     d = c.diff()
     gain = d.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-d.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
-    f["rsi"] = ((100 - 100 / (1 + rs)) / 100).fillna(0.5)
+    rsi = (100 - 100 / (1 + rs)) / 100
+    f["rsi"] = rsi.fillna(0.5)
+    f["rsi_slope"] = rsi.diff(3).fillna(0)
     
-    # دمج مؤشرات العقود الآجلة ES/NQ
-    f["es_lead_ret"] = futures_info.get("es_ret1", 0.0)
-    f["nq_lead_ret"] = futures_info.get("nq_ret1", 0.0)
+    # دمج مؤشر ناسداك المحاذي زمنياً
+    if qqq_bars is not None and not qqq_bars.empty:
+        qqq_c = qqq_bars["close"].reindex(f.index).ffill()
+        f["nq_lead_ret"] = qqq_c.pct_change().fillna(0)
+        f["nq_rel_strength"] = (f["nq_lead_ret"] - f["ret1"]).fillna(0)
+    else:
+        f["nq_lead_ret"] = 0.0
+        f["nq_rel_strength"] = 0.0
     
     f = f.drop(columns=['trade_date', 'pv', 'sq_diff'], errors='ignore')
     return f.replace([np.inf, -np.inf], np.nan)
 
-def train_institutional_quant_model(bars, futures_info):
-    if bars.empty or len(bars) < MIN_ROWS:
+def train_institutional_quant_model(spy_bars, qqq_bars):
+    if spy_bars.empty or len(spy_bars) < MIN_ROWS:
         return {"ok": False}
         
-    f = generate_institutional_features(bars, futures_info)
-    future_ret = (bars["close"].shift(-HORIZON) - bars["close"]) / bars["close"]
+    f = generate_institutional_features(spy_bars, qqq_bars)
+    future_ret = (spy_bars["close"].shift(-HORIZON) - spy_bars["close"]) / spy_bars["close"]
     
-    f["primary_target"] = np.where(future_ret > 0.0015, 1, (np.where(future_ret < -0.0015, -1, 0)))
+    f["primary_target"] = np.where(future_ret > 0.0014, 1, (np.where(future_ret < -0.0014, -1, 0)))
     
     ds = f[FEATURES + ["primary_target"]].dropna()
     ds_valid = ds[ds["primary_target"] != 0].copy()
     
-    if len(ds_valid) < MIN_ROWS:
+    if len(ds_valid) < MIN_ROWS or ds_valid["primary_target"].nunique() < 2:
         return {"ok": False}
         
-    # نموذج LightGBM الرئيسي
-    primary_pipeline = make_pipeline(
-        SimpleImputer(strategy="median"),
-        GradientBoostingClassifier(n_estimators=150, learning_rate=0.04, max_depth=4, random_state=42)
-    )
+    # اختيار النموذج الرياضي المتكيف
+    if HAS_LGB:
+        clf = lgb.LGBMClassifier(n_estimators=150, learning_rate=0.035, max_depth=4, random_state=42, verbose=-1)
+    else:
+        clf = GradientBoostingClassifier(n_estimators=150, learning_rate=0.035, max_depth=4, random_state=42)
+
+    primary_pipeline = make_pipeline(SimpleImputer(strategy="median"), clf)
     primary_pipeline.fit(ds_valid[FEATURES], ds_valid["primary_target"])
     
     latest_feat = f[FEATURES].iloc[[-1]]
     primary_pred = primary_pipeline.predict(latest_feat)[0]
     probs = primary_pipeline.predict_proba(latest_feat)[0]
     
-    classes = list(primary_pipeline.named_steps["gradientboostingclassifier"].classes_)
+    classes = list(primary_pipeline.named_steps[clf.__class__.__name__.lower()].classes_)
     prob_max = probs[classes.index(primary_pred)] if primary_pred in classes else 0.5
 
-    # Meta-Labeling Model (فلترة الإشارات الزائفة)
+    # Meta-Labeling Model (فلترة الإشارات الزائفة باستعمال Random Forest)
     ds_valid["pred_signal"] = primary_pipeline.predict(ds_valid[FEATURES])
     ds_valid["meta_target"] = np.where((ds_valid["pred_signal"] == ds_valid["primary_target"]), 1, 0)
     
@@ -334,7 +360,7 @@ def train_institutional_quant_model(bars, futures_info):
     if ds_valid["meta_target"].nunique() >= 2:
         meta_pipeline = make_pipeline(
             SimpleImputer(strategy="median"),
-            RandomForestClassifier(n_estimators=80, max_depth=3, random_state=42)
+            RandomForestClassifier(n_estimators=100, max_depth=4, random_state=42)
         )
         meta_pipeline.fit(ds_valid[FEATURES], ds_valid["meta_target"])
         meta_classes = list(meta_pipeline.named_steps["randomforestclassifier"].classes_)
@@ -342,20 +368,22 @@ def train_institutional_quant_model(bars, futures_info):
             idx1 = meta_classes.index(1)
             meta_prob = float(meta_pipeline.predict_proba(latest_feat)[0, idx1])
 
-    curr_price = float(bars["close"].iloc[-1])
+    curr_price = float(spy_bars["close"].iloc[-1])
     zscore = float(f["vwap_zscore"].iloc[-1])
     trend_200 = float(f["trend_200"].iloc[-1])
-    fut_mom = futures_info.get("futures_momentum", "NEUTRAL")
+    
+    nasdaq_info = get_nasdaq_regime_info(spy_bars, qqq_bars)
+    nasdaq_regime = nasdaq_info.get("nasdaq_regime", "NEUTRAL")
     
     signal = "محايد ⏳"
     
-    # تأكيد الإشارة بدمج العقود الآجلة ES/NQ
-    if (primary_pred == 1 or fut_mom == "BULLISH_SURGE") and prob_max >= 0.54 and meta_prob >= 0.51 and trend_200 > -0.003:
-        if -1.8 <= zscore <= 2.2 and fut_mom != "BEARISH_SURGE":
+    # تأكيد الذكاء الاصطناعي مع زخم مؤشر ناسداك
+    if (primary_pred == 1 or nasdaq_regime == "BULLISH_SURGE") and prob_max >= 0.54 and meta_prob >= 0.51 and trend_200 > -0.003:
+        if -1.8 <= zscore <= 2.2 and nasdaq_regime != "BEARISH_SURGE":
             signal = "صعود 🚀"
             
-    elif (primary_pred == -1 or fut_mom == "BEARISH_SURGE") and prob_max >= 0.54 and meta_prob >= 0.51 and trend_200 < 0.003:
-        if -2.2 <= zscore <= 1.8 and fut_mom != "BULLISH_SURGE":
+    elif (primary_pred == -1 or nasdaq_regime == "BEARISH_SURGE") and prob_max >= 0.54 and meta_prob >= 0.51 and trend_200 < 0.003:
+        if -2.2 <= zscore <= 1.8 and nasdaq_regime != "BULLISH_SURGE":
             signal = "نزول 📉"
 
     return {
@@ -364,12 +392,12 @@ def train_institutional_quant_model(bars, futures_info):
         "primary_prob": prob_max,
         "meta_prob": meta_prob,
         "current_price": curr_price,
-        "futures_momentum": fut_mom
+        "nasdaq_regime": nasdaq_regime
     }
 
 # -------------------- COMPOUNDING CAPITAL ALLOCATION --------------------
 def calculate_half_kelly_qty(option_mid_price, win_probability):
-    """حساب أحجام العقود بنسبة تركيبة تلقائية تستفيد من الفائدة المركبة بمرور الوقت"""
+    """حساب أحجام العقود بنسبة الفائدة المركبة الذكية"""
     try:
         acc = alpaca_get(f"{TRADING_URL}/v2/account")
         equity = num(acc.get("equity"), 1000.0)
@@ -392,7 +420,7 @@ def calculate_half_kelly_qty(option_mid_price, win_probability):
             return 0
 
         qty = math.floor(trade_budget / contract_cost)
-        final_qty = max(1 if contract_cost <= trade_budget * 1.5 else 0, min(qty, 40))
+        final_qty = max(1 if contract_cost <= trade_budget * 1.5 else 0, min(qty, 50))
         
         log.info(f"🧠 [Half-Kelly Compounding] السيولة الحالية: ${equity:,.2f} | نسبة المخاطرة: {half_kelly*100:.2f}% | الكمية: {final_qty} عقود")
         return final_qty
@@ -400,7 +428,7 @@ def calculate_half_kelly_qty(option_mid_price, win_probability):
         log.error(f"⚠️ خطأ في حساب كمية التداول المركبة: {e}")
         return 0
 
-# -------------------- ORDERS & ADVANCED DYNAMIC TRAILING STOP --------------------
+# -------------------- ORDERS & UNLIMITED PROFIT TRAILING STOP --------------------
 def execute_limit_order(symbol, qty=1, side="buy", limit_price=None):
     if qty <= 0:
         return None
@@ -421,6 +449,7 @@ def execute_limit_order(symbol, qty=1, side="buy", limit_price=None):
         return None
 
 def fetch_spy_contracts(direction, spy_price):
+    """جلب عقود SPY القريبة من السعر الحالي (ATM) بأعلى سيولة"""
     today = now_ny().date()
     target_exp_end = (now_ny() + timedelta(days=3)).date()
     params = {
@@ -465,7 +494,7 @@ def close_all_positions_immediately():
                 price = q["bid"] if q else num(pos.get("current_price"), 0.1)
                 execute_limit_order(sym, qty=abs(int(qty)), side="sell", limit_price=price)
         save_json(ACTIVE_POSITIONS_FILE, {})
-        send_telegram("🛑 <b>تنبيه نظام:</b> تم إغلاق جميع الصفقات فوراً عبر كاسر الحماية.")
+        send_telegram("🛑 <b>تنبيه نظام:</b> تم إغلاق جميع صفقات SPY فوراً عبر كاسر الحماية.")
     except Exception as e:
         log.error(f"خطأ أثناء الإغلاق الشامل للمحفظة: {e}")
 
@@ -488,7 +517,11 @@ def check_daily_circuit_breaker():
     return False
 
 def manage_active_positions():
-    """نظام إغلاق وجني أرباح متحرك ذكي يتيح تضاعف الأرباح (10%+، 50%+، 100%+) وحمايتها عند الهبوط"""
+    """
+    نظام حماية الأرباح المتدرج المفتوح:
+    - لا يتم إغلاق العقد عند تحقيق الدبل (+100%)، بل يترك ليمتد مع حماية 88% من أعلى قمة وصل إليها.
+    - جدار حماية +10%: يضمن أن الصفقة لا تنزل عن +10% ربح صافي بمجرد تجاوز أرباحها الـ 10%.
+    """
     saved_positions = read_json(ACTIVE_POSITIONS_FILE)
     try:
         r = HTTP.get(f"{TRADING_URL}/v2/positions", headers={"APCA-API-KEY-ID": KEY, "APCA-API-SECRET-KEY": SECRET}, timeout=10)
@@ -496,6 +529,7 @@ def manage_active_positions():
         active_alpaca_symbols = set()
         
         open_orders = get_open_orders()
+        pending_buy_symbols = set(o.get("symbol") for o in open_orders if o.get("side") == "buy")
         pending_sell_symbols = set(o.get("symbol") for o in open_orders if o.get("side") == "sell")
         
         force_eod_close = is_eod_close_time()
@@ -520,7 +554,7 @@ def manage_active_positions():
                 pnl_pct = (current_price - entry_price) / entry_price
                 peak_pnl_pct = (highest_price - entry_price) / entry_price
 
-                log.info(f"📊 [متابعة SPY] {sym} | الدخول: ${entry_price:.2f} | الحالي: ${current_price:.2f} | القمة: +{peak_pnl_pct*100:.1f}% | صافي الربح: {pnl_pct*100:+.2f}%")
+                log.info(f"📊 [متابعة SPY] {sym} | الدخول: ${entry_price:.2f} | الحالي: ${current_price:.2f} | القمة: +{peak_pnl_pct*100:.1f}% | صافي الربح الحالي: {pnl_pct*100:+.2f}%")
 
                 saved_positions[sym] = {
                     "symbol": sym,
@@ -542,44 +576,48 @@ def manage_active_positions():
                 # 0. إغلاق إجباري قبل إغلاق السوق
                 if force_eod_close:
                     should_close = True
-                    reason = "🌆 إغلاق نهاية اليوم (EOD Hard Exit)"
+                    reason = "🌆 إغلاق نهاية اليوم (EOD Exit)"
 
-                # 1. الأرباح الانفجارية الخارقة (+100% فأكثر): حماية 80% من أعلى قمة وصل لها العقد
-                elif peak_pnl_pct >= 1.00 and pnl_pct <= (peak_pnl_pct * 0.80):
+                # 1. أرباح استثنائية دبل وما فوق (+100%+): ترك الصفقة مفتوحة وحماية 88% من أعلى قمة (Trailing Shield)
+                elif peak_pnl_pct >= 1.00 and pnl_pct <= (peak_pnl_pct * 0.88):
                     should_close = True
-                    reason = f"🚀 اقتناص أرباح مضاعفة (+100%+) | الربح المحقق: {pnl_pct*100:.2f}%"
+                    reason = f"🚀 حماية أرباح انفجارية دبل+ (قمة: +{peak_pnl_pct*100:.1f}%) | الربح المحقق: +{pnl_pct*100:.2f}%"
 
-                # 2. أرباح قوية (+50% إلى +100%): تأمين 35% ربح كحد أدنى عند التراجع
-                elif peak_pnl_pct >= 0.50 and pnl_pct <= 0.35:
+                # 2. أرباح مرتفعة (+50% إلى +100%): تأمين 78% من أقصى قمة أرباح
+                elif peak_pnl_pct >= 0.50 and pnl_pct <= (peak_pnl_pct * 0.78):
                     should_close = True
-                    reason = f"🔥 حجز أرباح عالية (+50%+) | الربح المحقق: {pnl_pct*100:.2f}%"
+                    reason = f"🔥 حماية أرباح عالية (قمة: +{peak_pnl_pct*100:.1f}%) | الربح المحقق: +{pnl_pct*100:.2f}%"
 
-                # 3. أرباح متوسطة (+25% إلى +50%): تأمين 15% ربح كحد أدنى عند التراجع
-                elif peak_pnl_pct >= 0.25 and pnl_pct <= 0.15:
+                # 3. أرباح متوسطة (+25% إلى +50%): تأمين 68% من قمة الأرباح
+                elif peak_pnl_pct >= 0.25 and pnl_pct <= (peak_pnl_pct * 0.68):
                     should_close = True
-                    reason = f"🏆 حجز أرباح ممتازة (+25%+) | الربح المحقق: {pnl_pct*100:.2f}%"
+                    reason = f"🏆 حماية أرباح ممتازة | الربح المحقق: +{pnl_pct*100:.2f}%"
 
-                # 4. تحقيق أرباح +10% فأكثر والتراجع إلى +5% (تأمين 5% صافي)
-                elif peak_pnl_pct >= 0.10 and pnl_pct <= 0.05:
+                # 4. جدار حماية +10% الصارم: عند الوصول لـ +10% أو أكثر والتراجع تحت +10%
+                elif peak_pnl_pct >= 0.10 and pnl_pct < 0.10:
                     should_close = True
-                    reason = f"🛡️ تأمين أرباح (+5%+) بعد قمة +10%"
+                    reason = f"🛡️ جدار حماية أرباح +10% الصارم (تحقيق قمة +{peak_pnl_pct*100:.1f}%)"
 
-                # 5. تفعيل Breakeven عند الوصول لربح +6% والتراجع إلى سعر الدخول (0.5%)
-                elif peak_pnl_pct >= 0.06 and pnl_pct <= 0.005:
+                # 5. تفعيل Breakeven/أرباح مبكرة (+5% إلى +10% والتراجع لـ +2.5%)
+                elif peak_pnl_pct >= 0.05 and pnl_pct <= 0.025:
                     should_close = True
-                    reason = "🔒 تفعيل Breakeven (إغلاق بدون خسارة)"
+                    reason = f"🔒 تأمين أرباح مبكرة (+2.5%+) بعد قمة +{peak_pnl_pct*100:.1f}%"
 
-                # 6. وقف خسارة خاطف وصارم (-6.0%)
-                elif pnl_pct <= -0.060:
+                # 6. وقف خسارة خاطف وصارم (-5.5%)
+                elif pnl_pct <= -0.055:
                     should_close = True
-                    reason = f"🛑 وقف خسارة خاطف (-6.0%) لـ {sym}"
+                    reason = f"🛑 وقف خسارة خاطف (-5.5%) لـ {sym}"
 
                 if should_close:
                     log.info(f"{reason} | العقد: {sym}")
                     execute_limit_order(sym, qty=qty, side="sell", limit_price=exit_price)
-                    send_telegram(f"📉 <b>إغلاق صفقة:</b> {sym}\nالسبب: {reason}\nالربح/الخسارة الصافية: {pnl_pct*100:+.2f}%")
+                    send_telegram(f"📉 <b>إغلاق صفقة SPY:</b> <code>{sym}</code>\nالسبب: {reason}\nصافي الربح/الخسارة: <b>{pnl_pct*100:+.2f}%</b>")
 
-        to_remove = [s for s in saved_positions if s not in active_alpaca_symbols]
+        # تنظيف الصفقات المغلقة دون مسح الأوامر المطلوبة التي تحضر في الانتظار (Pending Buy Orders)
+        to_remove = [
+            s for s in saved_positions 
+            if s not in active_alpaca_symbols and s not in pending_buy_symbols
+        ]
         for s in to_remove:
             saved_positions.pop(s, None)
 
@@ -592,15 +630,18 @@ def open_new_trade():
         return
 
     positions = read_json(ACTIVE_POSITIONS_FILE)
-    if len(positions) >= 1:
+    open_orders = get_open_orders()
+    
+    # حظر فتح صفقة جديدة إذا كانت هناك صفقة مفتوحة أو أمر شراء معلق
+    if len(positions) >= 1 or len(open_orders) >= 1:
         return
 
-    bars = fetch_bars(HYPER_ASSET)
-    if bars.empty:
+    spy_bars = fetch_bars(HYPER_ASSET)
+    if spy_bars.empty:
         return
         
-    futures_info = fetch_futures_lead_signals()
-    pred = train_institutional_quant_model(bars, futures_info)
+    qqq_bars = fetch_bars(NASDAQ_ASSET)
+    pred = train_institutional_quant_model(spy_bars, qqq_bars)
     
     if not pred.get("ok") or pred["signal"] == "محايد ⏳":
         return
@@ -639,10 +680,10 @@ def open_new_trade():
             save_json(ACTIVE_POSITIONS_FILE, positions)
             msg = (
                 f"🚀 <b>فتح صفقة جديدة ({NAME}):</b>\n"
-                f"العقد: <code>{sym}</code>\n"
+                f"الأصل: <b>SPY</b> | العقد: <code>{sym}</code>\n"
                 f"الكمية المركبة: {trade_qty} | السعر: ${q['mid']:.2f}\n"
-                f"الإشارة: {pred['signal']} (مستوى الثقة: {win_prob*100:.1f}%)\n"
-                f"حركة العقود الآجلة ES/NQ: <code>{pred['futures_momentum']}</code>"
+                f"الإشارة: {pred['signal']} (نسبة الثقة: {win_prob*100:.1f}%)\n"
+                f"حركة ناسداك القيادية: <code>{pred['nasdaq_regime']}</code>"
             )
             log.info(msg)
             send_telegram(msg)
@@ -650,7 +691,7 @@ def open_new_trade():
 
 # -------------------- MAIN LOOP --------------------
 if __name__ == "__main__":
-    log.info(f"🚀 بدء تشغيل {NAME} v{VERSION} (محرك تتبع العقود الآجلة والأرباح المركبة)")
+    log.info(f"🚀 بدء تشغيل {NAME} v{VERSION} (محرك تداول SPY والأرباح المفتوحة)")
     
     while True:
         try:
