@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل v60.3 — محرك تداول تنفيذي صامت (نسخة مُصلحة)
+صَفاء التحليل v60.4 — محرك تداول تنفيذي صامت (خروج مضمون + هدف ربح)
 تطوير وتنفيذ: تصميم أبو سحاب
 """
 
@@ -30,7 +30,7 @@ from sklearn.pipeline import make_pipeline
 # ================= الإعدادات =================
 
 NAME = "صَفاء التحليل - المحرك التنفيذي"
-VERSION = "v60.3-SilentExecution-Fixed"
+VERSION = "v60.4-SilentExecution-SafeExit"
 
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
@@ -46,19 +46,22 @@ SECRET = (os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY") or 
 STOCK_FEED = os.getenv("ALPACA_DATA_FEED", "iex").lower()
 OPTION_FEED = os.getenv("OPTIONS_FEED", "indicative").lower()
 
-HISTORY_DAYS = 30        # للتدريب
-LIVE_DAYS = 5            # للتنبؤ اللحظي (أخف على الـ API)
+HISTORY_DAYS = 30
+LIVE_DAYS = 5
 MIN_ROWS = 300
 HORIZON = 5
 
 MAX_SPREAD_PCT = 0.045
-POLL_SECONDS = 10
-SCAN_SECONDS = 30        # كل كم ثانية يحلل السوق ويبحث عن صفقة
+POLL_SECONDS = 10          # الفحص العادي
+POSITION_POLL_SECONDS = 3  # الفحص أثناء وجود صفقة مفتوحة
+SCAN_SECONDS = 30
 EXECUTION_TIMEOUT = 5
 
 MAX_DAILY_LOSS_PCT = 0.02
 MAX_RISK_CAP = 0.065
-# يمكن تغييرها من Railway Variables بدون تعديل الكود: MIN_CONFIDENCE=0.70
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.055"))
+# هدف الربح الثابت: 0.35 = يغلق عند +35%. ارفعه (مثلاً 1.0) لو تبي تترك الصفقة تركض
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.35"))
 MIN_CONFIDENCE_THRESHOLD = float(os.getenv("MIN_CONFIDENCE", "0.65"))
 MIN_VOL_VELOCITY = float(os.getenv("MIN_VOL_VELOCITY", "1.15"))
 
@@ -243,7 +246,7 @@ def fetch_bars(symbol=HYPER_ASSET, days=HISTORY_DAYS, timeframe=TF):
 def calculate_0dte_gamma_exposure(symbol, spot):
     """
     مؤشر تقريبي لمستوى التثبيت (Pin) مبني على الفائدة المفتوحة (Open Interest)
-    لعقود اليوم القريبة من السعر. ليس GEX حقيقياً، لكنه أفضل من وسيط السترايكات.
+    لعقود اليوم القريبة من السعر. ليس GEX حقيقياً.
     """
     today_str = now_ny().date().isoformat()
     try:
@@ -276,7 +279,6 @@ def calculate_0dte_gamma_exposure(symbol, spot):
         return 0, spot
 
 
-# الميزات تُحسب الآن لكل صف (دقيقة) وليس رقماً واحداً منسوخاً
 FEATURES = [
     "ret1", "ret3", "ret6", "ret12",
     "ema_9_21", "ema_21_50", "trend_200",
@@ -304,32 +306,28 @@ def generate_institutional_features(spy_bars, qqq_bars=None):
     f["ema_21_50"] = (e21 - e50) / c
     f["trend_200"] = (c - e200) / c
 
-    # VWAP يومي (يعاد حسابه كل يوم تداول) + Z-score
     day = pd.Series(f.index.tz_convert(NY).date, index=f.index)
     cum_pv = (c * v).groupby(day).cumsum()
     cum_v = v.groupby(day).cumsum().replace(0, np.nan)
     vwap = cum_pv / cum_v
     f["vwap_zscore"] = (c - vwap) / (c.rolling(15).std() + 1e-6)
 
-    # سرعة الحجم
     recent_vol = v.rolling(3).mean()
     prior_vol = v.shift(3).rolling(12).mean().replace(0, np.nan)
     f["vol_velocity"] = (recent_vol / prior_vol).fillna(1.0)
     f["vol_surge"] = v / v.rolling(20).mean().replace(0, np.nan)
 
-    # الامتصاص: شمعة ضيقة بحجم عال
     rng = h - l
     f["absorption"] = (
         (rng < rng.rolling(10).mean() * 0.65) & (v > v.rolling(10).mean() * 1.5)
     ).astype(int)
 
-    # كنس السيولة
     prev_high = h.shift(1).rolling(20).max()
     prev_low = l.shift(1).rolling(20).min()
     avg_vol = v.shift(1).rolling(14).mean()
     big_vol = v > avg_vol * 1.35
-    sweep_up = (l < prev_low) & (c > prev_low) & big_vol      # كنس قاع ثم ارتداد = صعود
-    sweep_down = (h > prev_high) & (c < prev_high) & big_vol  # كنس قمة ثم رفض = نزول
+    sweep_up = (l < prev_low) & (c > prev_low) & big_vol
+    sweep_down = (h > prev_high) & (c < prev_high) & big_vol
     f["sweep_signal"] = np.where(sweep_up, 1, np.where(sweep_down, -1, 0))
 
     ema12 = c.ewm(span=12, adjust=False).mean()
@@ -367,11 +365,11 @@ class PretrainedInstitutionalEngine:
         self.last_attempt = 0.0
 
     def needs_training(self):
-        if time.time() - self.last_attempt < 300:  # لا تعيد المحاولة قبل 5 دقائق
+        if time.time() - self.last_attempt < 300:
             return False
         if not self.is_trained:
             return True
-        return self.last_trained_time.date() != now_ny().date()  # إعادة تدريب يومية
+        return self.last_trained_time.date() != now_ny().date()
 
     def train_model(self):
         self.last_attempt = time.time()
@@ -391,7 +389,6 @@ class PretrainedInstitutionalEngine:
         close = spy_bars["close"]
         future_ret = close.shift(-HORIZON) / close - 1
 
-        # منع الهدف من عبور يومين مختلفين (فجوة الافتتاح)
         day = pd.Series(spy_bars.index.tz_convert(NY).date, index=spy_bars.index)
         same_day = day.shift(-HORIZON) == day
 
@@ -408,7 +405,6 @@ class PretrainedInstitutionalEngine:
             log.warning("⚠️ عينات البيانات غير كافية للتدريب.")
             return False
 
-        # تقسيم زمني: 70% للنموذج الأساسي، 30% للنموذج الوصفي (خارج العينة)
         split = int(len(ds_valid) * 0.7)
         train_df = ds_valid.iloc[:split]
         hold_df = ds_valid.iloc[split:].copy()
@@ -492,7 +488,7 @@ class PretrainedInstitutionalEngine:
 model_engine = PretrainedInstitutionalEngine()
 
 
-# ================= 3. إدارة رأس المال والتنفيذ =================
+# ================= 3. رأس المال والتنفيذ =================
 
 def calculate_half_kelly_qty(option_mid_price, win_probability):
     try:
@@ -520,7 +516,7 @@ def calculate_half_kelly_qty(option_mid_price, win_probability):
 
 
 def execute_smart_limit_order(symbol, qty, side, quotes):
-    """أمر حد بسعر المنتصف، وإن لم ينفذ خلال المهلة يُلغى ويُرسل بسعر Ask/Bid."""
+    """للشراء: أمر حد بسعر المنتصف، وإن لم ينفذ خلال المهلة يُلغى ويُرسل بسعر Ask/Bid."""
     if qty <= 0 or not quotes:
         return None
 
@@ -549,7 +545,6 @@ def execute_smart_limit_order(symbol, qty, side, quotes):
                 log.info(f"⚡ تم التنفيذ الكامل عند سعر المنتصف ${mid_price:.2f}")
                 return chk
 
-        # انتهت المهلة: إلغاء ثم فحص ما نُفذ فعلاً
         alpaca_delete(f"{TRADING_URL}/v2/orders/{order_id}")
         time.sleep(0.5)
         chk = alpaca_get(f"{TRADING_URL}/v2/orders/{order_id}")
@@ -562,20 +557,62 @@ def execute_smart_limit_order(symbol, qty, side, quotes):
             return chk
 
         log.warning(f"⚠️ لم ينفذ كاملاً. إرسال المتبقي ({remaining}) بسعر ${fallback_price:.2f}")
-        fallback_payload = {
+        final_order = alpaca_post(f"{TRADING_URL}/v2/orders", {
             "symbol": symbol,
             "qty": str(remaining),
             "side": side,
             "type": "limit",
             "limit_price": str(round(fallback_price, 2)),
             "time_in_force": "day",
-        }
-        final_order = alpaca_post(f"{TRADING_URL}/v2/orders", fallback_payload)
+        })
         log.info(f"📨 تم إرسال أمر مباشر بسعر ${fallback_price:.2f}")
         return final_order
 
     except Exception as e:
         log.error(f"❌ خطأ أثناء تنفيذ الأمر الذكي: {e}")
+        return None
+
+
+def execute_exit_order(symbol, qty, bid):
+    """
+    خروج مضمون: أمر حد أقل من Bid بـ 3% (ينفذ فوراً تقريباً)،
+    وإن لم ينفذ يُلغى ويُرسل المتبقي كأمر Market.
+    """
+    if qty <= 0:
+        return None
+    try:
+        price = max(0.01, round(bid * 0.97, 2))
+        order = alpaca_post(f"{TRADING_URL}/v2/orders", {
+            "symbol": symbol, "qty": str(qty), "side": "sell",
+            "type": "limit", "limit_price": str(price), "time_in_force": "day",
+        })
+        oid = order.get("id")
+        log.info(f"📤 أمر خروج | {symbol} | كمية {qty} | حد ${price:.2f} (Bid ${bid:.2f})")
+
+        for _ in range(3):
+            time.sleep(1)
+            chk = alpaca_get(f"{TRADING_URL}/v2/orders/{oid}")
+            if chk.get("status") == "filled":
+                log.info(f"✅ تم الخروج من {symbol}")
+                return chk
+
+        alpaca_delete(f"{TRADING_URL}/v2/orders/{oid}")
+        time.sleep(0.5)
+        chk = alpaca_get(f"{TRADING_URL}/v2/orders/{oid}")
+        if chk.get("status") == "filled":
+            return chk
+
+        remaining = qty - int(num(chk.get("filled_qty"), 0))
+        if remaining <= 0:
+            return chk
+
+        log.warning(f"⚠️ الخروج بأمر Market للمتبقي ({remaining}) من {symbol}")
+        return alpaca_post(f"{TRADING_URL}/v2/orders", {
+            "symbol": symbol, "qty": str(remaining), "side": "sell",
+            "type": "market", "time_in_force": "day",
+        })
+    except Exception as e:
+        log.error(f"❌ فشل أمر الخروج: {e}")
         return None
 
 
@@ -605,7 +642,11 @@ def fetch_spy_contracts(direction, spy_price):
 
 
 def _get_option_quote(symbol):
-    payload = alpaca_get(f"{DATA_URL}/v1beta1/options/quotes/latest", {"symbols": symbol, "feed": OPTION_FEED})
+    try:
+        payload = alpaca_get(f"{DATA_URL}/v1beta1/options/quotes/latest",
+                             {"symbols": symbol, "feed": OPTION_FEED})
+    except Exception:
+        return None
     q = (payload.get("quotes") or {}).get(symbol, {})
     bid, ask = num(q.get("bp")), num(q.get("ap"))
     if not math.isfinite(bid) or bid <= 0 or not math.isfinite(ask) or ask < bid:
@@ -622,12 +663,11 @@ def close_all_positions_immediately():
         positions = r.json() if r.status_code == 200 else []
         for pos in positions:
             sym = pos.get("symbol")
-            qty = pos.get("qty")
-            if sym and qty:
+            qty = abs(int(num(pos.get("qty"), 0)))
+            if sym and qty > 0:
                 q = _get_option_quote(sym)
                 price = q["bid"] if q else num(pos.get("current_price"), 0.1)
-                execute_smart_limit_order(sym, qty=abs(int(num(qty))), side="sell",
-                                          quotes={"mid": price, "ask": price, "bid": price})
+                execute_exit_order(sym, qty, price)
         save_json(ACTIVE_POSITIONS_FILE, {})
         log.warning("🛑 تم إغلاق جميع الصفقات فوراً عبر كاسر الحماية اليومي.")
     except Exception as e:
@@ -680,10 +720,15 @@ def manage_active_positions():
                 if not math.isfinite(entry_price) or entry_price <= 0 or not math.isfinite(current_price) or current_price <= 0:
                     continue
 
-                pos_data = saved_positions.get(sym, {})
-                highest_price = max(pos_data.get("highest_price", current_price), current_price)
+                # الربح يُحسب من Bid الفعلي (سعر البيع الحقيقي) بدل current_price المتأخر
+                q = _get_option_quote(sym)
+                live_price = q["bid"] if q else current_price
+                exit_price = live_price
 
-                pnl_pct = (current_price - entry_price) / entry_price
+                pos_data = saved_positions.get(sym, {})
+                highest_price = max(pos_data.get("highest_price", live_price), live_price)
+
+                pnl_pct = (live_price - entry_price) / entry_price
                 peak_pnl_pct = (highest_price - entry_price) / entry_price
 
                 saved_positions[sym] = {
@@ -697,15 +742,15 @@ def manage_active_positions():
                 if sym in pending_sell_symbols:
                     continue
 
-                q = _get_option_quote(sym)
-                exit_price = q["bid"] if q else current_price
-
                 should_close = False
                 reason = ""
 
                 if force_eod_close:
                     should_close = True
                     reason = "إغلاق نهاية اليوم (EOD Exit)"
+                elif pnl_pct >= TAKE_PROFIT_PCT:
+                    should_close = True
+                    reason = f"هدف الربح الثابت (+{pnl_pct*100:.1f}%)"
                 elif peak_pnl_pct >= 1.00 and pnl_pct <= (peak_pnl_pct * 0.88):
                     should_close = True
                     reason = f"حماية أرباح انفجارية دبل+ (قمة: +{peak_pnl_pct*100:.1f}%) | الربح: +{pnl_pct*100:.2f}%"
@@ -718,17 +763,16 @@ def manage_active_positions():
                 elif peak_pnl_pct >= 0.10 and pnl_pct < 0.10:
                     should_close = True
                     reason = f"جدار حماية +10% الصارم (قمة +{peak_pnl_pct*100:.1f}%)"
-                elif peak_pnl_pct >= 0.05 and pnl_pct <= 0.025:
+                elif peak_pnl_pct >= 0.05 and pnl_pct <= peak_pnl_pct * 0.55:
                     should_close = True
-                    reason = f"تأمين أرباح مبكرة (+2.5%+) بعد قمة +{peak_pnl_pct*100:.1f}%"
-                elif pnl_pct <= -0.055:
+                    reason = f"تأمين أرباح مبكرة بعد قمة +{peak_pnl_pct*100:.1f}%"
+                elif pnl_pct <= -STOP_LOSS_PCT:
                     should_close = True
-                    reason = f"وقف خسارة خاطف (-5.5%) لـ {sym}"
+                    reason = f"وقف خسارة (-{STOP_LOSS_PCT*100:.1f}%) لـ {sym}"
 
                 if should_close:
                     log.info(f"📉 [إغلاق صفقة] {sym} | السبب: {reason} | صافي الـ PnL: {pnl_pct*100:+.2f}%")
-                    execute_smart_limit_order(sym, qty=qty, side="sell",
-                                              quotes={"mid": exit_price, "ask": exit_price, "bid": exit_price})
+                    execute_exit_order(sym, qty, exit_price)
 
         # حماية الصفقات المعلقة من الحذف أثناء التنفيذ
         to_remove = [
@@ -773,7 +817,6 @@ def open_new_trade():
         log.error(f"⚠️ خطأ أثناء التحليل: {e}")
         return
 
-    # نبض كل دقيقة ليظهر لك أن البوت يعمل ويبحث
     log_every(
         "heartbeat", 60,
         f"💓 نبض | SPY ${pred['current_price']:.2f} | الإشارة: {pred['signal']} | "
@@ -785,7 +828,11 @@ def open_new_trade():
     if pred["signal"] == "محايد ⏳":
         return
 
-    contracts = fetch_spy_contracts(pred["signal"], pred["current_price"])
+    try:
+        contracts = fetch_spy_contracts(pred["signal"], pred["current_price"])
+    except Exception as e:
+        log.error(f"⚠️ فشل جلب العقود: {e}")
+        return
     if not contracts:
         log.info(f"ℹ️ إشارة {pred['signal']} لكن لا توجد عقود مناسبة قريبة من السعر.")
         return
@@ -829,7 +876,10 @@ def open_new_trade():
 
 if __name__ == "__main__":
     log.info(f"🚀 بدء تشغيل محرك التداول التنفيذي الصامت {NAME} {VERSION}")
-    log.info(f"الإعدادات: ثقة ≥ {MIN_CONFIDENCE_THRESHOLD*100:.0f}% | سرعة حجم ≥ {MIN_VOL_VELOCITY} | {TRADING_URL}")
+    log.info(
+        f"الإعدادات: ثقة ≥ {MIN_CONFIDENCE_THRESHOLD*100:.0f}% | سرعة حجم ≥ {MIN_VOL_VELOCITY} | "
+        f"هدف ربح +{TAKE_PROFIT_PCT*100:.0f}% | وقف خسارة -{STOP_LOSS_PCT*100:.1f}% | {TRADING_URL}"
+    )
 
     while True:
         try:
@@ -845,7 +895,8 @@ if __name__ == "__main__":
             else:
                 log_every("closed", 300, "⏳ السوق مغلق حالياً.. المحرك في وضع الانتظار.")
 
-            time.sleep(POLL_SECONDS)
+            # فحص أسرع (3 ثوانٍ) أثناء وجود صفقة مفتوحة
+            time.sleep(POSITION_POLL_SECONDS if read_json(ACTIVE_POSITIONS_FILE) else POLL_SECONDS)
 
         except KeyboardInterrupt:
             log.info("تم إيقاف المحرك التنفيذي يدوياً.")
