@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل v60.5 — محرك تداول تنفيذي صامت (خروج ذكي + حماية أرباح ديناميكية)
+صَفاء التحليل v61.0 — محرك تداول تنفيذي صامت (فلترة صارمة + حماية أرباح ديناميكية)
 تطوير وتنفيذ: تصميم أبو سحاب
 """
 
@@ -30,7 +30,7 @@ from sklearn.pipeline import make_pipeline
 # ================= الإعدادات =================
 
 NAME = "صَفاء التحليل - المحرك التنفيذي"
-VERSION = "v60.5-SmartExit-DynamicProfit"
+VERSION = "v61.0-StrictFilters-DynamicProfit"
 
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
@@ -51,9 +51,10 @@ LIVE_DAYS = 5
 MIN_ROWS = 300
 HORIZON = 5
 
-MAX_SPREAD_PCT = 0.045
-POLL_SECONDS = 10          # الفحص العادي
-POSITION_POLL_SECONDS = 3  # الفحص أثناء وجود صفقة مفتوحة
+MAX_SPREAD_PCT = 0.030        # تم تضييق الفارق إلى 3.0% لضمان أعلى سيولة وانزلاق أدنى
+MIN_OPEN_INTEREST = 300       # الحد الأدنى للعقود المفتوحة لضمان سهولة الخروج
+POLL_SECONDS = 15             # الفحص العادي
+POSITION_POLL_SECONDS = 3     # الفحص أثناء وجود صفقة مفتوحة
 SCAN_SECONDS = 30
 EXECUTION_TIMEOUT = 5
 
@@ -78,7 +79,7 @@ log = logging.getLogger("safaa_execution")
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": f"SafaaExecution/{VERSION}"})
 
-STATE = {"last_scan": 0.0}
+STATE = {"last_scan": 0.0, "gamma_cache": None, "gamma_cache_time": 0.0}
 _LAST_LOG = {}
 
 
@@ -243,6 +244,11 @@ def fetch_bars(symbol=HYPER_ASSET, days=HISTORY_DAYS, timeframe=TF):
 
 
 def calculate_0dte_gamma_exposure(symbol, spot):
+    """تخزين مؤقت لمدة 60 ثانية لتقليل ضغط استعلامات API"""
+    now = time.time()
+    if STATE["gamma_cache"] is not None and (now - STATE["gamma_cache_time"]) < 60.0:
+        return STATE["gamma_cache"]
+
     today_str = now_ny().date().isoformat()
     try:
         payload = alpaca_get(f"{TRADING_URL}/v2/options/contracts", {
@@ -262,14 +268,19 @@ def calculate_0dte_gamma_exposure(symbol, spot):
                 strikes.append(k)
                 weights.append(oi)
         if not strikes:
-            return 0, spot
+            res = (0, spot)
+        else:
+            pin = float(np.average(strikes, weights=weights))
+            if spot > pin * 1.0015:
+                res = (1, pin)
+            elif spot < pin * 0.9985:
+                res = (-1, pin)
+            else:
+                res = (0, pin)
 
-        pin = float(np.average(strikes, weights=weights))
-        if spot > pin * 1.0015:
-            return 1, pin
-        elif spot < pin * 0.9985:
-            return -1, pin
-        return 0, pin
+        STATE["gamma_cache"] = res
+        STATE["gamma_cache_time"] = now
+        return res
     except Exception:
         return 0, spot
 
@@ -454,6 +465,8 @@ class PretrainedInstitutionalEngine:
         curr_price = float(spy_bars["close"].iloc[-1])
         vol_vel = float(f["vol_velocity"].iloc[-1])
         sweep_sig = int(f["sweep_signal"].iloc[-1])
+        rsi_val = float(f["rsi"].iloc[-1])
+        vwap_z = float(f["vwap_zscore"].iloc[-1])
         gamma_sig, pin = calculate_0dte_gamma_exposure(HYPER_ASSET, curr_price)
 
         confidence = (prob_max + meta_prob) / 2.0
@@ -476,6 +489,8 @@ class PretrainedInstitutionalEngine:
             "vol_velocity": vol_vel,
             "sweep_signal": sweep_sig,
             "gamma_signal": gamma_sig,
+            "rsi": rsi_val,
+            "vwap_zscore": vwap_z,
             "pin": pin,
         }
 
@@ -483,7 +498,69 @@ class PretrainedInstitutionalEngine:
 model_engine = PretrainedInstitutionalEngine()
 
 
-# ================= 3. رأس المال والتنفيذ =================
+# ================= 3. الفلترة الصارمة والتحقق =================
+
+def ultra_strict_filter(pred, option_quote, contract_info):
+    """
+    طبقة استبعاد صارمة لمنع التداول عند اتساع الفارق أو ضعف السيولة أو مناطق التشبع
+    """
+    # 1. فلتر اتساع الـ Spread (السيولة)
+    bid, ask = option_quote["bid"], option_quote["ask"]
+    spread_pct = (ask - bid) / option_quote["mid"]
+    if spread_pct > MAX_SPREAD_PCT:
+        log.info(f"🛑 [مرفوض] الـ Spread واسع جداً ({spread_pct*100:.2f}% > الحد {MAX_SPREAD_PCT*100:.1f}%)")
+        return False
+
+    # 2. فلتر الحد الأدنى للسيولة على العقد (Open Interest)
+    open_interest = num(contract_info.get("open_interest"), 0)
+    if open_interest < MIN_OPEN_INTEREST:
+        log.info(f"🛑 [مرفوض] العقود المفتوحة ضئيلة ({open_interest} < {MIN_OPEN_INTEREST})")
+        return False
+
+    # 3. فلتر منع المطاردة (Momentum Guard)
+    rsi_val = pred.get("rsi", 0.5)
+    vwap_z = pred.get("vwap_zscore", 0.0)
+
+    if pred["signal"] == "صعود 🚀":
+        if rsi_val > 0.75:
+            log.info(f"🛑 [مرفوض] تشبع شرائي حاد (RSI: {rsi_val*100:.1f}%)")
+            return False
+        if vwap_z > 2.2:
+            log.info(f"🛑 [مرفوض] السعر مبتعد جداً فوق الـ VWAP (Z-Score: {vwap_z:.2f})")
+            return False
+    elif pred["signal"] == "نزول 📉":
+        if rsi_val < 0.25:
+            log.info(f"🛑 [مرفوض] تشبع بيعي حاد (RSI: {rsi_val*100:.1f}%)")
+            return False
+        if vwap_z < -2.2:
+            log.info(f"🛑 [مرفوض] السعر مبتعد جداً تحت الـ VWAP (Z-Score: {vwap_z:.2f})")
+            return False
+
+    return True
+
+
+def recheck_momentum_before_entry(expected_signal):
+    """فحص لحظي للزخم قبل إرسال أمر الشراء المباشر"""
+    try:
+        spy_bars = fetch_bars(HYPER_ASSET, days=1)
+        if len(spy_bars) < 3:
+            return True
+        last_c = spy_bars["close"].iloc[-1]
+        prev_c = spy_bars["close"].iloc[-2]
+        momo = (last_c - prev_c) / prev_c
+
+        if expected_signal == "صعود 🚀" and momo < -0.0005:
+            log.warning("🛑 [إلغاء لحظي] الزخم انعكس للهبوط قبل التنفيذ مباشرة.")
+            return False
+        elif expected_signal == "نزول 📉" and momo > 0.0005:
+            log.warning("🛑 [إلغاء لحظي] الزخم انعكس للصعود قبل التنفيذ مباشرة.")
+            return False
+        return True
+    except Exception:
+        return True
+
+
+# ================= 4. رأس المال والتنفيذ =================
 
 def calculate_half_kelly_qty(option_mid_price, win_probability):
     try:
@@ -568,14 +645,6 @@ def execute_smart_limit_order(symbol, qty, side, quotes):
 
 
 def execute_exit_order(symbol, qty, quotes_or_bid, is_emergency=False):
-    """
-    خروج ذكي ومُحسّن لمنع البيع بأقل سعر (تلافي الـ Slippage)
-    -------------------------------------------------------
-    - إذا كانت quotes_or_bid قاموساً كـ {'bid': x, 'ask': y, 'mid': z}:
-        1. يحاول التنفيذ أولاً بسعر المنتصف (Mid Price) لامتصاص الـ Spread.
-        2. إذا لم ينفذ خلال ثوانٍ، ينزل لسعر الـ Bid المباشر (بدون خصم 3%).
-        3. لا يتناول أمر Market إلا إذا كان خروجاً طارئاً (وقف خسارة أو نهاية اليوم).
-    """
     if qty <= 0:
         return None
 
@@ -592,7 +661,6 @@ def execute_exit_order(symbol, qty, quotes_or_bid, is_emergency=False):
         mid = bid
 
     try:
-        # 1. المحاولة الأولى: أخذ أفضل سعر ممكن (المنتصف Mid Price)
         target_price = round(mid, 2)
         order = alpaca_post(f"{TRADING_URL}/v2/orders", {
             "symbol": symbol,
@@ -609,7 +677,7 @@ def execute_exit_order(symbol, qty, quotes_or_bid, is_emergency=False):
             time.sleep(1)
             chk = alpaca_get(f"{TRADING_URL}/v2/orders/{oid}")
             if chk.get("status") == "filled":
-                log.info(f"✅ تم الخروج بنجاح بسعر المنتصف الممتاز ${target_price:.2f} لـ {symbol}")
+                log.info(f"✅ تم الخروج بنجاح بسعر المنتصف ${target_price:.2f} لـ {symbol}")
                 return chk
 
         alpaca_delete(f"{TRADING_URL}/v2/orders/{oid}")
@@ -622,7 +690,6 @@ def execute_exit_order(symbol, qty, quotes_or_bid, is_emergency=False):
         if remaining <= 0:
             return chk
 
-        # 2. المحاولة الثانية: العرض بسعر الـ Bid المباشر (بدون خصم 3% عشوائي)
         bid_price = round(bid, 2)
         log.warning(f"⚠️ تعديل أمر الخروج لـ {symbol} إلى سعر Bid المباشر: ${bid_price:.2f} (المتبقي: {remaining})")
         
@@ -643,7 +710,6 @@ def execute_exit_order(symbol, qty, quotes_or_bid, is_emergency=False):
                 log.info(f"✅ تم الخروج بسعر Bid المباشر ${bid_price:.2f} لـ {symbol}")
                 return chk
 
-        # 3. الخروج الطارئ بأمر السوق (فقط لو كانت الصفقة ضربت وقف الخسارة أو EOD)
         if is_emergency:
             alpaca_delete(f"{TRADING_URL}/v2/orders/{second_oid}")
             time.sleep(0.3)
@@ -701,7 +767,7 @@ def _get_option_quote(symbol):
     return {"bid": bid, "ask": ask, "mid": (bid + ask) / 2}
 
 
-# ================= 4. إدارة الصفقات وكاسر الحماية =================
+# ================= 5. إدارة الصفقات وكاسر الحماية =================
 
 def close_all_positions_immediately():
     cancel_all_open_orders()
@@ -740,11 +806,6 @@ def check_daily_circuit_breaker():
 
 
 def manage_active_positions():
-    """
-    إدارة الصفقات وحماية الأرباح الديناميكية المحسّنة
-    ------------------------------------------------
-    تضمن عدم الخروج عند التذبذبات الطبيعية للـ 0DTE مع حماية الأرباح الحقيقية
-    """
     saved_positions = read_json(ACTIVE_POSITIONS_FILE)
     try:
         r = HTTP.get(f"{TRADING_URL}/v2/positions", headers=_headers(), timeout=10)
@@ -796,8 +857,6 @@ def manage_active_positions():
                 is_emergency = False
                 reason = ""
 
-                # --- قواعد الخروج وحماية الأرباح المحسّنة ---
-
                 if force_eod_close:
                     should_close = True
                     is_emergency = True
@@ -807,27 +866,22 @@ def manage_active_positions():
                     should_close = True
                     reason = f"🎯 تحقيق هدف الربح الثابت (+{pnl_pct*100:.1f}%)"
 
-                # 1. أرباح انفجارية دبل+ (Peak >= +100%): نحمي 85% من أقصى ربح
                 elif peak_pnl_pct >= 1.00 and pnl_pct <= (peak_pnl_pct * 0.85):
                     should_close = True
                     reason = f"🚀 حماية أرباح انفجارية (قمة: +{peak_pnl_pct*100:.1f}%) | الربح الحالي: +{pnl_pct*100:.1f}%"
 
-                # 2. أرباح عالية جداً (Peak >= +50%): نحمي 75% من أقصى ربح
                 elif peak_pnl_pct >= 0.50 and pnl_pct <= (peak_pnl_pct * 0.75):
                     should_close = True
                     reason = f"💎 حماية أرباح عالية (قمة: +{peak_pnl_pct*100:.1f}%) | الربح الحالي: +{pnl_pct*100:.1f}%"
 
-                # 3. أرباح ممتازة (Peak >= +25%): نحمي 60% من أقصى ربح
                 elif peak_pnl_pct >= 0.25 and pnl_pct <= (peak_pnl_pct * 0.60):
                     should_close = True
                     reason = f"📈 حماية أرباح جيدة جداً (قمة: +{peak_pnl_pct*100:.1f}%) | الربح الحالي: +{pnl_pct*100:.1f}%"
 
-                # 4. تأمين رأس المال (Breakeven Lock): إذا وصلت القمة بين +10% و +25%، يغلق إذا تراجع الربح لـ +1%
                 elif peak_pnl_pct >= 0.10 and pnl_pct <= 0.01:
                     should_close = True
                     reason = f"🛡️ تأمين رأس المال بعد قمة +{peak_pnl_pct*100:.1f}% (الربح عند الخروج: +{pnl_pct*100:.1f}%)"
 
-                # 5. وقف الخسارة الصارم
                 elif pnl_pct <= -STOP_LOSS_PCT:
                     should_close = True
                     is_emergency = True
@@ -883,8 +937,8 @@ def open_new_trade():
         "heartbeat", 60,
         f"💓 نبض | SPY ${pred['current_price']:.2f} | الإشارة: {pred['signal']} | "
         f"اتجاه النموذج: {pred['primary_pred']:+d} | الثقة: {pred['confidence']*100:.1f}% "
-        f"(الحد {MIN_CONFIDENCE_THRESHOLD*100:.0f}%) | سرعة الحجم: {pred['vol_velocity']:.2f} "
-        f"(الحد {MIN_VOL_VELOCITY}) | Sweep: {pred['sweep_signal']} | Gamma: {pred['gamma_signal']}",
+        f"(الحد {MIN_CONFIDENCE_THRESHOLD*100:.0f}%) | سرعة الحجم: {pred['vol_velocity']:.2f} | "
+        f"RSI: {pred['rsi']*100:.1f}% | Sweep: {pred['sweep_signal']} | Gamma: {pred['gamma_signal']}",
     )
 
     if pred["signal"] == "محايد ⏳":
@@ -908,9 +962,12 @@ def open_new_trade():
             log.info(f"تخطي {sym}: لا يوجد تسعير صالح (Bid/Ask).")
             continue
 
-        spread = (q["ask"] - q["bid"]) / q["mid"]
-        if spread > MAX_SPREAD_PCT:
-            log.info(f"تخطي العقد {sym} بسبب اتساع Spread ({spread*100:.1f}%)")
+        # --- الفلترة الصارمة الشديدة ---
+        if not ultra_strict_filter(pred, q, c):
+            continue
+
+        # --- إعادة الفحص اللحظي للزخم قبل الدخول المباشر ---
+        if not recheck_momentum_before_entry(pred["signal"]):
             continue
 
         trade_qty = calculate_half_kelly_qty(q["mid"], pred["confidence"])
@@ -929,18 +986,18 @@ def open_new_trade():
                 "time": stamp(),
             }
             save_json(ACTIVE_POSITIONS_FILE, positions)
-            log.info(f"🚀 [صفقة جديدة] {sym} | كمية: {trade_qty} | ${q['mid']:.2f} | "
+            log.info(f"🚀 [صفقة جديدة مُفلتَرة] {sym} | كمية: {trade_qty} | ${q['mid']:.2f} | "
                      f"{pred['signal']} | ثقة: {pred['confidence']*100:.1f}%")
             return
 
 
-# ================= 5. الحلقة الرئيسية =================
+# ================= 6. الحلقة الرئيسية =================
 
 if __name__ == "__main__":
-    log.info(f"🚀 بدء تشغيل محرك التداول التنفيذي الصامت {NAME} {VERSION}")
+    log.info(f"🚀 بدء تشغيل محرك التداول التنفيذي {NAME} {VERSION}")
     log.info(
-        f"الإعدادات: ثقة ≥ {MIN_CONFIDENCE_THRESHOLD*100:.0f}% | سرعة حجم ≥ {MIN_VOL_VELOCITY} | "
-        f"هدف ربح +{TAKE_PROFIT_PCT*100:.0f}% | وقف خسارة -{STOP_LOSS_PCT*100:.1f}% | {TRADING_URL}"
+        f"الإعدادات: ثقة ≥ {MIN_CONFIDENCE_THRESHOLD*100:.0f}% | أقصى Spread: {MAX_SPREAD_PCT*100:.1f}% | "
+        f"أدنى OI: {MIN_OPEN_INTEREST} | هدف ربح +{TAKE_PROFIT_PCT*100:.0f}% | وقف خسارة -{STOP_LOSS_PCT*100:.1f}% | {TRADING_URL}"
     )
 
     while True:
