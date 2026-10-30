@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل v64.2 — محرك التداول التنفيذي النهائي (عتبة تكيفية + تشخيص + fallback للـ feed)
+صَفاء التحليل v64.3 — دخول انتقائي + تتبع أرباح متدرج + قواطع خسارة + تسجيل فلول حقيقية
 تطوير وتنفيذ: تصميم أبو سحاب
 """
 
@@ -23,14 +23,14 @@ try:
 except ImportError:
     HAS_LGB = False
 
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import ExtraTreesClassifier, GradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
 
-# ================= الإعدادات المتقدمة =================
+# ================= الإعدادات =================
 
 NAME = "صَفاء التحليل - Ultra Engine"
-VERSION = "v64.2-ProductionReady"
+VERSION = "v64.3-SmartEntryTrail"
 
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
@@ -48,9 +48,9 @@ OPTION_FEED = os.getenv("OPTIONS_FEED", "indicative").lower()
 
 HISTORY_DAYS = 90
 LIVE_DAYS = 5
-MIN_RAW_BARS = 1200           # الحد الأدنى للأشرطة الخام
-MIN_TRAIN_ROWS = int(os.getenv("MIN_TRAIN_ROWS", "500"))  # الحد الأدنى لعينات التدريب بعد إزالة الحياد
-MIN_TARGET_THRESHOLD = float(os.getenv("MIN_TARGET_THRESHOLD", "0.0004"))  # أدنى عتبة للحركة (0.04%)
+MIN_RAW_BARS = 1200
+MIN_TRAIN_ROWS = int(os.getenv("MIN_TRAIN_ROWS", "500"))
+MIN_TARGET_THRESHOLD = float(os.getenv("MIN_TARGET_THRESHOLD", "0.0004"))
 TARGET_QUANTILE = float(os.getenv("TARGET_QUANTILE", "0.60"))
 HORIZON = 5
 
@@ -67,18 +67,33 @@ MIN_DELTA = 0.40
 MAX_DELTA = 0.65
 MAX_IV_THRESHOLD = 0.45
 
+# --- إدارة المخاطر والقواطع ---
 MAX_TIME_IN_TRADE_MINUTES = 20
-MAX_DAILY_LOSS_PCT = 0.02
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.02"))   # قاطع الخسارة اليومية (من رأس المال)
 MAX_RISK_CAP = 0.05
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.06"))
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.35"))
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "6"))
+MAX_CONSEC_LOSSES = int(os.getenv("MAX_CONSEC_LOSSES", "3"))
+COOLDOWN_AFTER_LOSS_MIN = int(os.getenv("COOLDOWN_AFTER_LOSS_MIN", "15"))
+COOLDOWN_AFTER_WIN_MIN = int(os.getenv("COOLDOWN_AFTER_WIN_MIN", "3"))
+
+# --- الخروج ---
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.10"))        # كان 0.06 (ضيق جداً لعقود 1-3 أيام)
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "1.50"))    # سقف بعيد: الرابحة تُترك تكبر والتتبع يحميها
+SCALE_OUT_PCT = float(os.getenv("SCALE_OUT_PCT", "0.25"))        # بيع نصف الكمية عند هذا الربح (إن كانت الكمية 2+)
+BREAKEVEN_BUFFER = float(os.getenv("BREAKEVEN_BUFFER", "0.02"))  # بعد التخفيف: الباقي يخرج إن رجع لهذا المستوى
+
+# --- الدخول ---
 MIN_CONFIDENCE_THRESHOLD = float(os.getenv("MIN_CONFIDENCE", "0.68"))
 MIN_VOL_VELOCITY = float(os.getenv("MIN_VOL_VELOCITY", "1.20"))
+CONFIRM_SCANS = int(os.getenv("CONFIRM_SCANS", "2"))             # عدد المسوحات المتتالية لنفس الإشارة
+MIN_REALIZED_VOL = float(os.getenv("MIN_REALIZED_VOL", "0.006")) # سوق ميت = عقد يذوب
+STALE_BAR_SECONDS = int(os.getenv("STALE_BAR_SECONDS", "240"))
+AVOID_LUNCH = os.getenv("AVOID_LUNCH", "1") == "1"               # تجنب 11:45-13:15 نيويورك
 
 ROOT = Path(os.getenv("DATA_DIR", "./data"))
 ROOT.mkdir(parents=True, exist_ok=True)
 ACTIVE_POSITIONS_FILE = ROOT / "spy_ultratitan_positions.json"
-JOURNAL_FILE = ROOT / "trade_journal.csv"
+JOURNAL_FILE = ROOT / "trade_journal_v2.csv"   # ملف جديد (يتضمن عمود kind)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -90,7 +105,16 @@ log = logging.getLogger("safaa_execution")
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": f"SafaaExecution/{VERSION}"})
 
-STATE = {"last_scan": 0.0}
+STATE = {
+    "last_scan": 0.0,
+    "sig": None,
+    "sig_n": 0,
+    "day": None,
+    "entries_today": 0,
+    "cooldown_until": 0.0,
+    "acct": None,
+    "acct_t": 0.0,
+}
 _LAST_LOG = {}
 
 
@@ -208,33 +232,45 @@ def in_signal_window():
     return n.weekday() < 5 and (9, 45) <= (n.hour, n.minute) < (15, 30)
 
 
+def in_avoid_window():
+    if not AVOID_LUNCH:
+        return False
+    n = now_ny()
+    return (11, 45) <= (n.hour, n.minute) < (13, 15)
+
+
 def is_eod_close_time():
     n = now_ny()
     return n.weekday() < 5 and (n.hour, n.minute) >= (15, 50)
 
 
-# ================= 1. نظام تتبع الأداء =================
+# ================= 1. نظام تتبع الأداء (فلول حقيقية) =================
 
-def log_completed_trade(symbol, entry_price, exit_price, qty, pnl_pct, reason):
+JOURNAL_COLS = ["timestamp", "symbol", "entry_price", "exit_price", "qty",
+                "pnl_usd", "pnl_pct", "r_multiple", "kind", "exit_reason"]
+
+
+def log_completed_trade(symbol, entry_price, exit_price, qty, reason, kind="final"):
+    """kind: final = إغلاق كامل | partial = تخفيف/إغلاق جزئي. الأسعار هنا أسعار التنفيذ الفعلية."""
+    pnl_pct = (exit_price - entry_price) / entry_price if entry_price > 0 else 0.0
     pnl_usd = (exit_price - entry_price) * qty * 100
-    r_multiple = pnl_pct / STOP_LOSS_PCT
     row = {
         "timestamp": stamp(),
         "symbol": symbol,
-        "entry_price": entry_price,
-        "exit_price": exit_price,
+        "entry_price": round(entry_price, 4),
+        "exit_price": round(exit_price, 4),
         "qty": qty,
         "pnl_usd": round(pnl_usd, 2),
         "pnl_pct": round(pnl_pct, 4),
-        "r_multiple": round(r_multiple, 2),
+        "r_multiple": round(pnl_pct / STOP_LOSS_PCT, 2),
+        "kind": kind,
         "exit_reason": reason,
     }
-    df_row = pd.DataFrame([row])
+    df_row = pd.DataFrame([row], columns=JOURNAL_COLS)
     if not JOURNAL_FILE.exists():
         df_row.to_csv(JOURNAL_FILE, index=False)
     else:
         df_row.to_csv(JOURNAL_FILE, mode="a", header=False, index=False)
-
     calculate_and_log_metrics()
 
 
@@ -245,36 +281,92 @@ def calculate_and_log_metrics():
         df = pd.read_csv(JOURNAL_FILE)
         if df.empty:
             return
-        total_trades = len(df)
+        total = len(df)
         wins = df[df["pnl_usd"] > 0]
         losses = df[df["pnl_usd"] <= 0]
-
-        win_rate = len(wins) / total_trades if total_trades > 0 else 0.0
-        avg_r = df["r_multiple"].mean() if total_trades > 0 else 0.0
-
-        avg_win_r = wins["r_multiple"].mean() if len(wins) > 0 else 0.0
-        avg_loss_r = abs(losses["r_multiple"].mean()) if len(losses) > 0 else 1.0
-
+        win_rate = len(wins) / total if total else 0.0
+        avg_r = df["r_multiple"].mean()
+        avg_win_r = wins["r_multiple"].mean() if len(wins) else 0.0
+        avg_loss_r = abs(losses["r_multiple"].mean()) if len(losses) else 1.0
         expectancy = (win_rate * avg_win_r) - ((1.0 - win_rate) * avg_loss_r)
-        total_pnl = df["pnl_usd"].sum()
-
         log.info(
-            f"📊 [سجل الأداء] صفقات: {total_trades} | نسبة النجاح: {win_rate*100:.1f}% | "
-            f"متوسط R: {avg_r:.2f} | Expectancy: {expectancy:.2f}R | إجمالي الـ PnL: ${total_pnl:+.2f}"
+            f"📊 [سجل الأداء] عمليات إغلاق: {total} | نسبة النجاح: {win_rate*100:.1f}% | "
+            f"متوسط R: {avg_r:.2f} | Expectancy: {expectancy:.2f}R | إجمالي PnL: ${df['pnl_usd'].sum():+.2f}"
         )
     except Exception as e:
         log.error(f"خطأ في حساب مقاييس الأداء: {e}")
 
 
-# ================= 2. Snapshots لليونانيات =================
+def finals_today():
+    if not JOURNAL_FILE.exists():
+        return pd.DataFrame(columns=JOURNAL_COLS)
+    try:
+        df = pd.read_csv(JOURNAL_FILE)
+        df = df[df["kind"] == "final"]
+        if df.empty:
+            return df
+        d = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dt.tz_convert(NY).dt.date
+        return df[d == now_ny().date()]
+    except Exception:
+        return pd.DataFrame(columns=JOURNAL_COLS)
+
+
+# ================= 2. القواطع (يومي / خسائر متتالية / تبريد) =================
+
+def get_account_cached():
+    if time.time() - STATE["acct_t"] > 30:
+        try:
+            STATE["acct"] = alpaca_get(f"{TRADING_URL}/v2/account")
+            STATE["acct_t"] = time.time()
+        except Exception as e:
+            log.error(f"⚠️ فشل جلب الحساب: {e}")
+    return STATE["acct"]
+
+
+def trading_allowed():
+    today = now_ny().date()
+    if STATE["day"] != today:
+        STATE["day"] = today
+        STATE["entries_today"] = 0
+        STATE["cooldown_until"] = 0.0
+
+    acct = get_account_cached()
+    if acct:
+        equity = num(acct.get("equity"), 0.0)
+        last_equity = num(acct.get("last_equity"), 0.0)
+        if last_equity > 0 and equity > 0:
+            day_pnl = (equity - last_equity) / last_equity
+            if day_pnl <= -MAX_DAILY_LOSS_PCT:
+                return False, f"قاطع الخسارة اليومية: {day_pnl*100:.2f}% (الحد -{MAX_DAILY_LOSS_PCT*100:.1f}%)"
+
+    if STATE["entries_today"] >= MAX_TRADES_PER_DAY:
+        return False, f"وصلت الحد اليومي للصفقات ({MAX_TRADES_PER_DAY})"
+
+    df = finals_today()
+    consec = 0
+    for pnl in reversed(df["pnl_usd"].tolist()):
+        if pnl <= 0:
+            consec += 1
+        else:
+            break
+    if consec >= MAX_CONSEC_LOSSES:
+        return False, f"{consec} خسائر متتالية اليوم"
+
+    if time.time() < STATE["cooldown_until"]:
+        left = (STATE["cooldown_until"] - time.time()) / 60
+        return False, f"فترة تبريد بعد صفقة ({left:.1f} دقيقة متبقية)"
+
+    return True, ""
+
+
+# ================= 3. العقود واليونانيات =================
 
 def fetch_option_snapshots_specific(symbols_list):
     if not symbols_list:
         return {}
-    symbols_param = ",".join(symbols_list)
     url = f"{DATA_URL}/v1beta1/options/snapshots"
     try:
-        res = alpaca_get(url, {"symbols": symbols_param, "feed": OPTION_FEED})
+        res = alpaca_get(url, {"symbols": ",".join(symbols_list), "feed": OPTION_FEED})
         return res.get("snapshots") or {}
     except Exception as e:
         log.error(f"فشل جلب Snapshots للعقود المحددة: {e}")
@@ -283,15 +375,12 @@ def fetch_option_snapshots_specific(symbols_list):
 
 def fetch_spy_contracts_with_greeks(direction, spy_price):
     today = now_ny().date()
-    min_exp = today + timedelta(days=MIN_DTE)
-    max_exp = today + timedelta(days=MAX_DTE)
-
     params = {
         "underlying_symbols": HYPER_ASSET,
         "status": "active",
         "type": "call" if direction == "صعود 🚀" else "put",
-        "expiration_date_gte": min_exp.isoformat(),
-        "expiration_date_lte": max_exp.isoformat(),
+        "expiration_date_gte": (today + timedelta(days=MIN_DTE)).isoformat(),
+        "expiration_date_lte": (today + timedelta(days=MAX_DTE)).isoformat(),
         "strike_price_gte": str(math.floor(spy_price * 0.985)),
         "strike_price_lte": str(math.ceil(spy_price * 1.015)),
         "limit": 50,
@@ -319,7 +408,6 @@ def fetch_spy_contracts_with_greeks(direction, spy_price):
 
         exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
         dte = (exp_date - today).days
-
         if dte < MIN_DTE or dte > MAX_DTE:
             continue
 
@@ -330,25 +418,37 @@ def fetch_spy_contracts_with_greeks(direction, spy_price):
 
         if delta > 0 and (delta < MIN_DELTA or delta > MAX_DELTA):
             continue
-
         if iv > MAX_IV_THRESHOLD:
             log.info(f"🛑 [تخطي العقد {sym}] IV مرتفع جداً ({iv*100:.1f}%) معرض لـ IV Crush")
             continue
 
-        dist = abs(strike - spy_price)
-        valid_contracts.append((dist, dte, c, snap))
+        valid_contracts.append((abs(strike - spy_price), dte, c, snap))
 
     valid_contracts.sort(key=lambda x: (x[0], x[1]))
     return [(item[2], item[3]) for item in valid_contracts[:3]]
 
 
-# ================= 3. الفلترة الصارمة =================
+# ================= 4. فلاتر الدخول =================
+
+def entry_context_ok(pred):
+    """فلتر سياق: توافق الاتجاه الأعلى + جانب الـ VWAP + سوق متحرك."""
+    want = 1 if pred["signal"] == "صعود 🚀" else -1
+
+    if pred["htf_trend"] != want:
+        return False, "اتجاه فريم 5 دقائق لا يوافق الإشارة"
+    if want == 1 and pred["vwap_zscore"] < 0:
+        return False, "السعر تحت الـ VWAP وإشارة شراء Call"
+    if want == -1 and pred["vwap_zscore"] > 0:
+        return False, "السعر فوق الـ VWAP وإشارة شراء Put"
+    if pred["realized_vol"] < MIN_REALIZED_VOL:
+        return False, f"تذبذب منخفض ({pred['realized_vol']:.4f} < {MIN_REALIZED_VOL})"
+    return True, ""
+
 
 def ultra_strict_filter(pred, option_quote, contract_info):
-    bid, ask = option_quote["bid"], option_quote["ask"]
-    spread_pct = (ask - bid) / option_quote["mid"]
+    spread_pct = (option_quote["ask"] - option_quote["bid"]) / option_quote["mid"]
     if spread_pct > MAX_SPREAD_PCT:
-        log.info(f"🛑 [مرفوض] الـ Spread واسع جداً ({spread_pct*100:.2f}% > الحد {MAX_SPREAD_PCT*100:.1f}%)")
+        log.info(f"🛑 [مرفوض] الـ Spread واسع جداً ({spread_pct*100:.2f}% > {MAX_SPREAD_PCT*100:.1f}%)")
         return False
 
     open_interest = num(contract_info.get("open_interest"), 0)
@@ -373,11 +473,10 @@ def ultra_strict_filter(pred, option_quote, contract_info):
         if vwap_z < -2.0:
             log.info(f"🛑 [مرفوض] السعر مبتعد تحت الـ VWAP (Z-Score: {vwap_z:.2f})")
             return False
-
     return True
 
 
-# ================= 4. محرك التعلم الآلي =================
+# ================= 5. محرك التعلم الآلي =================
 
 FEATURES = [
     "ret1", "ret3", "ret6", "ret12",
@@ -456,6 +555,24 @@ def generate_institutional_features(spy_bars, qqq_bars=None):
     return f.replace([np.inf, -np.inf], np.nan)
 
 
+def higher_tf_trend(spy_bars):
+    """اتجاه فريم 5 دقائق: 1 صاعد، -1 هابط، 0 غير واضح."""
+    try:
+        c5 = spy_bars["close"].resample("5min").last().dropna()
+        if len(c5) < 30:
+            return 0
+        e9 = c5.ewm(span=9, adjust=False).mean().iloc[-1]
+        e21 = c5.ewm(span=21, adjust=False).mean().iloc[-1]
+        last = c5.iloc[-1]
+        if e9 > e21 and last > e21:
+            return 1
+        if e9 < e21 and last < e21:
+            return -1
+    except Exception:
+        pass
+    return 0
+
+
 class AdvancedInstitutionalEngine:
     def __init__(self):
         self.primary_model = None
@@ -492,7 +609,6 @@ class AdvancedInstitutionalEngine:
         day = pd.Series(spy_bars.index.tz_convert(NY).date, index=spy_bars.index)
         same_day = day.shift(-HORIZON) == day
 
-        # عتبة تكيفية: تتأقلم مع تذبذب السوق الفعلي بدل قيمة ثابتة
         valid_ret = future_ret[same_day].dropna().abs()
         if len(valid_ret) > 0:
             thr = max(MIN_TARGET_THRESHOLD, float(valid_ret.quantile(TARGET_QUANTILE)))
@@ -570,6 +686,7 @@ class AdvancedInstitutionalEngine:
         rsi_val = float(f["rsi"].iloc[-1])
         vwap_z = float(f["vwap_zscore"].iloc[-1])
         real_vol = float(f["realized_vol"].iloc[-1])
+        htf = higher_tf_trend(spy_bars)
 
         confidence = (prob_max * 0.4) + (meta_prob * 0.6)
         signal = "محايد ⏳"
@@ -593,187 +710,265 @@ class AdvancedInstitutionalEngine:
             "rsi": rsi_val,
             "vwap_zscore": vwap_z,
             "realized_vol": real_vol,
+            "htf_trend": htf,
         }
 
 
 model_engine = AdvancedInstitutionalEngine()
 
 
-# ================= 5. إدارة التنفيذ والصفقات =================
+# ================= 6. التنفيذ (مع قراءة الفلول الحقيقية) =================
+
+def _wait_fill(order_id, seconds):
+    end = time.time() + seconds
+    last = None
+    while time.time() < end:
+        time.sleep(1)
+        try:
+            last = alpaca_get(f"{TRADING_URL}/v2/orders/{order_id}")
+        except Exception:
+            continue
+        if last.get("status") in ("filled", "canceled", "expired", "rejected"):
+            return last
+    return last
+
+
+def _fill_info(order, fallback_price):
+    """يرجع (الكمية المنفذة، متوسط سعر التنفيذ الفعلي)."""
+    if not isinstance(order, dict):
+        return 0, None
+    fq = int(num(order.get("filled_qty"), 0))
+    if fq <= 0:
+        return 0, None
+    fp = num(order.get("filled_avg_price"), 0.0)
+    if fp <= 0:
+        fp = fallback_price
+    return fq, fp
+
 
 def execute_exit_order(symbol, qty, quotes_or_bid, is_emergency=False):
+    """يرجع (الكمية المنفذة فعلاً، متوسط سعر التنفيذ). لو لم ينفذ شيء: (0, None)."""
     if qty <= 0:
-        return None
+        return 0, None
 
     bid = quotes_or_bid.get("bid", 0.01) if isinstance(quotes_or_bid, dict) else float(quotes_or_bid or 0.01)
     if bid <= 0:
         bid = 0.01
 
-    target_price = round(bid, 2)
+    remaining = qty
+    total_filled = 0
+    notional = 0.0
+    prices = [round(bid, 2), max(0.01, round(bid - 0.02, 2))]
+
     try:
-        order = alpaca_post(f"{TRADING_URL}/v2/orders", {
-            "symbol": symbol,
-            "qty": str(qty),
-            "side": "sell",
-            "type": "limit",
-            "limit_price": str(target_price),
-            "time_in_force": "day",
-        })
-        oid = order.get("id")
-        log.info(f"📤 [خروج 1/3] {symbol} | كمية {qty} | Limit على Bid: ${target_price:.2f}")
-
-        for _ in range(2):
-            time.sleep(1)
-            chk = alpaca_get(f"{TRADING_URL}/v2/orders/{oid}")
-            if chk.get("status") == "filled":
-                log.info(f"✅ تم الخروج بنجاح بسعر ${target_price:.2f}")
-                return chk
-
-        alpaca_delete(f"{TRADING_URL}/v2/orders/{oid}")
-        time.sleep(0.3)
-
-        aggressive_bid = max(0.01, round(bid - 0.02, 2))
-        second_order = alpaca_post(f"{TRADING_URL}/v2/orders", {
-            "symbol": symbol,
-            "qty": str(qty),
-            "side": "sell",
-            "type": "limit",
-            "limit_price": str(aggressive_bid),
-            "time_in_force": "day",
-        })
-        second_oid = second_order.get("id")
-
-        for _ in range(2):
-            time.sleep(1)
-            chk = alpaca_get(f"{TRADING_URL}/v2/orders/{second_oid}")
-            if chk.get("status") == "filled":
-                log.info(f"✅ تم الخروج المباشر بسعر ${aggressive_bid:.2f}")
-                return chk
-
-        alpaca_delete(f"{TRADING_URL}/v2/orders/{second_oid}")
-        time.sleep(0.2)
-
-        if is_emergency:
-            log.warning(f"🚨 [خروج 3/3 طوارئ] إرسال أمر Market مباشر لـ {symbol}")
-            return alpaca_post(f"{TRADING_URL}/v2/orders", {
-                "symbol": symbol,
-                "qty": str(qty),
-                "side": "sell",
-                "type": "market",
-                "time_in_force": "day",
+        for i, px in enumerate(prices, 1):
+            if remaining <= 0:
+                break
+            order = alpaca_post(f"{TRADING_URL}/v2/orders", {
+                "symbol": symbol, "qty": str(remaining), "side": "sell",
+                "type": "limit", "limit_price": str(px), "time_in_force": "day",
             })
+            oid = order.get("id")
+            log.info(f"📤 [خروج {i}] {symbol} | كمية {remaining} | Limit ${px:.2f}")
 
-        return second_order
+            o = _wait_fill(oid, 2)
+            if not o or o.get("status") != "filled":
+                alpaca_delete(f"{TRADING_URL}/v2/orders/{oid}")
+                time.sleep(0.3)
+                try:
+                    o = alpaca_get(f"{TRADING_URL}/v2/orders/{oid}")
+                except Exception:
+                    pass
+
+            fq, fp = _fill_info(o, px)
+            if fq > 0:
+                total_filled += fq
+                notional += fq * fp
+                remaining -= fq
+
+        if remaining > 0 and is_emergency:
+            log.warning(f"🚨 [خروج طوارئ] أمر Market لـ {symbol} | كمية {remaining}")
+            order = alpaca_post(f"{TRADING_URL}/v2/orders", {
+                "symbol": symbol, "qty": str(remaining), "side": "sell",
+                "type": "market", "time_in_force": "day",
+            })
+            o = _wait_fill(order.get("id"), 3)
+            fq, fp = _fill_info(o, bid)
+            if fq > 0:
+                total_filled += fq
+                notional += fq * fp
+                remaining -= fq
 
     except Exception as e:
-        log.error(f"❌ فشل حرج في أمر الخروج لـ {symbol}: {e}")
+        log.error(f"❌ فشل في أمر الخروج لـ {symbol}: {e}")
+
+    if total_filled > 0:
+        avg = notional / total_filled
+        log.info(f"✅ خروج منفذ | {symbol} | {total_filled}/{qty} | متوسط ${avg:.2f}")
+        return total_filled, avg
+
+    log.warning(f"⚠️ لم ينفذ أي خروج لـ {symbol}، سيعاد المحاولة.")
+    return 0, None
+
+
+def execute_smart_limit_order(symbol, qty, side, quotes):
+    """يرجع {'qty','price'} للمنفذ فعلاً (يشمل التنفيذ الجزئي) أو None."""
+    if qty <= 0 or not quotes:
         return None
+    mid_price = round(quotes["mid"], 2)
+    try:
+        order = alpaca_post(f"{TRADING_URL}/v2/orders", {
+            "symbol": symbol, "qty": str(qty), "side": side,
+            "type": "limit", "limit_price": str(mid_price), "time_in_force": "day",
+        })
+        oid = order.get("id")
+        log.info(f"⏳ أمر حد ({side.upper()}) بسعر المنتصف ${mid_price:.2f} | {symbol} | كمية {qty}")
+
+        o = _wait_fill(oid, EXECUTION_TIMEOUT)
+        if not o or o.get("status") != "filled":
+            alpaca_delete(f"{TRADING_URL}/v2/orders/{oid}")
+            time.sleep(0.3)
+            try:
+                o = alpaca_get(f"{TRADING_URL}/v2/orders/{oid}")
+            except Exception:
+                pass
+
+        fq, fp = _fill_info(o, mid_price)
+        if fq > 0:
+            log.info(f"⚡ تنفيذ فعلي: {fq} عقد بمتوسط ${fp:.2f} (المنتصف ${mid_price:.2f})")
+            return {"qty": fq, "price": fp}
+        return None
+    except Exception as e:
+        log.error(f"❌ خطأ أثناء إرسال الأمر: {e}")
+        return None
+
+
+# ================= 7. إدارة الصفقة: تتبع متدرج + تخفيف =================
+
+def trail_giveback(peak_pct):
+    """نسبة التراجع المسموحة من القمة؛ كلما كبر الربح ضاق الهامش."""
+    if peak_pct >= 1.00:
+        return 0.15
+    if peak_pct >= 0.60:
+        return 0.22
+    if peak_pct >= 0.30:
+        return 0.32
+    if peak_pct >= 0.15:
+        return 0.45
+    return None
 
 
 def manage_active_positions():
     saved_positions = read_json(ACTIVE_POSITIONS_FILE)
     try:
         r = HTTP.get(f"{TRADING_URL}/v2/positions", headers=_headers(), timeout=10)
-        positions_payload = r.json() if r.status_code == 200 else []
-        active_alpaca_symbols = set()
+        if r.status_code != 200:
+            log.error(f"⚠️ فشل جلب المراكز (HTTP {r.status_code}) - تخطي هذه الدورة")
+            return
+        positions_payload = r.json()
+        if not isinstance(positions_payload, list):
+            return
 
+        active_alpaca_symbols = set()
         force_eod_close = is_eod_close_time()
 
-        if isinstance(positions_payload, list):
-            for pos in positions_payload:
-                sym = pos.get("symbol")
-                if not sym or not sym.startswith("SPY"):
-                    continue
+        for pos in positions_payload:
+            sym = pos.get("symbol")
+            if not sym or not sym.startswith("SPY"):
+                continue
 
-                active_alpaca_symbols.add(sym)
-                qty = abs(int(num(pos.get("qty"), 0)))
-                entry_price = num(pos.get("avg_entry_price"))
-                current_price = num(pos.get("current_price"))
+            active_alpaca_symbols.add(sym)
+            qty = abs(int(num(pos.get("qty"), 0)))
+            entry_price = num(pos.get("avg_entry_price"))
+            current_price = num(pos.get("current_price"))
+            if qty <= 0 or entry_price <= 0 or current_price <= 0:
+                continue
 
-                if entry_price <= 0 or current_price <= 0:
-                    continue
+            q = _get_option_quote(sym)
+            live_bid = q["bid"] if q else current_price
+            pnl_pct = (live_bid - entry_price) / entry_price
 
-                q = _get_option_quote(sym)
-                live_bid = q["bid"] if q else current_price
-                live_mid = q["mid"] if q else current_price
+            pos_data = saved_positions.get(sym, {})
+            entry_time_str = pos_data.get("time", stamp())
+            try:
+                entry_dt = datetime.fromisoformat(entry_time_str)
+                minutes_in_trade = (datetime.now(UTC) - entry_dt).total_seconds() / 60.0
+            except Exception:
+                minutes_in_trade = 0.0
 
-                pnl_pct = (live_bid - entry_price) / entry_price
-                pos_data = saved_positions.get(sym, {})
+            prev_high = pos_data.get("highest_bid", pos_data.get("highest_price", live_bid))
+            highest_bid = max(prev_high, live_bid)
+            peak_pnl_pct = (highest_bid - entry_price) / entry_price
+            scaled = bool(pos_data.get("scaled", False))
 
-                entry_time_str = pos_data.get("time", stamp())
-                try:
-                    entry_dt = datetime.fromisoformat(entry_time_str)
-                    minutes_in_trade = (datetime.now(UTC) - entry_dt).total_seconds() / 60.0
-                except Exception:
-                    minutes_in_trade = 0.0
+            saved_positions[sym] = {
+                "symbol": sym, "entry_price": entry_price, "highest_bid": highest_bid,
+                "qty": qty, "time": entry_time_str, "scaled": scaled,
+            }
 
-                highest_price = max(pos_data.get("highest_price", live_mid), live_mid)
-                peak_pnl_pct = (highest_price - entry_price) / entry_price
+            close_all = False
+            emergency = False
+            reason = ""
+            partial_qty = 0
 
-                saved_positions[sym] = {
-                    "symbol": sym,
-                    "entry_price": entry_price,
-                    "highest_price": highest_price,
-                    "qty": qty,
-                    "time": entry_time_str,
-                }
+            gb = trail_giveback(peak_pnl_pct)
+            trail_level = peak_pnl_pct * (1.0 - gb) if gb is not None else None
 
-                should_close = False
-                is_emergency = False
-                reason = ""
+            if force_eod_close:
+                close_all, emergency, reason = True, True, "إغلاق نهاية اليوم (EOD)"
 
-                if force_eod_close:
-                    should_close = True
-                    is_emergency = True
-                    reason = "إغلاق نهاية اليوم (EOD Exit)"
+            elif pnl_pct >= TAKE_PROFIT_PCT:
+                close_all, reason = True, f"🎯 سقف الربح (+{pnl_pct*100:.1f}%)"
 
-                elif pnl_pct >= TAKE_PROFIT_PCT:
-                    should_close = True
-                    reason = f"🎯 هدف الربح الثابت الرئيسي (+{pnl_pct*100:.1f}%)"
+            elif trail_level is not None and pnl_pct <= trail_level:
+                close_all = True
+                reason = (f"📈 تتبع الأرباح (قمة +{peak_pnl_pct*100:.1f}% | "
+                          f"تراجع مسموح {gb*100:.0f}% | خرج عند +{pnl_pct*100:.1f}%)")
 
-                elif peak_pnl_pct >= 1.00 and pnl_pct <= (peak_pnl_pct * 0.85):
-                    should_close = True
-                    reason = f"🚀 حماية أرباح خرافية (قمة: +{peak_pnl_pct*100:.1f}%) | الربح المضمون: +{pnl_pct*100:.1f}%"
+            elif scaled and pnl_pct <= BREAKEVEN_BUFFER:
+                close_all, reason = True, f"🛡️ بعد التخفيف: حماية الباقي عند التعادل (+{pnl_pct*100:.1f}%)"
 
-                elif peak_pnl_pct >= 0.50 and pnl_pct <= (peak_pnl_pct * 0.75):
-                    should_close = True
-                    reason = f"💎 حماية أرباح عالية (قمة: +{peak_pnl_pct*100:.1f}%) | الربح المضمون: +{pnl_pct*100:.1f}%"
+            elif peak_pnl_pct >= 0.08 and pnl_pct <= 0.01:
+                close_all, reason = True, f"🛡️ تأمين رأس المال بعد قمة +{peak_pnl_pct*100:.1f}%"
 
-                elif peak_pnl_pct >= 0.25 and pnl_pct <= (peak_pnl_pct * 0.65):
-                    should_close = True
-                    reason = f"📈 حماية أرباح ممتازة (قمة: +{peak_pnl_pct*100:.1f}%) | الربح المضمون: +{pnl_pct*100:.1f}%"
+            elif minutes_in_trade >= MAX_TIME_IN_TRADE_MINUTES and pnl_pct < 0.05:
+                close_all, reason = True, f"⏳ إغلاق زمني: {minutes_in_trade:.0f} دقيقة دون حركة"
 
-                elif peak_pnl_pct >= 0.15 and pnl_pct <= (peak_pnl_pct * 0.50):
-                    should_close = True
-                    reason = f"⚖️ حماية أرباح متوسطة (قمة: +{peak_pnl_pct*100:.1f}%) | الربح المضمون: +{pnl_pct*100:.1f}%"
+            elif pnl_pct <= -STOP_LOSS_PCT:
+                close_all, emergency = True, True
+                reason = f"🛑 وقف خسارة (-{STOP_LOSS_PCT*100:.1f}%)"
 
-                elif peak_pnl_pct >= 0.08 and pnl_pct <= 0.01:
-                    should_close = True
-                    reason = f"🛡️ تأمين رأس المال بعد قمة +{peak_pnl_pct*100:.1f}% (الخروج بسعر التكلفة)"
+            elif (not scaled) and qty >= 2 and pnl_pct >= SCALE_OUT_PCT:
+                partial_qty = qty // 2
+                reason = f"💰 تخفيف: بيع {partial_qty} من {qty} عند +{pnl_pct*100:.1f}% وترك الباقي يكبر"
 
-                elif minutes_in_trade >= MAX_TIME_IN_TRADE_MINUTES and pnl_pct < 0.05:
-                    should_close = True
-                    is_emergency = False
-                    reason = f"⏳ إغلاق زمني (Time Stop): مضى {minutes_in_trade:.0f} دقيقة دون حركة حاسمة"
+            if close_all:
+                log.info(f"📉 [إغلاق] {sym} | {reason} | PnL: {pnl_pct*100:+.2f}%")
+                filled, avg_px = execute_exit_order(sym, qty, q if q else live_bid, is_emergency=emergency)
+                if filled > 0:
+                    kind = "final" if filled >= qty else "partial"
+                    log_completed_trade(sym, entry_price, avg_px, filled, reason, kind)
+                    if kind == "final":
+                        real_pnl = (avg_px - entry_price) / entry_price
+                        mins = COOLDOWN_AFTER_LOSS_MIN if real_pnl <= 0 else COOLDOWN_AFTER_WIN_MIN
+                        STATE["cooldown_until"] = time.time() + mins * 60
 
-                elif pnl_pct <= -STOP_LOSS_PCT:
-                    should_close = True
-                    is_emergency = True
-                    reason = f"🛑 وقف خسارة صارم (-{STOP_LOSS_PCT*100:.1f}%) لـ {sym}"
+            elif partial_qty > 0:
+                log.info(f"💰 [تخفيف] {sym} | {reason}")
+                filled, avg_px = execute_exit_order(sym, partial_qty, q if q else live_bid, is_emergency=False)
+                if filled > 0:
+                    log_completed_trade(sym, entry_price, avg_px, filled, reason, "partial")
+                    saved_positions[sym]["scaled"] = True
 
-                if should_close:
-                    log.info(f"📉 [إغلاق صفقة] {sym} | السبب: {reason} | PnL النهائي: {pnl_pct*100:+.2f}%")
-                    execute_exit_order(sym, qty, quotes_or_bid=q if q else live_bid, is_emergency=is_emergency)
-                    log_completed_trade(sym, entry_price, live_bid, qty, pnl_pct, reason)
-
-        to_remove = [s for s in saved_positions if s not in active_alpaca_symbols]
-        for s in to_remove:
+        for s in [s for s in saved_positions if s not in active_alpaca_symbols]:
             saved_positions.pop(s, None)
 
         save_json(ACTIVE_POSITIONS_FILE, saved_positions)
     except Exception as e:
         log.error(f"⚠️ خطأ أثناء إدارة الصفقات: {e}")
 
+
+# ================= 8. الدخول الانتقائي =================
 
 def open_new_trade():
     positions = read_json(ACTIVE_POSITIONS_FILE)
@@ -789,9 +984,23 @@ def open_new_trade():
     if not model_engine.is_trained:
         return
 
+    ok, why = trading_allowed()
+    if not ok:
+        STATE["sig"], STATE["sig_n"] = None, 0
+        log_every("halt", 600, f"⛔ الدخول متوقف: {why}", logging.WARNING)
+        return
+
+    if in_avoid_window():
+        log_every("lunch", 900, "😴 فترة الغداء (11:45-13:15 نيويورك): لا دخول جديد.")
+        return
+
     try:
         spy_bars = fetch_bars(HYPER_ASSET, days=LIVE_DAYS)
         if spy_bars.empty or len(spy_bars) < 60:
+            return
+        age = (datetime.now(UTC) - spy_bars.index[-1]).total_seconds()
+        if age > STALE_BAR_SECONDS:
+            log_every("stale", 300, f"⚠️ بيانات SPY متأخرة ({age:.0f} ثانية) - تخطي.", logging.WARNING)
             return
         qqq_bars = fetch_bars(NASDAQ_ASSET, days=LIVE_DAYS)
         pred = model_engine.predict_fast(spy_bars, qqq_bars)
@@ -801,14 +1010,32 @@ def open_new_trade():
 
     log_every(
         "heartbeat", 60,
-        f"💓 [Safaa Engine] SPY ${pred['current_price']:.2f} | الإشارة: {pred['signal']} | "
-        f"الثقة: {pred['confidence']*100:.1f}% | RSI: {pred['rsi']*100:.1f}%"
+        f"💓 SPY ${pred['current_price']:.2f} | الإشارة: {pred['signal']} | "
+        f"الثقة: {pred['confidence']*100:.1f}% | RSI: {pred['rsi']*100:.1f}% | "
+        f"اتجاه 5د: {pred['htf_trend']:+d} | VWAP-Z: {pred['vwap_zscore']:.2f}"
     )
 
-    if pred["signal"] == "محايد ⏳":
+    sig = pred["signal"]
+    if sig == "محايد ⏳":
+        STATE["sig"], STATE["sig_n"] = None, 0
         return
 
-    contracts_with_snap = fetch_spy_contracts_with_greeks(pred["signal"], pred["current_price"])
+    ctx_ok, ctx_why = entry_context_ok(pred)
+    if not ctx_ok:
+        STATE["sig"], STATE["sig_n"] = None, 0
+        log_every("ctx", 120, f"🚫 [سياق مرفوض] {sig}: {ctx_why}")
+        return
+
+    # تأكيد الإشارة عبر عدة مسوحات متتالية
+    if sig == STATE["sig"]:
+        STATE["sig_n"] += 1
+    else:
+        STATE["sig"], STATE["sig_n"] = sig, 1
+    if STATE["sig_n"] < CONFIRM_SCANS:
+        log.info(f"🔄 إشارة {sig} تنتظر التأكيد ({STATE['sig_n']}/{CONFIRM_SCANS})")
+        return
+
+    contracts_with_snap = fetch_spy_contracts_with_greeks(sig, pred["current_price"])
     if not contracts_with_snap:
         log.info("ℹ️ لا توجد عقود تلبّي شروط الـ Greeks والـ DTE.")
         return
@@ -821,11 +1048,6 @@ def open_new_trade():
         if not q:
             continue
 
-        spread_pct = (q["ask"] - q["bid"]) / q["mid"]
-        if spread_pct > MAX_SPREAD_PCT:
-            log.info(f"🛑 [تخطي {sym}] الـ Spread اللحظي واسع ({spread_pct*100:.2f}% > {MAX_SPREAD_PCT*100:.1f}%)")
-            continue
-
         if not ultra_strict_filter(pred, q, c):
             continue
 
@@ -834,19 +1056,25 @@ def open_new_trade():
             continue
 
         cancel_all_open_orders()
-        order = execute_smart_limit_order(sym, qty=trade_qty, side="buy", quotes=q)
-        if order:
+        fill = execute_smart_limit_order(sym, qty=trade_qty, side="buy", quotes=q)
+        if fill:
             positions[sym] = {
                 "symbol": sym,
-                "entry_price": q["mid"],
-                "highest_price": q["mid"],
-                "qty": trade_qty,
+                "entry_price": fill["price"],
+                "highest_bid": q["bid"],
+                "qty": fill["qty"],
                 "time": stamp(),
+                "scaled": False,
             }
             save_json(ACTIVE_POSITIONS_FILE, positions)
-            log.info(f"🚀 [صفقة آمنة جديدة] {sym} | كمية: {trade_qty} | بسعر ${q['mid']:.2f}")
+            STATE["entries_today"] += 1
+            STATE["sig"], STATE["sig_n"] = None, 0
+            log.info(f"🚀 [صفقة جديدة] {sym} | كمية: {fill['qty']} | تنفيذ فعلي ${fill['price']:.2f} "
+                     f"| صفقة اليوم #{STATE['entries_today']}")
             return
 
+
+# ================= 9. البيانات والحجم =================
 
 def _fetch_bars_feed(symbol, days, timeframe, feed):
     end = datetime.now(UTC)
@@ -888,7 +1116,6 @@ def _fetch_bars_feed(symbol, days, timeframe, feed):
 
 
 def fetch_bars(symbol=HYPER_ASSET, days=HISTORY_DAYS, timeframe=TF):
-    """يجرب الـ feed المضبوط أولاً، وإن فشل (مثلاً sip غير مسموح) يتحول إلى iex تلقائياً."""
     feeds = [STOCK_FEED]
     if STOCK_FEED != "iex":
         feeds.append("iex")
@@ -922,7 +1149,7 @@ def _get_option_quote(symbol):
 
 def calculate_half_kelly_qty(option_mid_price, win_probability):
     try:
-        acc = alpaca_get(f"{TRADING_URL}/v2/account")
+        acc = get_account_cached() or {}
         equity = num(acc.get("equity"), 1000.0)
 
         p = max(0.51, min(win_probability, 0.85))
@@ -944,38 +1171,7 @@ def calculate_half_kelly_qty(option_mid_price, win_probability):
         return 0
 
 
-def execute_smart_limit_order(symbol, qty, side, quotes):
-    if qty <= 0 or not quotes:
-        return None
-    mid_price = quotes["mid"]
-    payload = {
-        "symbol": symbol,
-        "qty": str(qty),
-        "side": side,
-        "type": "limit",
-        "limit_price": str(round(mid_price, 2)),
-        "time_in_force": "day",
-    }
-    try:
-        order = alpaca_post(f"{TRADING_URL}/v2/orders", payload)
-        order_id = order.get("id")
-        log.info(f"⏳ أمر حد ({side.upper()}) بسعر المنتصف ${mid_price:.2f} | {symbol} | كمية {qty}")
-        start_time = time.time()
-        while time.time() - start_time < EXECUTION_TIMEOUT:
-            time.sleep(1)
-            chk = alpaca_get(f"{TRADING_URL}/v2/orders/{order_id}")
-            if chk.get("status") == "filled":
-                log.info(f"⚡ تم التنفيذ عند سعر المنتصف ${mid_price:.2f}")
-                return chk
-
-        alpaca_delete(f"{TRADING_URL}/v2/orders/{order_id}")
-        return None
-    except Exception as e:
-        log.error(f"❌ خطأ أثناء إرسال الأمر: {e}")
-        return None
-
-
-# ================= 6. الحلقة الرئيسية =================
+# ================= 10. الحلقة الرئيسية =================
 
 if __name__ == "__main__":
     log.info(f"🚀 تشغيل {NAME} {VERSION}")
@@ -993,7 +1189,7 @@ if __name__ == "__main__":
             else:
                 log_every("closed", 300, "⏳ السوق مغلق حالياً.. المحرك في وضع الانتظار.")
 
-            log_every("metrics", 3600, "📊 تحديث محفظة الأداء وسجل الصفقات:")
+            log_every("metrics", 3600, "📊 تحديث سجل الصفقات:")
             if time.time() - _LAST_LOG.get("metrics", 0.0) < 5:
                 calculate_and_log_metrics()
 
