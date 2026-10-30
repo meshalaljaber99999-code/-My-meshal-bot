@@ -55,14 +55,38 @@ EXECUTION_TIMEOUT = 5
 # 2) Alpaca — Paper افتراضيًا
 # =========================================================
 
-API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
-API_SECRET = os.getenv("ALPACA_API_SECRET", "").strip()
+API_KEY = (
+    os.getenv("ALPACA_API_KEY")
+    or os.getenv("APCA_API_KEY_ID")
+    or ""
+).strip()
 
-DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-TRADING_URL = os.getenv("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
+API_SECRET = (
+    os.getenv("ALPACA_API_SECRET")
+    or os.getenv("APCA_API_SECRET_KEY")
+    or ""
+).strip()
+
+DATA_URL = os.getenv(
+    "ALPACA_DATA_URL",
+    "https://data.alpaca.markets"
+).rstrip("/")
+
+TRADING_URL = os.getenv(
+    "ALPACA_TRADING_URL",
+    "https://paper-api.alpaca.markets"
+).rstrip("/")
 
 STOCK_FEED = os.getenv("ALPACA_STOCK_FEED", "iex")
 OPTION_FEED = os.getenv("ALPACA_OPTION_FEED", "indicative")
+
+if not API_KEY or not API_SECRET:
+    raise RuntimeError(
+        "مفاتيح Alpaca غير موجودة. "
+        "أضف ALPACA_API_KEY و ALPACA_API_SECRET "
+        "أو APCA_API_KEY_ID و APCA_API_SECRET_KEY "
+        "في Railway Variables."
+    )
 
 HEADERS = {
     "APCA-API-KEY-ID": API_KEY,
@@ -70,9 +94,8 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-if not API_KEY or not API_SECRET:
-    raise RuntimeError("ضع ALPACA_API_KEY و ALPACA_API_SECRET في متغيرات البيئة.")
-
+log.info("تم العثور على مفاتيح Alpaca بنجاح.")
+log.info("رابط التداول: %s", TRADING_URL)
 # =========================================================
 # 3) إعدادات الدخول والخيارات
 # =========================================================
