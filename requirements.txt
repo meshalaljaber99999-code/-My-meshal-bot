@@ -1,9 +1,5 @@
-alpaca-py
-lightgbm
-optuna
+requests
 numpy
 pandas
+lightgbm
 scikit-learn
-flask
-gunicorn
-yfinance
