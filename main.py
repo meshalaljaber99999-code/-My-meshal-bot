@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل v64.4 — Smart Entry Pro (Fix Release)
-- تم إصلاح متغير EXECUTION_TIMEOUT غير المعرف.
+صَفاء التحليل v64.5 — Smart Entry Pro (Enhanced Execution & Safety)
+- معالجة التنفيذ الجزئي (Partial Fill Protection)
+- إضافة أمر سريان الخروج بالسوق (Market Fallback) لعقود 0DTE
 - SPY Options: 0DTE إلى 3DTE
 - Paper Trading افتراضيًا
 """
@@ -29,14 +30,14 @@ from sklearn.pipeline import make_pipeline
 # =========================================================
 
 NAME = "صَفاء التحليل - Smart Entry Pro"
-VERSION = "v64.4-Fix"
+VERSION = "v64.5-Robust"
 
 NY = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 
 BASE_DIR = Path(".")
-STATE_FILE = BASE_DIR / "safaa_v644_positions.json"
-JOURNAL_FILE = BASE_DIR / "safaa_v644_journal.csv"
+STATE_FILE = BASE_DIR / "safaa_v645_positions.json"
+JOURNAL_FILE = BASE_DIR / "safaa_v645_journal.csv"
 
 SYMBOL = "SPY"
 BENCHMARK = "QQQ"
@@ -48,7 +49,7 @@ LIVE_DAYS = 5
 MIN_RAW_BARS = 1200
 MIN_TRAIN_ROWS = 500
 FORECAST_HORIZON = 5
-EXECUTION_TIMEOUT = 5  # <-- تم إضافة المتغير لتفادي الانهيار
+EXECUTION_TIMEOUT = 5
 
 # =========================================================
 # 2) Alpaca — Paper افتراضيًا
@@ -124,7 +125,7 @@ EOD_CLOSE_TIME = dtime(15, 50)
 # =========================================================
 
 MIN_REALIZED_VOL = 0.006
-MAX_BAR_AGE_SECONDS = 900  # رفع المهلة لمنع الرفض في حال تأخر بيانات IEX
+MAX_BAR_AGE_SECONDS = 900 
 
 LUNCH_START = dtime(11, 45)
 LUNCH_END = dtime(13, 15)
@@ -279,7 +280,7 @@ def make_client_order_id(prefix="ENTRY"):
     return BOT_ORDER_PREFIX + prefix + "_" + uuid.uuid4().hex[:12]
 
 # =========================================================
-# 11) جلب بيانات الأسهم
+# 11) جلب بيانات الأسهم والنموذج
 # =========================================================
 
 def fetch_stock_bars(symbol, days=LIVE_DAYS, limit=10000):
@@ -311,14 +312,9 @@ def fetch_stock_bars(symbol, days=LIVE_DAYS, limit=10000):
     df = pd.DataFrame(bars)
     df = df.rename(
         columns={
-            "t": "timestamp",
-            "o": "open",
-            "h": "high",
-            "l": "low",
-            "c": "close",
-            "v": "volume",
-            "n": "trade_count",
-            "vw": "vwap",
+            "t": "timestamp", "o": "open", "h": "high",
+            "l": "low", "c": "close", "v": "volume",
+            "n": "trade_count", "vw": "vwap",
         }
     )
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -759,6 +755,10 @@ def wait_for_order(order_id, timeout=EXECUTION_TIMEOUT):
         time.sleep(0.5)
     return get_order(order_id)
 
+# =========================================================
+# 12) معالجة التنفيذ المتقدمة (Fixed Partial Fill)
+# =========================================================
+
 def submit_entry_order(contract, qty):
     if qty <= 0:
         return None
@@ -778,20 +778,27 @@ def submit_entry_order(contract, qty):
         if not order_id:
             return None
         final_order = wait_for_order(order_id, timeout=EXECUTION_TIMEOUT)
-        if final_order.get("status") != "filled":
+        
+        # إذا لم يكتمل بالكامل، نلغي المتبقي ونلتقط الشراء الجزئي
+        if final_order.get("status") not in ("filled", "canceled", "rejected"):
             try:
                 trading_delete(f"/v2/orders/{order_id}")
             except Exception:
                 pass
+            time.sleep(0.5)
             try:
                 final_order = get_order(order_id)
             except Exception:
                 pass
+
         filled_qty = int(float(final_order.get("filled_qty", 0) or 0))
         filled_price = float(final_order.get("filled_avg_price", 0) or 0)
+        
         if filled_qty <= 0 or filled_price <= 0:
             log.warning("لم يتم تنفيذ أمر الشراء | الحالة: %s", final_order.get("status"))
             return None
+            
+        log.info("تم الشراء فعليًا: %d عقد بسعر %.2f", filled_qty, filled_price)
         return {"symbol": symbol, "qty": filled_qty, "entry_price": filled_price, "order_id": order_id}
     except Exception as exc:
         log.exception("فشل إرسال أمر الشراء: %s", exc)
@@ -803,9 +810,9 @@ def submit_exit_order(symbol, qty, reason):
     try:
         snapshot = fetch_option_snapshot(symbol)
         bid, _ = extract_quote(snapshot)
-        if bid <= 0:
-            return None
-        limit_price = round(bid, 2)
+        
+        # استخدام أمر Limit بسعر الـ Bid لتسريع التنفيذ
+        limit_price = round(bid, 2) if bid > 0 else 0.01
         payload = {
             "symbol": symbol, "qty": str(qty), "side": "sell", "type": "limit",
             "time_in_force": "day", "limit_price": f"{limit_price:.2f}",
@@ -815,20 +822,30 @@ def submit_exit_order(symbol, qty, reason):
         order_id = order.get("id")
         if not order_id:
             return None
+            
         final_order = wait_for_order(order_id, timeout=EXECUTION_TIMEOUT)
+        
+        # إذا فشل أمر الـ Limit، تحويل تلقائي إلى أمر بسعر السوق (Market Fallback) لمنع تعليق 0DTE
         if final_order.get("status") != "filled":
             try:
                 trading_delete(f"/v2/orders/{order_id}")
             except Exception:
                 pass
-            try:
-                final_order = get_order(order_id)
-            except Exception:
-                pass
+            
+            log.warning("تنبيه: فشل أمر إغلاق Limit لـ %s. تحويل إلى Market Order لضمان الخروج.", symbol)
+            mkt_payload = {
+                "symbol": symbol, "qty": str(qty), "side": "sell", "type": "market",
+                "time_in_force": "day", "client_order_id": make_client_order_id("EXIT_MKT"),
+            }
+            mkt_order = trading_post("/v2/orders", mkt_payload)
+            final_order = wait_for_order(mkt_order.get("id"), timeout=EXECUTION_TIMEOUT)
+
         filled_qty = int(float(final_order.get("filled_qty", 0) or 0))
         filled_price = float(final_order.get("filled_avg_price", 0) or 0)
-        if filled_qty <= 0 or filled_price <= 0:
+        
+        if filled_qty <= 0:
             return None
+            
         return {"qty": filled_qty, "price": filled_price, "reason": reason}
     except Exception as exc:
         log.exception("خطأ في أمر البيع: %s", exc)
