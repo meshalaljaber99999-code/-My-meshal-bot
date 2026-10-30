@@ -545,27 +545,38 @@ def analyze_market():
 
 def entry_context_ok(analysis):
     direction = analysis["direction"]
+
     if direction not in (-1, 1):
         return False, "اتجاه النموذج محايد"
+
     if analysis["confidence"] < MIN_CONFIDENCE_THRESHOLD:
-        return False, f"الثقة أقل من الحد: {analysis['confidence']:.1%}"
+        return False, "ثقة النموذج غير كافية"
+
     if analysis["volume_velocity"] < MIN_VOLUME_VELOCITY:
-        return False, f"سرعة الحجم ضعيفة: {analysis['volume_velocity']:.2f}"
+        return False, "حجم التداول ضعيف"
+
     if analysis["realized_vol"] < MIN_REALIZED_VOL:
-        return False, f"التذبذب غير كافٍ: {analysis['realized_vol']:.4f}"
+        return False, "التذبذب غير كافٍ"
+
+    # تأكيد اتجاه 5 دقائق
     if analysis["trend_5m"] != direction:
-        return False, "اتجاه 5 دقائق لا يؤكد الإشارة"
-    if direction == 1 and analysis["vwap_z"] < 0:
+        return False, "تعارض اتجاه النموذج مع اتجاه 5 دقائق"
+
+    # تأكيد VWAP
+    if direction == 1 and analysis["vwap_z"] <= 0:
         return False, "CALL مرفوض: السعر أسفل VWAP"
-    if direction == -1 and analysis["vwap_z"] > 0:
+
+    if direction == -1 and analysis["vwap_z"] >= 0:
         return False, "PUT مرفوض: السعر أعلى VWAP"
-    if abs(analysis["vwap_z"]) > 2.0:
-        return False, "السعر بعيد جدًا عن VWAP"
-    if direction == 1 and analysis["rsi"] >= 75:
+
+    # منع الدخول عند التشبع
+    if direction == 1 and analysis["rsi"] >= 70:
         return False, "CALL مرفوض: تشبع شرائي"
-    if direction == -1 and analysis["rsi"] <= 25:
+
+    if direction == -1 and analysis["rsi"] <= 30:
         return False, "PUT مرفوض: تشبع بيعي"
-    return True, "اجتاز فلاتر السوق"
+
+    return True, "جميع المؤشرات متوافقة"
 
 def confirm_signal(direction):
     confirmation = state.get("confirmation", {"direction": None, "count": 0})
