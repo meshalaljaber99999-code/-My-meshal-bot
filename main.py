@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل v64.1 — محرك التداول التنفيذي النهائي (إصلاح دالة num + حماية متكاملة)
+صَفاء التحليل v64.2 — محرك التداول التنفيذي النهائي (عتبة تكيفية + تشخيص + fallback للـ feed)
 تطوير وتنفيذ: تصميم أبو سحاب
 """
 
@@ -30,7 +30,7 @@ from sklearn.pipeline import make_pipeline
 # ================= الإعدادات المتقدمة =================
 
 NAME = "صَفاء التحليل - Ultra Engine"
-VERSION = "v64.1-ProductionReady"
+VERSION = "v64.2-ProductionReady"
 
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
@@ -46,25 +46,28 @@ SECRET = (os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY") or 
 STOCK_FEED = os.getenv("ALPACA_DATA_FEED", "sip").lower()
 OPTION_FEED = os.getenv("OPTIONS_FEED", "indicative").lower()
 
-HISTORY_DAYS = 90             
+HISTORY_DAYS = 90
 LIVE_DAYS = 5
-MIN_ROWS = 1200
-HORIZON = 5                   
+MIN_RAW_BARS = 1200           # الحد الأدنى للأشرطة الخام
+MIN_TRAIN_ROWS = int(os.getenv("MIN_TRAIN_ROWS", "500"))  # الحد الأدنى لعينات التدريب بعد إزالة الحياد
+MIN_TARGET_THRESHOLD = float(os.getenv("MIN_TARGET_THRESHOLD", "0.0004"))  # أدنى عتبة للحركة (0.04%)
+TARGET_QUANTILE = float(os.getenv("TARGET_QUANTILE", "0.60"))
+HORIZON = 5
 
-MAX_SPREAD_PCT = 0.025        
-MIN_OPEN_INTEREST = 300       
+MAX_SPREAD_PCT = 0.025
+MIN_OPEN_INTEREST = 300
 POLL_SECONDS = 15
 POSITION_POLL_SECONDS = 3
 SCAN_SECONDS = 20
 EXECUTION_TIMEOUT = 5
 
-MIN_DTE = 1                   
+MIN_DTE = 1
 MAX_DTE = 3
 MIN_DELTA = 0.40
 MAX_DELTA = 0.65
-MAX_IV_THRESHOLD = 0.45       
+MAX_IV_THRESHOLD = 0.45
 
-MAX_TIME_IN_TRADE_MINUTES = 20  
+MAX_TIME_IN_TRADE_MINUTES = 20
 MAX_DAILY_LOSS_PCT = 0.02
 MAX_RISK_CAP = 0.05
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.06"))
@@ -245,16 +248,16 @@ def calculate_and_log_metrics():
         total_trades = len(df)
         wins = df[df["pnl_usd"] > 0]
         losses = df[df["pnl_usd"] <= 0]
-        
+
         win_rate = len(wins) / total_trades if total_trades > 0 else 0.0
         avg_r = df["r_multiple"].mean() if total_trades > 0 else 0.0
-        
+
         avg_win_r = wins["r_multiple"].mean() if len(wins) > 0 else 0.0
         avg_loss_r = abs(losses["r_multiple"].mean()) if len(losses) > 0 else 1.0
-        
+
         expectancy = (win_rate * avg_win_r) - ((1.0 - win_rate) * avg_loss_r)
         total_pnl = df["pnl_usd"].sum()
-        
+
         log.info(
             f"📊 [سجل الأداء] صفقات: {total_trades} | نسبة النجاح: {win_rate*100:.1f}% | "
             f"متوسط R: {avg_r:.2f} | Expectancy: {expectancy:.2f}R | إجمالي الـ PnL: ${total_pnl:+.2f}"
@@ -478,8 +481,8 @@ class AdvancedInstitutionalEngine:
             log.error(f"فشل جلب بيانات التدريب: {e}")
             return False
 
-        if spy_bars.empty or len(spy_bars) < MIN_ROWS:
-            log.warning("⚠️ لا توجد بيانات كافية لتدريب النموذج.")
+        if spy_bars.empty or len(spy_bars) < MIN_RAW_BARS:
+            log.warning(f"⚠️ لا توجد بيانات كافية لتدريب النموذج (أشرطة: {len(spy_bars)} < {MIN_RAW_BARS}).")
             return False
 
         f = generate_institutional_features(spy_bars, qqq_bars)
@@ -489,17 +492,30 @@ class AdvancedInstitutionalEngine:
         day = pd.Series(spy_bars.index.tz_convert(NY).date, index=spy_bars.index)
         same_day = day.shift(-HORIZON) == day
 
+        # عتبة تكيفية: تتأقلم مع تذبذب السوق الفعلي بدل قيمة ثابتة
+        valid_ret = future_ret[same_day].dropna().abs()
+        if len(valid_ret) > 0:
+            thr = max(MIN_TARGET_THRESHOLD, float(valid_ret.quantile(TARGET_QUANTILE)))
+        else:
+            thr = MIN_TARGET_THRESHOLD
+
         target = pd.Series(0, index=f.index)
-        target[future_ret > 0.0015] = 1
-        target[future_ret < -0.0015] = -1
+        target[future_ret > thr] = 1
+        target[future_ret < -thr] = -1
         target[~same_day] = 0
         f["primary_target"] = target
 
         ds = f[FEATURES + ["primary_target"]].dropna()
         ds_valid = ds[ds["primary_target"] != 0].copy()
 
-        if len(ds_valid) < MIN_ROWS or ds_valid["primary_target"].nunique() < 2:
-            log.warning("⚠️ عينات البيانات غير كافية للتدريب.")
+        log.info(
+            f"🔎 تشخيص | feed={STOCK_FEED} | أشرطة={len(spy_bars)} | بعد dropna={len(ds)} | "
+            f"بعد إزالة الحياد={len(ds_valid)} | العتبة={thr*100:.3f}% | "
+            f"فئات={ds_valid['primary_target'].nunique() if len(ds_valid) else 0}"
+        )
+
+        if len(ds_valid) < MIN_TRAIN_ROWS or ds_valid["primary_target"].nunique() < 2:
+            log.warning(f"⚠️ عينات البيانات غير كافية للتدريب ({len(ds_valid)} < {MIN_TRAIN_ROWS}).")
             return False
 
         split = int(len(ds_valid) * 0.75)
@@ -683,7 +699,7 @@ def manage_active_positions():
 
                 pnl_pct = (live_bid - entry_price) / entry_price
                 pos_data = saved_positions.get(sym, {})
-                
+
                 entry_time_str = pos_data.get("time", stamp())
                 try:
                     entry_dt = datetime.fromisoformat(entry_time_str)
@@ -832,7 +848,7 @@ def open_new_trade():
             return
 
 
-def fetch_bars(symbol=HYPER_ASSET, days=HISTORY_DAYS, timeframe=TF):
+def _fetch_bars_feed(symbol, days, timeframe, feed):
     end = datetime.now(UTC)
     params = {
         "timeframe": timeframe,
@@ -840,7 +856,7 @@ def fetch_bars(symbol=HYPER_ASSET, days=HISTORY_DAYS, timeframe=TF):
         "end": end.isoformat(),
         "limit": 10000,
         "adjustment": "split",
-        "feed": STOCK_FEED,
+        "feed": feed,
         "sort": "asc",
     }
     url = f"{DATA_URL}/v2/stocks/{symbol}/bars"
@@ -869,6 +885,26 @@ def fetch_bars(symbol=HYPER_ASSET, days=HISTORY_DAYS, timeframe=TF):
         .sort_values("timestamp")
         .set_index("timestamp")
     )
+
+
+def fetch_bars(symbol=HYPER_ASSET, days=HISTORY_DAYS, timeframe=TF):
+    """يجرب الـ feed المضبوط أولاً، وإن فشل (مثلاً sip غير مسموح) يتحول إلى iex تلقائياً."""
+    feeds = [STOCK_FEED]
+    if STOCK_FEED != "iex":
+        feeds.append("iex")
+    last_exc = None
+    for feed in feeds:
+        try:
+            df = _fetch_bars_feed(symbol, days, timeframe, feed)
+            if feed != STOCK_FEED:
+                log_every(f"feed_fallback_{symbol}", 600,
+                          f"ℹ️ تم استخدام feed={feed} بدلاً من {STOCK_FEED} لـ {symbol}", logging.WARNING)
+            return df
+        except Exception as e:
+            last_exc = e
+            log_every(f"feed_fail_{feed}_{symbol}", 600,
+                      f"⚠️ فشل جلب {symbol} عبر feed={feed}: {e}", logging.WARNING)
+    raise last_exc
 
 
 def _get_option_quote(symbol):
