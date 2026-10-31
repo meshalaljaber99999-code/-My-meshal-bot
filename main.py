@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل v66.2 — The Volatility Hunter (Accelerated Trailing Stop)
-- مستشعر التذبذب (Volatility Regime) واستغلال الانفجارات
-- Ratio Backspreads & Straddles للأسواق المكبوتة
+صَفاء التحليل v66.3 — The Volatility Hunter (Robust Data Handling)
+- حماية متقدمة ضد أخطاء فقدان الأعمدة (KeyError: 'close')
+- مستشعر التذبذب واستغلال الانفجارات (Ratio Backspreads & Straddles)
 - الوقف المتحرك المتسارع (Accelerating Trailing Stop) لاصطياد التدبيلات
-- الخزنة الاستراتيجية (Strategic Sweep) لحماية الأرباح
-- التنويع المالي (Multi-Asset: SPY & QQQ)
-- LightGBM + Kelly Criterion
+- الخزنة الاستراتيجية (Strategic Sweep) وتنويع الأصول (SPY & QQQ)
 """
 
 import os
@@ -33,14 +31,14 @@ from sklearn.preprocessing import StandardScaler
 # =========================================================
 
 NAME = "صَفاء التحليل - Volatility Hunter (Pro)"
-VERSION = "v66.2"
+VERSION = "v66.3"
 
 NY = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 
 BASE_DIR = Path(".")
-STATE_FILE = BASE_DIR / "safaa_v66_2_positions.json"
-JOURNAL_FILE = BASE_DIR / "safaa_v66_2_journal.csv"
+STATE_FILE = BASE_DIR / "safaa_v66_3_positions.json"
+JOURNAL_FILE = BASE_DIR / "safaa_v66_3_journal.csv"
 
 TRADE_SYMBOLS = ["SPY", "QQQ"]
 TIMEFRAME = "1Min"
@@ -73,7 +71,7 @@ DEFAULT_RISK_PCT = 0.01
 
 HARD_STOP_LOSS_PCT = -0.30       
 BREAKEVEN_ACTIVATION_PCT = 0.35  
-TRAILING_STOP_DISTANCE = 0.15    # الوقف المبدئي
+TRAILING_STOP_DISTANCE = 0.15    
 TAKE_PROFIT_PCT = 0.90           
 
 MARKET_OPEN = dtime(9, 30)
@@ -112,10 +110,17 @@ def save_state(): save_json(STATE_FILE, state)
 # =========================================================
 
 def alpaca_request(method, url, *, params=None, payload=None, timeout=15):
-    response = requests.request(method=method, url=url, headers=HEADERS, params=params, json=payload, timeout=timeout)
-    return response.json() if response.ok and response.text else {}
+    try:
+        response = requests.request(method=method, url=url, headers=HEADERS, params=params, json=payload, timeout=timeout)
+        if response.ok and response.text:
+            return response.json()
+    except Exception as e:
+        log.error(f"خطأ في الاتصال مع Alpaca API: {e}")
+    return {}
 
-def get_raw_equity(): return float(alpaca_request("GET", TRADING_URL + "/v2/account").get("equity", 0))
+def get_raw_equity():
+    data = alpaca_request("GET", TRADING_URL + "/v2/account")
+    return float(data.get("equity", 0)) if data else 0.0
 
 def get_managed_equity():
     raw_equity = get_raw_equity()
@@ -139,16 +144,29 @@ def calculate_dynamic_position_qty(equity, spread_cost, model_confidence):
     return max(1, int((equity * adjusted_risk_pct) // (spread_cost * 100)))
 
 # =========================================================
-# 7) مستشعر حالة السوق والبيانات (Regime Filter & ML)
+# 7) مستشعر حالة السوق والبيانات المحمية (Robust Data Fetching)
 # =========================================================
 
 def fetch_bars(symbol, days=LIVE_DAYS):
     end = datetime.now(UTC)
     start = end - timedelta(days=days)
     params = {"timeframe": TIMEFRAME, "start": start.isoformat(), "end": end.isoformat(), "limit": 10000, "feed": STOCK_FEED, "sort": "asc"}
-    bars = alpaca_request("GET", f"{DATA_URL}/v2/stocks/{symbol}/bars", params=params).get("bars", [])
-    if not bars: return pd.DataFrame()
-    df = pd.DataFrame(bars).rename(columns={"t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "vw": "vwap"})
+    
+    data = alpaca_request("GET", f"{DATA_URL}/v2/stocks/{symbol}/bars", params=params)
+    bars = data.get("bars", [])
+    
+    if not bars:
+        log.warning(f"⚠️ تحذير: لم يتم استرجاع أي بيانات لـ {symbol} من Alpaca.")
+        return pd.DataFrame()
+        
+    df = pd.DataFrame(bars)
+    # التأكد من وجود الأعمدة المطلوبة قبل إعادة التسمية
+    expected_cols = {"t", "o", "h", "l", "c", "v"}
+    if not expected_cols.issubset(df.columns):
+        log.error(f"❌ الأعمدة المسترجعة غير مطابقة لـ {symbol}: {df.columns}")
+        return pd.DataFrame()
+        
+    df = df.rename(columns={"t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "vw": "vwap"})
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     return df.set_index("timestamp").sort_index().dropna(subset=["close", "volume"])
 
@@ -158,6 +176,8 @@ def calculate_rsi(series, p=14):
     return 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
 
 def detect_market_regime(df):
+    if df.empty or "close" not in df.columns:
+        return "TRENDING"
     recent_vol = df["close"].pct_change().rolling(30).std().iloc[-1] * math.sqrt(390)
     bollinger_width = (df["high"].rolling(20).max() - df["low"].rolling(20).min()) / df["close"].iloc[-1]
     
@@ -169,6 +189,8 @@ def detect_market_regime(df):
         return "TRENDING"
 
 def generate_features(df):
+    if df.empty or "close" not in df.columns:
+        return pd.DataFrame()
     close, volume = df["close"], df["volume"].replace(0, np.nan)
     df["ret_1"] = close.pct_change(1)
     df["ret_5"] = close.pct_change(5)
@@ -186,16 +208,24 @@ models = {}
 def train_models():
     for sym in TRADE_SYMBOLS:
         log.info(f"بدء تدريب نموذج {sym}...")
-        df = generate_features(fetch_bars(sym, HISTORY_DAYS))
+        raw_df = fetch_bars(sym, HISTORY_DAYS)
+        df = generate_features(raw_df)
+        if df.empty or len(df) < 50:
+            log.warning(f"⚠️ بيانات غير كافية لتدريب {sym}. تخطي التدريب مؤقتاً.")
+            continue
+            
         df["target"] = np.where((df["close"].shift(-FORECAST_HORIZON) / df["close"] - 1) > 0.00035, 1, 
                        np.where((df["close"].shift(-FORECAST_HORIZON) / df["close"] - 1) < -0.00035, -1, 0))
         df = df[df["target"] != 0].dropna()
         
+        if len(df) < 20:
+            continue
+            
         mdl = make_pipeline(StandardScaler(), lgb.LGBMClassifier(n_estimators=300, max_depth=6, class_weight="balanced", n_jobs=-1, verbose=-1))
         mdl.fit(df[FEATURES], df["target"])
         models[sym] = mdl
         log.info(f"✅ اكتمل تدريب {sym}.")
-    return len(models) == len(TRADE_SYMBOLS)
+    return len(models) > 0
 
 # =========================================================
 # 8) استراتيجية التنفيذ التكيفية (Adaptive Execution)
@@ -203,7 +233,7 @@ def train_models():
 
 def execute_iceberg_order(symbol, strategy_type, total_qty, price):
     order_id = f"{symbol}_{strategy_type}_{uuid.uuid4().hex[:6]}"
-    spread_cost = 1.50 # محاكاة تكلفة استراتيجية مزدوجة أو Backspread
+    spread_cost = 1.50 
     
     log.info(f"❄️ تنفيذ Iceberg: استراتيجية [{strategy_type}] لـ {total_qty} عقد.")
     
@@ -248,7 +278,6 @@ def execute_adaptive_strategy(symbol, direction, price, active_equity, confidenc
 def manage_open_positions():
     if not state["positions"]: return
     
-    # محاكاة ارتفاع السعر (في الواقع يتم جلبه من API)
     current_cost = 1.70 
     positions_to_close = []
     
@@ -256,31 +285,26 @@ def manage_open_positions():
         if current_cost > pos["peak_cost"]: pos["peak_cost"] = current_cost
         pnl_pct = (current_cost - pos["entry_cost"]) / pos["entry_cost"]
 
-        # 1. تأمين نقطة الدخول (Breakeven) مبكراً عند 35% ربح
         if pnl_pct >= BREAKEVEN_ACTIVATION_PCT and not pos["breakeven_active"]:
             pos["stop_loss"] = pos["entry_cost"] * 1.05
             pos["breakeven_active"] = True
             log.info(f"🛡️ تأمين {pid}: تم تأمين الصفقة ضد الخسارة (Breakeven).")
 
-        # 2. الوقف المتحرك المتسارع (Accelerating Trailing Stop) للتدبيلات
         if pos["breakeven_active"]:
-            # التعديل السري: كلما زاد الربح، قلل مسافة التذبذب المسموحة
-            if pnl_pct > 3.0: # إذا تجاوز الربح 3 تدبيلات (300%)
-                dynamic_distance = 0.05 # ضيق الوقف إلى 5% فقط للاحتفاظ بالكاش
-            elif pnl_pct > 1.5: # إذا تجاوز الربح تدبيلة ونصف (150%)
-                dynamic_distance = 0.10 # ضيق الوقف إلى 10%
+            if pnl_pct > 3.0: 
+                dynamic_distance = 0.05 
+            elif pnl_pct > 1.5: 
+                dynamic_distance = 0.10 
             else:
-                dynamic_distance = TRAILING_STOP_DISTANCE # الوقف الطبيعي 15%
+                dynamic_distance = TRAILING_STOP_DISTANCE 
 
             dynamic_stop = pos["peak_cost"] * (1 - dynamic_distance)
             if dynamic_stop > pos["stop_loss"]:
                 pos["stop_loss"] = dynamic_stop
 
-        # 3. شروط الإغلاق
         is_eod = now_ny().time() >= EOD_CLOSE_TIME
         hit_stop = current_cost <= pos["stop_loss"]
         
-        # استثناء استراتيجيات التدبيلة (Backspreads/Straddles) من جني الأرباح الثابت
         is_unlimited_strategy = ("BACKSPREAD" in pos["strategy"] or "STRADDLE" in pos["strategy"])
         hit_target = (pnl_pct >= TAKE_PROFIT_PCT and not is_unlimited_strategy)
         
@@ -298,7 +322,9 @@ def manage_open_positions():
 
 def run():
     log.info(f"🚀 بدء تشغيل {NAME} {VERSION}...")
-    if not train_models(): return
+    if not train_models():
+        log.error("❌ فشل تدريب النماذج لجميع الأصول. إعادة المحاولة لاحقاً...")
+        return
 
     while True:
         try:
@@ -308,9 +334,14 @@ def run():
                 active_equity = get_managed_equity()
                 
                 for sym in TRADE_SYMBOLS:
-                    df = generate_features(fetch_bars(sym, LIVE_DAYS))
+                    if sym not in models:
+                        continue
+                    raw_df = fetch_bars(sym, LIVE_DAYS)
+                    df = generate_features(raw_df)
+                    if df.empty:
+                        continue
+                        
                     regime = detect_market_regime(df)
-                    
                     latest = df.iloc[-1]
                     probs = models[sym].predict_proba(pd.DataFrame([latest[FEATURES]]))[0]
                     best_idx = int(np.argmax(probs))
@@ -325,7 +356,7 @@ def run():
             
             time.sleep(15)
         except Exception as e:
-            log.error(f"خطأ في الحلقة: {e}")
+            log.error(f"خطأ غير متوقع في الحلقة الرئيسية: {e}")
             time.sleep(30)
 
 if __name__ == "__main__":
