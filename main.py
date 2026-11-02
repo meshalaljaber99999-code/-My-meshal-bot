@@ -83,8 +83,8 @@ SIGNAL_END = dtime(14, 30)
 EOD_CLOSE_TIME = dtime(15, 45)
 
 # --- Alpaca ---
-API_KEY = (os.getenv("ALPACA_API_KEY") or "").strip()
-API_SECRET = (os.getenv("ALPACA_API_SECRET") or "").strip()
+API_KEY = (os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID") or "").strip()
+API_SECRET = (os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY") or "").strip()
 DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
 TRADING_URL = os.getenv("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
 STOCK_FEED = os.getenv("ALPACA_STOCK_FEED", "iex")            # iex مجاني، sip يحتاج اشتراك
