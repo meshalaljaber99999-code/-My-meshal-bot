@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل v66.3 — The Volatility Hunter (Robust Data Handling)
+صَفاء التحليل v66.5 — The Volatility Hunter (Full Integration & Real Tracking)
+- جلب السعر الحقيقي للمراكز المفتوحة من السوق لتحديث الأرباح والخسائر بدقة
 - حماية متقدمة ضد أخطاء فقدان الأعمدة (KeyError: 'close')
 - مستشعر التذبذب واستغلال الانفجارات (Ratio Backspreads & Straddles)
-- الوقف المتحرك المتسارع (Accelerating Trailing Stop) لاصطياد التدبيلات
-- الخزنة الاستراتيجية (Strategic Sweep) وتنويع الأصول (SPY & QQQ)
+- الوقف المتحرك المتسارع (Accelerating Trailing Stop) مع تسجيل العمليات في السجل (CSV)
 """
 
 import os
@@ -31,14 +31,14 @@ from sklearn.preprocessing import StandardScaler
 # =========================================================
 
 NAME = "صَفاء التحليل - Volatility Hunter (Pro)"
-VERSION = "v66.3"
+VERSION = "v66.5"
 
 NY = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 
 BASE_DIR = Path(".")
-STATE_FILE = BASE_DIR / "safaa_v66_3_positions.json"
-JOURNAL_FILE = BASE_DIR / "safaa_v66_3_journal.csv"
+STATE_FILE = BASE_DIR / "safaa_v66_5_positions.json"
+JOURNAL_FILE = BASE_DIR / "safaa_v66_5_journal.csv"
 
 TRADE_SYMBOLS = ["SPY", "QQQ"]
 TIMEFRAME = "1Min"
@@ -84,7 +84,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger(NAME)
 
 # =========================================================
-# 4) أدوات الوقت والخزنة الاستراتيجية
+# 4) أدوات الوقت والخزنة الاستراتيجية والسجلات
 # =========================================================
 
 def now_ny(): return datetime.now(NY)
@@ -105,6 +105,18 @@ def save_json(path, data):
 state = load_json(STATE_FILE, {"date": today_ny(), "positions": {}, "vault": 0.0})
 def save_state(): save_json(STATE_FILE, state)
 
+def init_journal():
+    if not JOURNAL_FILE.exists():
+        with open(JOURNAL_FILE, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp", "symbol", "strategy", "qty", "entry_price", "exit_price", "pnl_pct", "reason"])
+
+def log_trade_to_journal(symbol, strategy, qty, entry_price, exit_price, pnl_pct, reason):
+    init_journal()
+    with open(JOURNAL_FILE, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([stamp(), symbol, strategy, qty, entry_price, exit_price, f"{pnl_pct*100:.2f}%", reason])
+
 # =========================================================
 # 5) طلبات API و التوزيع الاستراتيجي
 # =========================================================
@@ -114,6 +126,8 @@ def alpaca_request(method, url, *, params=None, payload=None, timeout=15):
         response = requests.request(method=method, url=url, headers=HEADERS, params=params, json=payload, timeout=timeout)
         if response.ok and response.text:
             return response.json()
+        else:
+            log.warning(f"⚠️ استجابة غير صالحة من Alpaca [{response.status_code}]: {response.text}")
     except Exception as e:
         log.error(f"خطأ في الاتصال مع Alpaca API: {e}")
     return {}
@@ -136,31 +150,55 @@ def get_managed_equity():
 # 6) إدارة رأس المال (Kelly Criterion)
 # =========================================================
 
-def calculate_dynamic_position_qty(equity, spread_cost, model_confidence):
+def calculate_dynamic_position_qty(equity, price, model_confidence):
     win_rate, avg_win_pct, avg_loss_pct = 0.55, 0.15, 0.08 
     R = avg_win_pct / avg_loss_pct
     kelly_pct = win_rate - ((1 - win_rate) / R)
     adjusted_risk_pct = min(max(0, kelly_pct / 4.0) * (model_confidence / 0.65), MAX_RISK_CAP)
-    return max(1, int((equity * adjusted_risk_pct) // (spread_cost * 100)))
+    return max(1, int((equity * adjusted_risk_pct) // (price * 100)))
 
 # =========================================================
-# 7) مستشعر حالة السوق والبيانات المحمية (Robust Data Fetching)
+# 7) مستشعر حالة السوق والبيانات المحمية (Pagination)
 # =========================================================
 
 def fetch_bars(symbol, days=LIVE_DAYS):
+    if not API_KEY or not API_SECRET:
+        log.error("❌ مفاتيح Alpaca API غير معرفة في متغيرات البيئة!")
+        return pd.DataFrame()
+
     end = datetime.now(UTC)
     start = end - timedelta(days=days)
-    params = {"timeframe": TIMEFRAME, "start": start.isoformat(), "end": end.isoformat(), "limit": 10000, "feed": STOCK_FEED, "sort": "asc"}
+    all_bars = []
+    page_token = None
     
-    data = alpaca_request("GET", f"{DATA_URL}/v2/stocks/{symbol}/bars", params=params)
-    bars = data.get("bars", [])
-    
-    if not bars:
+    while True:
+        params = {
+            "timeframe": TIMEFRAME, 
+            "start": start.isoformat(), 
+            "end": end.isoformat(), 
+            "limit": 10000, 
+            "feed": STOCK_FEED, 
+            "sort": "asc"
+        }
+        if page_token:
+            params["page_token"] = page_token
+            
+        data = alpaca_request("GET", f"{DATA_URL}/v2/stocks/{symbol}/bars", params=params)
+        bars = data.get("bars", [])
+        
+        if not bars:
+            break
+            
+        all_bars.extend(bars)
+        page_token = data.get("next_page_token")
+        if not page_token:
+            break
+            
+    if not all_bars:
         log.warning(f"⚠️ تحذير: لم يتم استرجاع أي بيانات لـ {symbol} من Alpaca.")
         return pd.DataFrame()
         
-    df = pd.DataFrame(bars)
-    # التأكد من وجود الأعمدة المطلوبة قبل إعادة التسمية
+    df = pd.DataFrame(all_bars)
     expected_cols = {"t", "o", "h", "l", "c", "v"}
     if not expected_cols.issubset(df.columns):
         log.error(f"❌ الأعمدة المسترجعة غير مطابقة لـ {symbol}: {df.columns}")
@@ -233,31 +271,29 @@ def train_models():
 
 def execute_iceberg_order(symbol, strategy_type, total_qty, price):
     order_id = f"{symbol}_{strategy_type}_{uuid.uuid4().hex[:6]}"
-    spread_cost = 1.50 
-    
-    log.info(f"❄️ تنفيذ Iceberg: استراتيجية [{strategy_type}] لـ {total_qty} عقد.")
+    log.info(f"❄️ تنفيذ Iceberg: استراتيجية [{strategy_type}] لـ {symbol} بعدد {total_qty} عقد بسعر دخول {price}$")
     
     remaining = total_qty
     while remaining > 0:
         chunk = min(remaining, MAX_ORDER_CHUNK_SIZE)
         remaining -= chunk
-        time.sleep(1.0) 
+        time.sleep(0.5) 
         
     state["positions"][order_id] = {
         "symbol": symbol, "strategy": strategy_type, "qty": total_qty,
-        "entry_cost": spread_cost, "peak_cost": spread_cost,
-        "stop_loss": spread_cost * (1 + HARD_STOP_LOSS_PCT),
+        "entry_price": price, "peak_price": price,
+        "stop_loss": price * (1 + HARD_STOP_LOSS_PCT),
         "breakeven_active": False, "entry_time": stamp()
     }
     save_state()
-    log.info(f"✅ اكتمل بناء المراكز بنجاح.")
+    log.info(f"✅ اكتمل بناء المراكز بنجاح وتسجيلها في النظام.")
 
 def execute_adaptive_strategy(symbol, direction, price, active_equity, confidence, regime):
     if regime == "CHOPPY_HIGH_VOL":
         log.warning(f"⚠️ سوق عالي الخطورة لـ {symbol}. إيقاف التداول مؤقتاً.")
         return
 
-    qty = calculate_dynamic_position_qty(active_equity, 1.50, confidence)
+    qty = calculate_dynamic_position_qty(active_equity, price, confidence)
     direction_str = "CALL" if direction == 1 else "PUT"
 
     if regime == "TRENDING":
@@ -278,15 +314,23 @@ def execute_adaptive_strategy(symbol, direction, price, active_equity, confidenc
 def manage_open_positions():
     if not state["positions"]: return
     
-    current_cost = 1.70 
     positions_to_close = []
     
     for pid, pos in state["positions"].items():
-        if current_cost > pos["peak_cost"]: pos["peak_cost"] = current_cost
-        pnl_pct = (current_cost - pos["entry_cost"]) / pos["entry_cost"]
+        sym = pos["symbol"]
+        # جلب السعر الحالي الفعلي للأصل من السوق بدلاً من القيمة الثابتة
+        df_latest = fetch_bars(sym, days=1)
+        if df_latest.empty:
+            continue
+        current_price = float(df_latest["close"].iloc[-1])
+        
+        if current_price > pos["peak_price"]: 
+            pos["peak_price"] = current_price
+            
+        pnl_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
 
         if pnl_pct >= BREAKEVEN_ACTIVATION_PCT and not pos["breakeven_active"]:
-            pos["stop_loss"] = pos["entry_cost"] * 1.05
+            pos["stop_loss"] = pos["entry_price"] * 1.05
             pos["breakeven_active"] = True
             log.info(f"🛡️ تأمين {pid}: تم تأمين الصفقة ضد الخسارة (Breakeven).")
 
@@ -298,12 +342,12 @@ def manage_open_positions():
             else:
                 dynamic_distance = TRAILING_STOP_DISTANCE 
 
-            dynamic_stop = pos["peak_cost"] * (1 - dynamic_distance)
+            dynamic_stop = pos["peak_price"] * (1 - dynamic_distance)
             if dynamic_stop > pos["stop_loss"]:
                 pos["stop_loss"] = dynamic_stop
 
         is_eod = now_ny().time() >= EOD_CLOSE_TIME
-        hit_stop = current_cost <= pos["stop_loss"]
+        hit_stop = current_price <= pos["stop_loss"]
         
         is_unlimited_strategy = ("BACKSPREAD" in pos["strategy"] or "STRADDLE" in pos["strategy"])
         hit_target = (pnl_pct >= TAKE_PROFIT_PCT and not is_unlimited_strategy)
@@ -311,6 +355,7 @@ def manage_open_positions():
         if is_eod or hit_stop or hit_target:
             reason = "EOD" if is_eod else ("Hit Target" if hit_target else "Trailing Stop")
             log.info(f"🔥 إغلاق {pid} | السبب: {reason} | الربح النهائي: {pnl_pct*100:.1f}%")
+            log_trade_to_journal(sym, pos["strategy"], pos["qty"], pos["entry_price"], current_price, pnl_pct, reason)
             positions_to_close.append(pid)
             
     for pid in positions_to_close: del state["positions"][pid]
@@ -322,6 +367,7 @@ def manage_open_positions():
 
 def run():
     log.info(f"🚀 بدء تشغيل {NAME} {VERSION}...")
+    init_journal()
     if not train_models():
         log.error("❌ فشل تدريب النماذج لجميع الأصول. إعادة المحاولة لاحقاً...")
         return
