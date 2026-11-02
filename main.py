@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل v66.8 — The 0-DTE Sniper (Ultra Aggressive)
+صَفاء التحليل v66.9 — The Smart Money Tracker (0-DTE + Volume Profile)
 - التداول حصراً بعقود الخيارات 0-DTE (نفس يوم الانتهاء) لـ SPY.
-- خوارزمية صيد الانفجارات السعرية العنيفة (Scalping).
+- إضافة (Volume Profile): تتبع سيولة صناديق التحوط ومعرفة "نقطة السيطرة" (POC).
 - تأمين فوري للصفقة (Breakeven) عند 15% ربح.
-- وقف متحرك خانق (Trailing Stop) لحلب الأرباح وتدبيلها.
+- وقف متحرك خانق (Trailing Stop) لحلب الأرباح.
 - إغلاق إجباري صارم قبل الإغلاق بـ 15 دقيقة لتجنب التصفية.
 """
 
@@ -31,21 +31,21 @@ from sklearn.preprocessing import StandardScaler
 # 1) الإعدادات العامة
 # =========================================================
 
-NAME = "صَفاء التحليل - 0-DTE Sniper"
-VERSION = "v66.8"
+NAME = "صَفاء التحليل - Smart Money Tracker"
+VERSION = "v66.9"
 
 NY = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 
 BASE_DIR = Path(".")
-STATE_FILE = BASE_DIR / "safaa_v66_8_0dte_positions.json"
-JOURNAL_FILE = BASE_DIR / "safaa_v66_8_0dte_journal.csv"
+STATE_FILE = BASE_DIR / "safaa_v66_9_0dte_positions.json"
+JOURNAL_FILE = BASE_DIR / "safaa_v66_9_0dte_journal.csv"
 
 TRADE_SYMBOLS = ["SPY"]
 TIMEFRAME = "1Min"
 HISTORY_DAYS = 90
 LIVE_DAYS = 5
-FORECAST_HORIZON = 3 # توقع حركات سريعة جداً (3 دقائق)
+FORECAST_HORIZON = 3 
 
 # =========================================================
 # 2) إعدادات Alpaca
@@ -64,19 +64,19 @@ HEADERS = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET, "Conte
 # 3) المخاطر، الوقف الخانق، وإدارة الـ 0-DTE
 # =========================================================
 
-MIN_CONFIDENCE_THRESHOLD = 0.70  # ثقة عالية جداً لفلترة الإشارات الكاذبة
-MAX_RISK_CAP = 0.15              # المخاطرة بـ 15% من رأس المال للصفقة (لتحقيق تدبيل حقيقي)
+MIN_CONFIDENCE_THRESHOLD = 0.70  
+MAX_RISK_CAP = 0.15              
 
-HARD_STOP_LOSS_PCT = -0.20       # قطع الخسارة الصارم عند -20% (ممنوع الخسارة الكبيرة)
-BREAKEVEN_ACTIVATION_PCT = 0.15  # تأمين الصفقة فوراً عند +15% ربح
-TRAILING_STOP_DISTANCE = 0.10    # ملاحقة السعر بمسافة 10% فقط لجني الأرباح بقسوة
-TAKE_PROFIT_PCT = 2.00           # الهدف 200% (تدبيلتين)، لكن الوقف المتحرك سيخرجنا متى ما انتهى الزخم
+HARD_STOP_LOSS_PCT = -0.20       
+BREAKEVEN_ACTIVATION_PCT = 0.15  
+TRAILING_STOP_DISTANCE = 0.10    
+TAKE_PROFIT_PCT = 2.00           
 
 MARKET_OPEN = dtime(9, 30)
 MARKET_CLOSE = dtime(16, 0)
-EOD_CLOSE_TIME = dtime(15, 45)   # الإغلاق قبل نهاية السوق بـ 15 دقيقة (صارم للـ 0-DTE)
-SIGNAL_START = dtime(9, 45)      # تجاهل أول 15 دقيقة المجنونة
-SIGNAL_END = dtime(15, 10)       # لا تفتح صفقات جديدة في آخر 50 دقيقة
+EOD_CLOSE_TIME = dtime(15, 45)   
+SIGNAL_START = dtime(9, 45)      
+SIGNAL_END = dtime(15, 10)       
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(NAME)
@@ -127,26 +127,18 @@ def get_raw_equity():
     return float(data.get("equity", 0)) if data else 0.0
 
 def calculate_dynamic_position_qty(equity, option_price, model_confidence):
-    # الدخول بقوة في الصفقات الموثوقة لتحقيق التدبيل
     adjusted_risk_pct = min(0.05 * (model_confidence / 0.70), MAX_RISK_CAP)
     capital_to_risk = equity * adjusted_risk_pct
     qty = int(capital_to_risk // (option_price * 100))
     return max(1, qty)
 
 # =========================================================
-# 6) قناص عقود الـ 0-DTE (الجديد)
+# 6) قناص عقود الـ 0-DTE
 # =========================================================
 
 def get_0dte_atm_contract(underlying_symbol, current_price, option_type="call"):
-    """البحث حصراً عن عقود تنتهي اليوم (0-DTE) وتكون At-The-Money"""
     log.info(f"🔍 البحث عن عقود 0-DTE لـ {underlying_symbol} (نوع: {option_type})...")
-    
-    params = {
-        "underlying_symbols": underlying_symbol,
-        "status": "active",
-        "limit": 1000
-    }
-    
+    params = {"underlying_symbols": underlying_symbol, "status": "active", "limit": 1000}
     contracts_data = alpaca_request("GET", f"{TRADING_URL}/v2/options/contracts", params=params)
     contracts = contracts_data.get("option_contracts", [])
     
@@ -160,24 +152,16 @@ def get_0dte_atm_contract(underlying_symbol, current_price, option_type="call"):
         exp_date = datetime.strptime(c["expiration_date"], "%Y-%m-%d").date()
         dte = (exp_date - now_date).days
         
-        # 🔥 الشرط الصارم: 0-DTE فقط 🔥
         if dte == 0:
             strike = float(c["strike_price"])
-            distance = abs(strike - current_price)
-            valid_contracts.append({
-                "symbol": c["symbol"],
-                "strike": strike,
-                "distance": distance
-            })
+            valid_contracts.append({"symbol": c["symbol"], "strike": strike, "distance": abs(strike - current_price)})
             
     if not valid_contracts:
-        log.warning("⚠️ لا توجد عقود 0-DTE متاحة اليوم (قد يكون يوم عطلة للخيارات).")
+        log.warning("⚠️ لا توجد عقود 0-DTE متاحة اليوم.")
         return None
         
-    # ترتيب العقود لاختيار الأقرب للسعر الحالي (ATM)
     valid_contracts.sort(key=lambda x: x["distance"])
     best_contract = valid_contracts[0]
-    
     log.info(f"🎯 تم قنص عقد 0-DTE: {best_contract['symbol']} (Strike: {best_contract['strike']})")
     return best_contract["symbol"]
 
@@ -193,7 +177,7 @@ def get_option_latest_price(occ_symbol):
     return 0.0
 
 # =========================================================
-# 7) جلب البيانات والتحليل العميق (المضاربة اللحظية)
+# 7) جلب البيانات والتحليل العميق (Smart Money / Volume Profile)
 # =========================================================
 
 def fetch_bars(symbol, days=LIVE_DAYS):
@@ -218,39 +202,51 @@ def fetch_bars(symbol, days=LIVE_DAYS):
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     return df.set_index("timestamp").sort_index().dropna(subset=["close", "volume"])
 
-def calculate_rsi(series, p=9): # RSI أسرع للمضاربة (9 بدلاً من 14)
+def calculate_rsi(series, p=9): 
     gain = series.diff().clip(lower=0).ewm(alpha=1/p, adjust=False).mean()
     loss = (-series.diff().clip(upper=0)).ewm(alpha=1/p, adjust=False).mean()
     return 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
 
 def detect_market_regime(df):
     recent_vol = df["close"].pct_change().rolling(30).std().iloc[-1] * math.sqrt(390)
-    # للـ 0-DTE، نحن نحب التذبذب العالي إذا كان له اتجاه، لذا نخفف القيود هنا قليلاً
     if recent_vol > 0.40: return "EXTREME_VOL"
     return "TRENDING"
 
 def generate_features(df):
-    close, volume = df["close"], df["volume"].replace(0, np.nan)
+    close, high, low, volume = df["close"], df["high"], df["low"], df["volume"].replace(0, np.nan)
     df["ret_1"] = close.pct_change(1)
-    df["ret_3"] = close.pct_change(3) # تركيز على الزخم السريع جداً
+    df["ret_3"] = close.pct_change(3)
     df["ema_5"] = close.ewm(span=5, adjust=False).mean()
     df["rsi"] = calculate_rsi(close)
-    df["macd"] = close.ewm(span=8).mean() - close.ewm(span=21).mean() # MACD سريع
-    if "vwap" not in df.columns: df["vwap"] = ((df["high"] + df["low"] + close) / 3 * volume).cumsum() / volume.cumsum()
+    df["macd"] = close.ewm(span=8).mean() - close.ewm(span=21).mean()
+    if "vwap" not in df.columns: df["vwap"] = ((high + low + close) / 3 * volume).cumsum() / volume.cumsum()
     df["vwap_z"] = ((close - df["vwap"]) / (close - df["vwap"]).rolling(20).std().replace(0, np.nan)).clip(-5.0, 5.0)
+    
+    # 🌟 بصمة السيولة (Institutional Volume Profile & Smart Money Index) 🌟
+    # 1. تدفق الأموال المؤسسية: يقيس هل السيولة تضغط للأعلى أم للأسفل داخل الشمعة
+    df["inst_money_flow"] = (((close - low) - (high - close)) / (high - low).replace(0, 0.001)) * volume
+    df["imf_trend"] = df["inst_money_flow"].rolling(10).mean()
+    
+    # 2. تقريب السعر لمعرفة "نقطة السيطرة" (POC) لآخر 60 دقيقة 
+    # (المكان الذي ضخت فيه الصناديق الكبرى أكبر حجم تداول)
+    df["price_bin"] = close.round(1)
+    df["poc_60m"] = df.rolling(60).apply(lambda x: df.loc[x.index, 'volume'].groupby(df.loc[x.index, 'price_bin']).sum().idxmax(), raw=False)['price_bin']
+    
+    # 3. المسافة بين السعر الحالي ونقطة سيطرة الحيتان
+    df["dist_to_poc"] = (close - df["poc_60m"]) / close
+
     df["vol_velocity"] = volume / volume.rolling(10).mean().replace(0, np.nan)
     return df.replace([np.inf, -np.inf], np.nan).dropna()
 
-FEATURES = ["ret_1", "ret_3", "ema_5", "rsi", "macd", "vwap_z", "vol_velocity"]
+FEATURES = ["ret_1", "ret_3", "ema_5", "rsi", "macd", "vwap_z", "imf_trend", "dist_to_poc", "vol_velocity"]
 models = {}
 
 def train_models():
     for sym in TRADE_SYMBOLS:
-        log.info(f"🧠 تدريب عقل القناص لـ {sym}...")
+        log.info(f"🧠 تدريب عقل القناص لـ {sym} (مع تتبع سيولة الحيتان)...")
         raw_df = fetch_bars(sym, HISTORY_DAYS)
         df = generate_features(raw_df)
         if len(df) < 50: continue
-        # فلترة صارمة: نبحث عن حركات تحقق أكثر من 0.05% خلال 3 دقائق
         df["target"] = np.where((df["close"].shift(-FORECAST_HORIZON) / df["close"] - 1) > 0.0005, 1, 
                        np.where((df["close"].shift(-FORECAST_HORIZON) / df["close"] - 1) < -0.0005, -1, 0))
         df = df[df["target"] != 0].dropna()
@@ -263,20 +259,20 @@ def train_models():
 # 8) استراتيجية التنفيذ 
 # =========================================================
 
-def execute_0dte_trade(symbol, direction, stock_price, equity, confidence):
+def execute_0dte_trade(symbol, direction, stock_price, poc_level, equity, confidence):
     opt_type = "call" if direction == 1 else "put"
     occ_symbol = get_0dte_atm_contract(symbol, stock_price, opt_type)
     
     if not occ_symbol: return
     
     opt_price = get_option_latest_price(occ_symbol)
-    if opt_price <= 0.10: # تجاهل العقود الرخيصة جداً (التراب)
-        log.warning(f"⚠️ سعر العقد {occ_symbol} منخفض جداً ({opt_price}$). مخاطرة عالية، تم الإلغاء.")
+    if opt_price <= 0.10: 
+        log.warning(f"⚠️ سعر العقد {occ_symbol} منخفض جداً ({opt_price}$). مخاطرة عالية.")
         return
         
     qty = calculate_dynamic_position_qty(equity, opt_price, confidence)
     
-    log.info(f"⚔️ تنفيذ 0-DTE: شراء {qty} عقد {occ_symbol} بسعر {opt_price}$ للعقد. (الهدف: جني أرباح سريع)")
+    log.info(f"⚔️ تنفيذ 0-DTE: شراء {qty} عقد {occ_symbol} بسعر {opt_price}$ (نقطة ارتكاز الحيتان حول: {poc_level}$)")
     
     state["positions"][occ_symbol] = {
         "underlying": symbol,
@@ -292,7 +288,7 @@ def execute_0dte_trade(symbol, direction, stock_price, equity, confidence):
     save_state()
 
 # =========================================================
-# 9) إدارة المراكز: الحماية والوقف الخانق 
+# 9) إدارة المراكز
 # =========================================================
 
 def manage_open_positions():
@@ -309,19 +305,16 @@ def manage_open_positions():
             
         pnl_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
 
-        # 1. تأمين فوري: إذا ربحنا 15%، الوقف يصبح نقطة الدخول (لا مجال للخسارة بعد الآن)
         if pnl_pct >= BREAKEVEN_ACTIVATION_PCT and not pos["breakeven_active"]:
-            pos["stop_loss"] = pos["entry_price"] * 1.02 # دخول + 2% لتغطية العمولات
+            pos["stop_loss"] = pos["entry_price"] * 1.02 
             pos["breakeven_active"] = True
-            log.info(f"🛡️ تم تأمين الصفقة (Breakeven Locked)! {occ} يتداول الآن بربح {pnl_pct*100:.1f}%")
+            log.info(f"🛡️ تم تأمين الصفقة! {occ} يتداول الآن بربح {pnl_pct*100:.1f}%")
 
-        # 2. الملاحقة الخانقة: نطارد السعر بـ 10% للأسفل من أعلى قمة وصلها
         if pos["breakeven_active"]:
             dynamic_stop = pos["peak_price"] * (1 - TRAILING_STOP_DISTANCE)
             if dynamic_stop > pos["stop_loss"]:
                 pos["stop_loss"] = dynamic_stop
 
-        # 3. شروط الخروج
         is_eod = now_ny().time() >= EOD_CLOSE_TIME
         hit_stop = current_price <= pos["stop_loss"]
         hit_target = pnl_pct >= TAKE_PROFIT_PCT
@@ -363,17 +356,17 @@ def run():
                     confidence = float(probs[best_idx])
                     direction = int(models[sym].classes_[best_idx])
 
-                    log.info(f"📊 تحليل {sym} | الاتجاه: {'صعود' if direction==1 else 'هبوط' if direction==-1 else 'عرضي'} | الثقة: {confidence*100:.1f}%")
+                    current_poc = latest["poc_60m"]
+                    log.info(f"📊 تحليل {sym} | الاتجاه: {'صعود' if direction==1 else 'هبوط' if direction==-1 else 'عرضي'} | الثقة: {confidence*100:.1f}% | تمركز السيولة (POC): {current_poc}$")
 
-                    # الدخول فقط إذا كانت الثقة أعلى من 70%
                     if direction != 0 and confidence >= MIN_CONFIDENCE_THRESHOLD:
                         if regime == "EXTREME_VOL":
                             log.warning("🚫 تجاهل: تذبذب عشوائي شديد الخطورة للـ 0-DTE.")
                         else:
-                            execute_0dte_trade(sym, direction, latest["close"], active_equity, confidence)
-                            time.sleep(30) # انتظار 30 ثانية بعد التنفيذ
+                            execute_0dte_trade(sym, direction, latest["close"], current_poc, active_equity, confidence)
+                            time.sleep(30)
                             
-            time.sleep(10) # فحص أسرع للـ 0-DTE (كل 10 ثواني)
+            time.sleep(10) 
         except Exception as e:
             log.error(f"خطأ غير متوقع: {e}")
             time.sleep(10)
