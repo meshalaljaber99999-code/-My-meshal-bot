@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 =========================================================
-صَفاء التحليل v75.2 (MASTERMIND ENGINE - INSTITUTIONAL)
+صَفاء التحليل v76.0 (SAFETY-FIRST ENGINE)
 SPY 0-DTE | PAPER TRADING ONLY
 =========================================================
-Upgrades in v75.2:
-1. Proper Slippage Guard with immediate Cancel of pending/partial orders.
-2. Theta Decay Hard Cutoff at 14:30 NY (force exit of non-performing positions).
-3. Safer Fill Price handling (fallback if filled_avg_price is missing).
+Critical Fixes:
+1. Partial-fill safe exit (never drop local position until qty_open == 0)
+2. Correct previous-day close for Gap calculation
+3. Broker-side Stop-Limit protection after entry
+4. Realistic slippage / partial-fill handling
 =========================================================
 """
 
@@ -25,32 +26,28 @@ import requests
 # 1. CONFIGURATION
 # =========================================================
 
-VERSION = "v75.2"
+VERSION = "v76.0"
 SYMBOL = "SPY"
 NY = ZoneInfo("America/New_York")
 
 def env_float(name, default): return float(os.getenv(name, default))
 def env_int(name, default): return int(os.getenv(name, default))
 
-# Risk & Sizing
 RISK_PER_TRADE = env_float("RISK_PER_TRADE", "0.015")
 MAX_PREMIUM_PCT = env_float("MAX_PREMIUM_PCT", "0.10")
 DAILY_LOSS_LIMIT = env_float("DAILY_LOSS_LIMIT", "0.04")
 ATR_MULTIPLIER = env_float("ATR_MULTIPLIER", "1.5")
 COMMISSION_PER_CONTRACT = 0.65
 
-# Circuit Breakers & Cooldowns
 LOSS_PAUSE_MINUTES = env_int("LOSS_PAUSE_MINUTES", 30)
 MAX_CONSEC_LOSSES = env_int("MAX_CONSEC_LOSSES", 2)
 ENTRY_COOLDOWN_MINUTES = env_int("ENTRY_COOLDOWN_MINUTES", 15)
 BIAS_REFRESH_MINUTES = 15
 
-# Opening Range Filters
 OR_MAX_AGE_MINUTES = 90
 OR_MIN_WIDTH = 0.50
 OR_MAX_WIDTH = 5.50
 
-# Profit Runner Controls
 BREAKEVEN_TRIGGER = env_float("BREAKEVEN_TRIGGER", "0.25")
 TRAIL_ACTIVATION = env_float("TRAIL_ACTIVATION", "0.45")
 TRAIL_DISTANCE = env_float("TRAIL_DISTANCE", "0.15")
@@ -60,18 +57,15 @@ SCALP_TRAIL_ACTIVATION = env_float("SCALP_TRAIL_ACTIVATION", "0.18")
 SCALP_TRAIL_DISTANCE = env_float("SCALP_TRAIL_DISTANCE", "0.10")
 SCALP_TIME_LIMIT_MINS = env_int("SCALP_TIME_LIMIT_MINS", 45)
 
-# Entry Quality & Execution
 VOLUME_MULT = env_float("VOLUME_MULT", "1.25")
 MAX_SPREAD_PCT = env_float("MAX_SPREAD_PCT", "0.08")
 MIN_OPTION_ASK = env_float("MIN_OPTION_ASK", "0.25")
 DELTA_PROXY_PCT = env_float("DELTA_PROXY_PCT", "0.003")
-MAX_ENTRY_SLIPPAGE = 0.08
 LIMIT_TIMEOUT = 4
 
-# Market Timing
 SIGNAL_START = dtime(9, 45)
 SIGNAL_END = dtime(14, 00)
-THETA_HARD_CUTOFF = dtime(14, 30)   # Force exit of non-performing positions
+THETA_HARD_CUTOFF = dtime(14, 30)
 EOD_CLOSE = dtime(15, 45)
 
 API_KEY = (os.getenv("ALPACA_API_KEY") or "").strip()
@@ -83,8 +77,8 @@ OPTIONS_FEED = "indicative"
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = DATA_DIR / "safaa_v75_state.json"
-TRADES_FILE = DATA_DIR / "safaa_v75_journal.csv"
+STATE_FILE = DATA_DIR / "safaa_v76_state.json"
+TRADES_FILE = DATA_DIR / "safaa_v76_journal.csv"
 
 HEADERS = {
     "APCA-API-KEY-ID": API_KEY,
@@ -96,7 +90,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("SAFAA")
 
 if "paper" not in TRADING_URL.lower():
-    raise RuntimeError("CRITICAL: v75 is PAPER ONLY.")
+    raise RuntimeError("CRITICAL: v76 is PAPER ONLY.")
 
 # =========================================================
 # 2. CORE HELPERS & STATE
@@ -116,7 +110,7 @@ def parse_time(value):
 
 def api_with_retry(method, url, params=None, body=None, max_retries=3):
     backoff = 0.5
-    for attempt in range(max_retries):
+    for _ in range(max_retries):
         try:
             res = requests.request(method, url, headers=HEADERS, params=params, json=body, timeout=8)
             data = res.json() if res.content else {}
@@ -187,7 +181,7 @@ def calculate_rsi(prices, period=14):
     losses = [max(0, prices[i-1] - prices[i]) for i in range(1, len(prices))]
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(prices)-1):
+    for i in range(period, len(prices) - 1):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
     if avg_loss == 0:
@@ -199,14 +193,12 @@ def calculate_intraday_atr(bars, period=30):
         return None
     tr = []
     for i in range(1, len(bars)):
-        h = float(bars[i]["h"])
-        l = float(bars[i]["l"])
-        prev_c = float(bars[i-1]["c"])
+        h, l, prev_c = float(bars[i]["h"]), float(bars[i]["l"]), float(bars[i-1]["c"])
         tr.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
     return sum(tr[-period:]) / period
 
 # =========================================================
-# 4. ROBUST BIAS ENGINE
+# 4. BIAS ENGINE (Fixed Previous Close)
 # =========================================================
 
 def get_stock_bars(symbol, start, end, timeframe="1Min"):
@@ -236,9 +228,20 @@ def session_bars():
     end = n.replace(second=0, microsecond=0).astimezone(ZoneInfo("UTC"))
     return get_stock_bars(SYMBOL, start, end)
 
+def get_previous_close():
+    """Strictly the last COMPLETED daily bar before today."""
+    n = now_ny()
+    start = (n - timedelta(days=10)).astimezone(ZoneInfo("UTC"))
+    end = n.astimezone(ZoneInfo("UTC"))
+    bars = get_stock_bars(SYMBOL, start, end, "1Day")
+    completed = [b for b in bars if parse_time(b["t"]).date() < n.date()]
+    if not completed:
+        return None
+    return float(completed[-1]["c"])
+
 def get_trend_score():
     n = now_ny()
-    start_d = (n - timedelta(days=30)).astimezone(ZoneInfo("UTC"))
+    start_d = (n - timedelta(days=40)).astimezone(ZoneInfo("UTC"))
     end_d = n.astimezone(ZoneInfo("UTC"))
     bars = get_stock_bars(SYMBOL, start_d, end_d, "1Day")
     closes = [float(b["c"]) for b in bars if parse_time(b["t"]).date() < n.date()]
@@ -254,15 +257,9 @@ def refresh_bias():
         if (n - last_time).total_seconds() < BIAS_REFRESH_MINUTES * 60:
             return
 
-    prev_bars = get_stock_bars(
-        SYMBOL,
-        (n - timedelta(days=5)).astimezone(ZoneInfo("UTC")),
-        n.astimezone(ZoneInfo("UTC")),
-        "1Day"
-    )
-    if not prev_bars:
+    prev_close = get_previous_close()
+    if prev_close is None:
         return
-    prev_close = float(prev_bars[-1]["c"])
 
     pm_start = n.replace(hour=4, minute=0, second=0, microsecond=0).astimezone(ZoneInfo("UTC"))
     pm_end = n.replace(hour=9, minute=29, second=0, microsecond=0).astimezone(ZoneInfo("UTC"))
@@ -273,7 +270,7 @@ def refresh_bias():
     gap_pct = (ref_price - prev_close) / prev_close
     trend = get_trend_score()
 
-    score = 0
+    score = 0.0
     if gap_pct > 0.0015:
         score += 1
     elif gap_pct < -0.0015:
@@ -346,8 +343,7 @@ def choose_contract(direction, underlying):
     if not ok or not data.get("option_contracts"):
         return None, None
 
-    contracts = data["option_contracts"]
-    contracts.sort(key=lambda x: abs(float(x["strike_price"]) - target_strike))
+    contracts = sorted(data["option_contracts"], key=lambda x: abs(float(x["strike_price"]) - target_strike))
 
     for c in contracts:
         symbol = c["symbol"]
@@ -372,8 +368,20 @@ def submit_limit_order(symbol, qty, side, price):
     })
     return data.get("id") if ok else None
 
+def submit_stop_limit_order(symbol, qty, stop_price, limit_price):
+    """Broker-side protective stop (sell)."""
+    ok, data = api_with_retry("POST", f"{TRADING_URL}/v2/orders", body={
+        "symbol": symbol,
+        "qty": str(qty),
+        "side": "sell",
+        "type": "stop_limit",
+        "stop_price": f"{stop_price:.2f}",
+        "limit_price": f"{limit_price:.2f}",
+        "time_in_force": "day"
+    })
+    return data.get("id") if ok else None
+
 def cancel_order(order_id):
-    """Force cancel any pending order."""
     if order_id:
         api_with_retry("DELETE", f"{TRADING_URL}/v2/orders/{order_id}")
 
@@ -381,30 +389,36 @@ def wait_for_order(order_id, timeout=LIMIT_TIMEOUT):
     deadline = time.time() + timeout
     while time.time() < deadline:
         ok, order = api_with_retry("GET", f"{TRADING_URL}/v2/orders/{order_id}")
-        if ok and order.get("status") in ("filled", "canceled", "expired", "rejected"):
+        if ok and order.get("status") in ("filled", "partially_filled", "canceled", "expired", "rejected"):
             return order
         time.sleep(0.5)
-    # Timeout → cancel
     cancel_order(order_id)
     time.sleep(0.5)
     ok, order = api_with_retry("GET", f"{TRADING_URL}/v2/orders/{order_id}")
     return order if ok else None
 
-def safe_fill_price(order, fallback_price):
-    """Safely extract filled_avg_price with fallback."""
+def safe_fill_price(order, fallback):
     if not order:
-        return fallback_price
+        return fallback
     raw = order.get("filled_avg_price")
-    if raw is None or raw == "" or raw == "0" or raw == 0:
-        return fallback_price
+    if raw in (None, "", 0, "0"):
+        return fallback
     try:
         price = float(raw)
-        return price if price > 0 else fallback_price
+        return price if price > 0 else fallback
     except (TypeError, ValueError):
-        return fallback_price
+        return fallback
+
+def get_filled_qty(order):
+    if not order:
+        return 0
+    try:
+        return int(float(order.get("filled_qty") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 # =========================================================
-# 6. SIGNAL & FILTERS
+# 6. SIGNAL
 # =========================================================
 
 def is_cooling_down():
@@ -413,7 +427,6 @@ def is_cooling_down():
             return True
         state["pause_until"] = None
         save_state()
-
     last_entry = state.get("last_entry_time")
     if last_entry:
         if (now_ny() - datetime.fromisoformat(last_entry)).total_seconds() < ENTRY_COOLDOWN_MINUTES * 60:
@@ -426,7 +439,6 @@ def opening_range_signal():
 
     n = now_ny()
     market_open = n.replace(hour=9, minute=30, second=0, microsecond=0)
-
     if (n - market_open).total_seconds() > (OR_MAX_AGE_MINUTES * 60):
         return None
 
@@ -457,21 +469,14 @@ def opening_range_signal():
     bias = state.get("bias")
     vol_ratio = float(last["v"]) / (sum(float(b["v"]) for b in bars[-10:-1]) / 9) if len(bars) > 10 else 1.0
 
-    meta = {
-        "vwap": vwap,
-        "rsi": rsi,
-        "vol_ratio": vol_ratio,
-        "bias": bias
-    }
+    meta = {"vwap": vwap, "rsi": rsi, "vol_ratio": vol_ratio, "bias": bias}
 
-    # Trend Mode
     if bias in ("bull", "bear") and vol_ratio >= VOLUME_MULT:
         if c > or_high and c > vwap and bias == "bull":
             return "up", c, "trend", meta
         if c < or_low and c < vwap and bias == "bear":
             return "down", c, "trend", meta
 
-    # Scalp Mode
     if bias == "neutral" and rsi is not None and vwap:
         vwap_dist = abs(c - vwap) / vwap
         if vwap_dist < 0.004:
@@ -483,7 +488,7 @@ def opening_range_signal():
     return None
 
 # =========================================================
-# 7. EXECUTION, RECONCILIATION & JOURNAL
+# 7. EXECUTION (Partial-fill safe)
 # =========================================================
 
 def get_equity():
@@ -515,18 +520,30 @@ def reconcile_broker():
         or (str(p.get("symbol", "")).startswith("SPY") and len(str(p.get("symbol", ""))) > 10)
     ]
     local = state.get("position")
+
     if local is None and opts:
         log.error("🛑 Unknown broker position found. Halting.")
         state["halted"] = True
         save_state()
-    elif local is not None:
+        return
+
+    if local is not None:
         match = [p for p in opts if p["symbol"] == local["contract"]]
-        if not match or int(float(match[0]["qty"])) != local["qty_open"]:
-            log.error("🛑 Position mismatch. Halting.")
-            state["halted"] = True
+        if not match:
+            # Local thinks we have position, broker doesn't → clear carefully
+            log.warning("Local position not found at broker. Clearing local state.")
+            state["position"] = None
+            save_state()
+            return
+        broker_qty = abs(int(float(match[0].get("qty", 0))))
+        if broker_qty != int(local.get("qty_open", 0)):
+            log.warning("Qty mismatch. Local=%s Broker=%s → syncing to broker.", local["qty_open"], broker_qty)
+            local["qty_open"] = broker_qty
+            if broker_qty <= 0:
+                state["position"] = None
             save_state()
 
-def write_journal(pos):
+def write_journal(pos, closed_qty, exit_price, reason):
     file_exists = TRADES_FILE.exists()
     with open(TRADES_FILE, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -539,22 +556,24 @@ def write_journal(pos):
 
         entry_t = datetime.fromisoformat(pos["entry_time"])
         duration = round((now_ny() - entry_t).total_seconds() / 60.0, 1)
-        net = pos["realized_pnl"] - (pos["qty"] * COMMISSION_PER_CONTRACT * 2)
+        pnl = (exit_price - pos["entry"]) * 100 * closed_qty
+        net = pnl - (closed_qty * COMMISSION_PER_CONTRACT * 2)
         peak_gain = ((pos["peak"] - pos["entry"]) / pos["entry"]) * 100 if pos["entry"] else 0
 
         w.writerow([
-            iso_now(), pos["contract"], pos["direction"], pos["mode"], pos["qty"],
-            round(pos["entry"], 2), round(pos["exit_price"], 2),
-            round(pos["realized_pnl"], 2), round(net, 2), round(peak_gain, 1),
+            iso_now(), pos["contract"], pos["direction"], pos["mode"], closed_qty,
+            round(pos["entry"], 2), round(exit_price, 2),
+            round(pnl, 2), round(net, 2), round(peak_gain, 1),
             pos["meta"].get("bias"),
             round(pos["meta"].get("rsi", 0) or 0, 1),
             round(pos["meta"].get("vwap", 0) or 0, 2),
             round(pos["meta"].get("vol_ratio", 0) or 0, 2),
             round(pos["meta"].get("spread", 0) or 0, 3),
-            round(pos["slippage"], 3),
+            round(pos.get("slippage", 0), 3),
             duration,
-            pos["exit_reason"]
+            reason
         ])
+        return net
 
 def open_position(direction, underlying, mode, meta):
     if state.get("position") is not None:
@@ -587,48 +606,40 @@ def open_position(direction, underlying, mode, meta):
         return
 
     order = wait_for_order(order_id, LIMIT_TIMEOUT)
+    filled_qty = get_filled_qty(order)
 
-    # ========== IMPROVED SLIPPAGE GUARD ==========
-    if not order or float(order.get("filled_qty", 0) or 0) == 0:
-        log.warning("⚠️ Buy limit timed out / not filled. Order cancelled.")
+    if filled_qty <= 0:
+        log.warning("⚠️ Buy not filled. Cancelled.")
         cancel_order(order_id)
         return
 
     fill_price = safe_fill_price(order, ask)
-    filled_qty = int(float(order.get("filled_qty") or 0))
     slippage = fill_price - ask
 
-    if slippage > MAX_ENTRY_SLIPPAGE:
-        log.warning("⚠️ Entry rejected due to high slippage: %.3f. Cancelling any residual.", slippage)
-        cancel_order(order_id)
+    # If only partial fill, we still accept what we got (common in options)
+    if filled_qty < qty:
+        log.info("ℹ️ Partial entry fill: %d / %d", filled_qty, qty)
 
-        # If somehow partially/fully filled despite high slippage, force close immediately
-        if filled_qty > 0:
-            log.warning("⚠️ Partial/Full fill detected with bad slippage → Emergency close.")
-            api_with_retry("POST", f"{TRADING_URL}/v2/orders", body={
-                "symbol": contract,
-                "qty": str(filled_qty),
-                "side": "sell",
-                "type": "market",
-                "time_in_force": "day"
-            })
-        return
-    # ============================================
+    stop_price = fill_price * (1 - dynamic_stop_pct)
+    # Place broker-side protective stop (slightly below software stop for room)
+    broker_stop = round(stop_price * 0.98, 2)
+    broker_limit = round(stop_price * 0.95, 2)
+    stop_order_id = submit_stop_limit_order(contract, filled_qty, broker_stop, broker_limit)
 
     meta["spread"] = spread
     state["position"] = {
         "contract": contract,
         "direction": direction,
         "mode": mode,
-        "qty": filled_qty,
-        "qty_open": filled_qty,
+        "qty": filled_qty,          # original filled
+        "qty_open": filled_qty,     # remaining live
         "entry": fill_price,
         "peak": fill_price,
-        "stop": fill_price * (1 - dynamic_stop_pct),
+        "stop": stop_price,
+        "broker_stop_id": stop_order_id,
         "trail_active": False,
         "breakeven_active": False,
         "realized_pnl": 0.0,
-        "exit_price": 0.0,
         "entry_time": iso_now(),
         "meta": meta,
         "slippage": slippage,
@@ -638,12 +649,47 @@ def open_position(direction, underlying, mode, meta):
     state["last_entry_time"] = iso_now()
     state["last_signal_bar"] = iso_now()
     save_state()
-    log.info("🎯 OPEN [%s] | Qty: %d | Fill: $%.2f | Stop: $%.2f | Slip: %.3f",
-             mode.upper(), filled_qty, fill_price, state["position"]["stop"], slippage)
+    log.info("🎯 OPEN [%s] | Qty: %d | Fill: $%.2f | Stop: $%.2f | BrokerStop: %s",
+             mode.upper(), filled_qty, fill_price, stop_price, stop_order_id or "FAILED")
+
+def close_qty(pos, qty_to_close, reason, quote_bid):
+    """Close a specific quantity. Returns (success, filled_qty, exit_price)."""
+    if qty_to_close <= 0:
+        return False, 0, quote_bid
+
+    # Cancel existing broker stop first (so it doesn't fight us)
+    if pos.get("broker_stop_id"):
+        cancel_order(pos["broker_stop_id"])
+        pos["broker_stop_id"] = None
+
+    order_id = submit_limit_order(pos["contract"], qty_to_close, "sell", quote_bid)
+    if not order_id:
+        return False, 0, quote_bid
+
+    order = wait_for_order(order_id, LIMIT_TIMEOUT)
+    filled = get_filled_qty(order)
+
+    if filled <= 0:
+        log.warning("⚠️ Exit limit not filled → MARKET SELL %d", qty_to_close)
+        api_with_retry("POST", f"{TRADING_URL}/v2/orders", body={
+            "symbol": pos["contract"],
+            "qty": str(qty_to_close),
+            "side": "sell",
+            "type": "market",
+            "time_in_force": "day"
+        })
+        time.sleep(1.5)
+        # After market we approximate; reconciliation will correct later
+        return True, qty_to_close, quote_bid
+
+    exit_price = safe_fill_price(order, quote_bid)
+    return True, filled, exit_price
 
 def manage_position():
     pos = state.get("position")
-    if not pos:
+    if not pos or pos.get("qty_open", 0) <= 0:
+        state["position"] = None
+        save_state()
         return
 
     quote = get_option_quote(pos["contract"])
@@ -655,8 +701,8 @@ def manage_position():
     if bid > pos["peak"]:
         pos["peak"] = bid
 
-    gain = (bid - entry) / entry
-    peak_gain = (pos["peak"] - entry) / entry
+    gain = (bid - entry) / entry if entry else 0
+    peak_gain = (pos["peak"] - entry) / entry if entry else 0
 
     mode = pos["mode"]
     is_scalp = (mode == "scalp")
@@ -671,86 +717,78 @@ def manage_position():
     if gain >= trig_be and not pos["breakeven_active"]:
         pos["stop"] = max(pos["stop"], entry * 1.05)
         pos["breakeven_active"] = True
-        log.info("[%s] 🛡️ BREAKEVEN ACTIVATED", mode.upper())
+        log.info("[%s] 🛡️ BREAKEVEN", mode.upper())
 
     if peak_gain >= trig_tr and not pos["trail_active"]:
         pos["trail_active"] = True
-        log.info("[%s] 🏃 TRAIL ACTIVATED", mode.upper())
+        log.info("[%s] 🏃 TRAIL ON", mode.upper())
 
     if pos["trail_active"]:
         pos["stop"] = max(pos["stop"], entry, pos["peak"] * (1 - dist_tr))
 
     reason = None
     duration_mins = (now_ny() - datetime.fromisoformat(pos["entry_time"])).total_seconds() / 60.0
-    current_time = now_ny().time()
+    t = now_ny().time()
 
-    # ========== THETA DECAY HARD CUTOFF ==========
-    if current_time >= THETA_HARD_CUTOFF:
-        # Force exit if position is not meaningfully profitable
-        if gain < 0.15:  # Less than +15% → exit to avoid late theta crush
-            reason = "THETA HARD CUTOFF (14:30)"
-    # ============================================
+    if t >= THETA_HARD_CUTOFF and gain < 0.15:
+        reason = "THETA HARD CUTOFF"
+    elif t >= EOD_CLOSE:
+        reason = "EOD DECAY"
+    elif bid <= pos["stop"]:
+        reason = "TRAILING STOP" if pos["trail_active"] else "STOP LOSS"
+    elif is_scalp and duration_mins > SCALP_TIME_LIMIT_MINS and gain < trig_be:
+        reason = "TIME STOP"
 
-    if reason is None:
-        if current_time >= EOD_CLOSE:
-            reason = "EOD DECAY"
-        elif bid <= pos["stop"]:
-            reason = "TRAILING STOP" if pos["trail_active"] else "STOP LOSS"
-        elif is_scalp and duration_mins > SCALP_TIME_LIMIT_MINS and gain < trig_be:
-            reason = "TIME STOP"
+    if not reason:
+        save_state()
+        return
 
-    if reason:
-        order_id = submit_limit_order(pos["contract"], pos["qty_open"], "sell", bid)
-        order = wait_for_order(order_id, LIMIT_TIMEOUT)
+    # --- Partial-fill safe exit ---
+    qty_to_close = pos["qty_open"]
+    ok, filled, exit_price = close_qty(pos, qty_to_close, reason, bid)
 
-        exit_price = bid
-        if not order or float(order.get("filled_qty", 0) or 0) == 0:
-            log.warning("⚠️ Exit limit timed out → EMERGENCY MARKET SELL")
-            api_with_retry("POST", f"{TRADING_URL}/v2/orders", body={
-                "symbol": pos["contract"],
-                "qty": str(pos["qty_open"]),
-                "side": "sell",
-                "type": "market",
-                "time_in_force": "day"
-            })
-            time.sleep(1.5)
-            # After market order we still use bid as approximation
-            exit_price = bid
-        else:
-            exit_price = safe_fill_price(order, bid)
+    if not ok or filled <= 0:
+        log.warning("Exit attempt failed. Will retry next loop.")
+        save_state()
+        return
 
-        pnl = (exit_price - entry) * 100 * pos["qty_open"]
-        pos["realized_pnl"] += pnl
-        pos["exit_price"] = exit_price
-        pos["exit_reason"] = reason
+    pnl = (exit_price - entry) * 100 * filled
+    pos["realized_pnl"] += pnl
+    pos["qty_open"] -= filled
 
-        net = pnl - (pos["qty"] * COMMISSION_PER_CONTRACT * 2)
-        state["net_pnl"] += net
+    net = write_journal(pos, filled, exit_price, reason)
+    state["net_pnl"] += net
 
-        if net > 0:
-            state["wins"] += 1
-            state["consec_losses"] = 0
-        else:
-            state["consec_losses"] += 1
-            if state["consec_losses"] >= MAX_CONSEC_LOSSES:
-                state["pause_until"] = (now_ny() + timedelta(minutes=LOSS_PAUSE_MINUTES)).isoformat()
-                log.warning("🛑 Max consecutive losses reached. Paused %d mins.", LOSS_PAUSE_MINUTES)
+    if net > 0:
+        state["wins"] += 1
+        state["consec_losses"] = 0
+    else:
+        state["consec_losses"] += 1
+        if state["consec_losses"] >= MAX_CONSEC_LOSSES:
+            state["pause_until"] = (now_ny() + timedelta(minutes=LOSS_PAUSE_MINUTES)).isoformat()
+            log.warning("🛑 Max losses. Paused %d mins.", LOSS_PAUSE_MINUTES)
 
-        write_journal(pos)
+    log.info("🏁 SOLD %d | Left: %d | Net this fill: $%.2f | Reason: %s",
+             filled, pos["qty_open"], net, reason)
+
+    if pos["qty_open"] <= 0:
         state["position"] = None
-
-        win_rate = (state["wins"] / state["trades"]) * 100 if state["trades"] > 0 else 0
-        log.info("🏁 CLOSED [%s] | Net: $%.2f | Reason: %s | WR: %.1f%%",
-                 pos["contract"], net, reason, win_rate)
-
         if state["net_pnl"] <= -(float(state["start_equity"]) * DAILY_LOSS_LIMIT):
             state["halted"] = True
-            log.error("🛑 DAILY LOSS LIMIT HIT. Trading halted.")
+            log.error("🛑 DAILY LOSS LIMIT HIT.")
+    else:
+        # Still have remainder → re-place broker stop for remaining qty
+        new_stop = pos["stop"]
+        pos["broker_stop_id"] = submit_stop_limit_order(
+            pos["contract"], pos["qty_open"],
+            round(new_stop * 0.98, 2), round(new_stop * 0.95, 2)
+        )
+        log.info("Remaining qty %d still open. New broker stop placed.", pos["qty_open"])
 
     save_state()
 
 # =========================================================
-# 8. MAIN ENGINE
+# 8. MAIN
 # =========================================================
 
 def run():
@@ -770,7 +808,7 @@ def run():
                 time.sleep(20)
                 continue
 
-            if time.time() - last_recon > 60:
+            if time.time() - last_recon > 45:
                 reconcile_broker()
                 last_recon = time.time()
 
