@@ -46,17 +46,20 @@ HISTORY_DAYS = 90
 LIVE_DAYS = 5
 FORECAST_HORIZON = 5
 
-# =========================================================
+# # =========================================================
 # 2) إعدادات Alpaca
 # =========================================================
 
-API_KEY = (os.getenv("ALPACA_API_KEY") or "").strip()
-API_SECRET = (os.getenv("ALPACA_API_SECRET") or "").strip()
+# جلب المفاتيح مع دعم كافة التسميات الشائعة في المنصات السحابية
+API_KEY = (os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID") or os.getenv("APCA-API-KEY-ID") or "").strip()
+API_SECRET = (os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY") or os.getenv("APCA-API-SECRET-KEY") or "").strip()
+
 DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
 TRADING_URL = os.getenv("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
 STOCK_FEED = "iex"
 
 HEADERS = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET, "Content-Type": "application/json"}
+
 
 # =========================================================
 # 3) المخاطر، التوزيع الاستراتيجي، وحماية الأرباح
