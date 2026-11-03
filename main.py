@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 =========================================================
-صَفاء التحليل v83.1 (INTEGRITY PATCH + ACCOUNT DIAG)
+صَفاء التحليل v83.1 (INTEGRITY PATCH + FLEX CREDENTIALS)
 SPY 0-DTE | PAPER TRADING ONLY
 =========================================================
 """
@@ -26,6 +26,20 @@ def env_float(name, default):
 
 def env_int(name, default):
     return int(os.getenv(name, default))
+
+def env_first(*names, default=""):
+    for name in names:
+        val = os.getenv(name)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return default
+
+def env_name_found(names):
+    for name in names:
+        val = os.getenv(name)
+        if val is not None and str(val).strip():
+            return name
+    return "NONE"
 
 RISK_PER_TRADE = env_float("RISK_PER_TRADE", "0.015")
 MAX_PREMIUM_PCT = env_float("MAX_PREMIUM_PCT", "0.10")
@@ -65,10 +79,35 @@ SIGNAL_END = dtime(14, 0)
 THETA_HARD_CUTOFF = dtime(14, 30)
 EOD_CLOSE = dtime(15, 45)
 
-API_KEY = (os.getenv("ALPACA_API_KEY") or "").strip()
-API_SECRET = (os.getenv("ALPACA_API_SECRET") or "").strip()
-TRADING_URL = os.getenv("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
-DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+KEY_NAMES = [
+    "ALPACA_API_KEY",
+    "APCA_API_KEY_ID",
+    "ALPACA_KEY",
+    "API_KEY",
+    "APCA_API_KEY",
+]
+SECRET_NAMES = [
+    "ALPACA_API_SECRET",
+    "APCA_API_SECRET_KEY",
+    "ALPACA_SECRET",
+    "API_SECRET",
+    "APCA_API_SECRET",
+]
+
+API_KEY = env_first(*KEY_NAMES)
+API_SECRET = env_first(*SECRET_NAMES)
+TRADING_URL = env_first(
+    "ALPACA_TRADING_URL",
+    "APCA_API_BASE_URL",
+    "TRADING_URL",
+    default="https://paper-api.alpaca.markets",
+).rstrip("/")
+DATA_URL = env_first(
+    "ALPACA_DATA_URL",
+    "APCA_DATA_URL",
+    "DATA_URL",
+    default="https://data.alpaca.markets",
+).rstrip("/")
 STOCK_FEED = "iex"
 OPTIONS_FEED = "indicative"
 
@@ -1273,7 +1312,10 @@ def reconcile():
 
 def get_equity():
     if not API_KEY or not API_SECRET:
-        log.error("Missing API credentials (ALPACA_API_KEY / ALPACA_API_SECRET)")
+        log.error(
+            "Missing API credentials | tried keys=%s | tried secrets=%s",
+            KEY_NAMES, SECRET_NAMES,
+        )
         return 0.0
     ok, acc = api_get(f"{TRADING_URL}/v2/account")
     if not ok:
@@ -1822,8 +1864,12 @@ def _continue_exit(pos):
 def run():
     log.info("SAFAA %s", VERSION)
     log.info(
-        "TRADING_URL=%s | key_set=%s | secret_set=%s",
-        TRADING_URL, bool(API_KEY), bool(API_SECRET),
+        "TRADING_URL=%s | key_set=%s | secret_set=%s | key_from=%s | secret_from=%s",
+        TRADING_URL,
+        bool(API_KEY),
+        bool(API_SECRET),
+        env_name_found(KEY_NAMES),
+        env_name_found(SECRET_NAMES),
     )
     eq = get_equity()
     if eq <= 0:
