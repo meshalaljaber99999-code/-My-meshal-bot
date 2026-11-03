@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 =========================================================
-صَفاء التحليل v86.1 (ULTRA-FAST WITH FLUSH OLD POSITIONS)
+صَفاء التحليل v86.2 (RATE-LIMIT SAFE & STABLE EXECUTION)
 Platform: Alpaca Paper Trading
 Deployment: Railway (Includes Flask Keep-Alive Port)
 =========================================================
@@ -26,7 +26,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "Safaa Quant High-Speed Engine Active!", 200
+    return "Safaa Quant Stable Engine Active!", 200
 
 def start_flask():
     port = int(os.getenv("PORT", 8080))
@@ -35,9 +35,9 @@ def start_flask():
 Thread(target=start_flask, daemon=True).start()
 
 # ---------------------------------------------------------
-# 2. الإعدادات وسرعة الأداء
+# 2. الإعدادات وتفادي Rate Limit
 # ---------------------------------------------------------
-VERSION = "v86.1-FastExecution-AutoFlush"
+VERSION = "v86.2-RateLimitSafe"
 SYMBOL = "SPY"
 NY = ZoneInfo("America/New_York")
 
@@ -50,22 +50,21 @@ def env_first(*names, default=""):
             return str(val).strip()
     return default
 
-VIRTUAL_CAPITAL = 1000.0  # رأس مال ثابت 1000 دولار
+VIRTUAL_CAPITAL = 1000.0
 
-# إعدادات السرعة والتذبذب العالي
-LOOP_INTERVAL_SEC = 0.2         # فحص متواصل كل 200 مللي ثانية
-MAX_SPREAD_PCT = 0.12            # رفع السبريد المقبول إلى 12%
-MAX_PREMIUM_PCT = 0.20          # تخصيص 20% كحد أقصى للصفقة الواحدة
+# زيادة زمن الفحص لعدم تجاوز حد 200 طلب/دقيقة في Alpaca
+LOOP_INTERVAL_SEC = 0.4         # فحص كل 400 مللي ثانية (آمن تماماً)
+MAX_SPREAD_PCT = 0.12
+MAX_PREMIUM_PCT = 0.20
 
-# قواعد حماية الأرباح عند التذبذب
-UNDERLYING_TRAIL_DIST = 0.25    # إغلاق الصفقة لحماية الربح إذا تراجع SPY بـ 0.25$
-BREAKEVEN_TRIGGER = 0.12        # نقل الوقف للمربح عند ربح 12%
-OPTION_TRAIL_ACTIVATION = 0.25  # تفعيل الوقف المتحرك للعقد عند ربح 25%
-OPTION_TRAIL_DISTANCE = 0.08    # مسافة التتبع 8%
+UNDERLYING_TRAIL_DIST = 0.25
+BREAKEVEN_TRIGGER = 0.12
+OPTION_TRAIL_ACTIVATION = 0.25
+OPTION_TRAIL_DISTANCE = 0.08
 
 DEEP_OTM_MIN_PRICE = 0.10
 DEEP_OTM_MAX_PRICE = 0.60
-QUICK_PROFIT_TARGET_USD = 0.40  # جني أرباح سريع إذا ارتفع العقد 0.40$
+QUICK_PROFIT_TARGET_USD = 0.40
 
 SIGNAL_START = dtime(9, 45)
 SIGNAL_END = dtime(14, 0)
@@ -95,35 +94,40 @@ session = requests.Session()
 session.headers.update(HEADERS)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("SAFAA_FAST")
+log = logging.getLogger("SAFAA_SAFE")
 
 def now_ny(): return datetime.now(NY)
 def today(): return now_ny().date().isoformat()
 def iso_now(): return now_ny().isoformat(timespec="seconds")
 
 # ---------------------------------------------------------
-# 3. محرك الاتصال السريع (Fast API Session)
+# 3. محرك الاتصال الآمن مع حماية Rate-Limit
 # ---------------------------------------------------------
-def api_get(url, params=None):
-    try:
-        r = session.get(url, params=params, timeout=3)
-        return r.ok, (r.json() if r.content else {})
-    except Exception:
-        return False, {}
+def safe_api_call(method, url, params=None, json_body=None, max_retries=3):
+    """إرسال الطلبات مع إعادة المحاولة تلقائياً عند ظهور خطأ Too Many Requests (429)"""
+    for attempt in range(max_retries):
+        try:
+            if method == "GET":
+                r = session.get(url, params=params, timeout=4)
+            elif method == "POST":
+                r = session.post(url, json=json_body, timeout=4)
+            elif method == "DELETE":
+                r = session.delete(url, timeout=5)
 
-def api_post(url, body):
-    try:
-        r = session.post(url, json=body, timeout=3)
-        return r.ok, (r.json() if r.content else {}), r.status_code
-    except Exception as e:
-        return False, {"error": str(e)}, None
+            if r.status_code == 429:  # Too Many Requests
+                log.warning("⚠️ Rate limit hit (429). Waiting 2 seconds before retry...")
+                time.sleep(2)
+                continue
 
-def api_delete(url):
-    try:
-        r = session.delete(url, timeout=5)
-        return r.ok, (r.json() if r.content else {}), r.status_code
-    except Exception as e:
-        return False, {"error": str(e)}, None
+            return r.ok, (r.json() if r.content else {}), r.status_code
+        except Exception as e:
+            log.error("API Call Error: %s", e)
+            time.sleep(1)
+    return False, {}, 429
+
+def api_get(url, params=None): return safe_api_call("GET", url, params=params)[:2]
+def api_post(url, body): return safe_api_call("POST", url, json_body=body)
+def api_delete(url): return safe_api_call("DELETE", url)
 
 # ---------------------------------------------------------
 # 4. الحالة العامة
@@ -154,29 +158,54 @@ def new_state():
 state = load_state()
 
 # ---------------------------------------------------------
-# 5. تنظيف وتصفية الصفقات والأوامر القديمة
+# 5. تنظيف وتصفية الصفقات القوي والتجزيئي (Batched Flush)
 # ---------------------------------------------------------
 def close_all_old_positions_and_orders():
-    """تغلق جميع الصفقات المفتوحة وتلغي الأوامر المعلقة في Alpaca وتصفر حالة البوت"""
-    log.info("🧹 FLUSHING OLD POSITIONS & ORDERS...")
+    """تصفية إجبارية وتجزيئية لكافة الصفقات والأوامر القديمة"""
+    log.info("🧹 FLUSHING OLD POSITIONS & ORDERS SAFELY...")
     
-    # 1. إلغاء جميع الأوامر المفتوحة
-    ok, res, _ = api_delete(f"{TRADING_URL}/v2/orders")
-    if ok:
-        log.info("✅ Cancelled all existing pending orders.")
+    # 1. إلغاء جميع الأوامر المعلقة
+    api_delete(f"{TRADING_URL}/v2/orders")
+    
+    # 2. جلب جميع الصفقات المفتوحة في الحساب
+    ok, positions = api_get(f"{TRADING_URL}/v2/positions")
+    if ok and isinstance(positions, list):
+        for pos in positions:
+            symbol = pos.get("symbol")
+            total_qty = abs(int(float(pos.get("qty", 0))))
+            if total_qty == 0:
+                continue
 
-    # 2. إغلاق جميع عقود الخيارات والأسهم المفتوحة فوراً
-    ok, res, _ = api_delete(f"{TRADING_URL}/v2/positions")
-    if ok:
-        log.info("✅ Closed all existing open positions on Alpaca.")
-    else:
-        log.warning("⚠️ Could not close existing positions automatically: %s", res)
+            log.info("Closing open position: %s | Total Qty: %d", symbol, total_qty)
 
-    # 3. إعادة تصفير صفقة البوت في الذاكرة
-    if state.get("position"):
-        log.info("🧹 Resetting local active position state.")
-        state["position"] = None
-        save_state()
+            # إغلاق على دفعات لتجنب الرفض بسبب الكمية الكبيرة
+            batch_size = 100
+            remaining = total_qty
+            
+            while remaining > 0:
+                current_batch = min(remaining, batch_size)
+                st, res, code = api_post(f"{TRADING_URL}/v2/orders", {
+                    "symbol": symbol,
+                    "qty": str(current_batch),
+                    "side": "sell",
+                    "type": "market",
+                    "time_in_force": "day"
+                })
+                if st:
+                    log.info("✅ Batch of %d units sent for %s", current_batch, symbol)
+                    remaining -= current_batch
+                else:
+                    log.warning("⚠️ Failed batch sell for %s: %s", symbol, res)
+                    break
+                time.sleep(0.5)
+
+    # 3. محاولة تصفية شامّلة إضافية عبر API
+    api_delete(f"{TRADING_URL}/v2/positions")
+
+    # 4. تصفير الذاكرة المحفوظة
+    state["position"] = None
+    save_state()
+    log.info("✅ Local state and positions successfully cleaned.")
 
 # ---------------------------------------------------------
 # 6. البيانات والأسعار اللحظية
@@ -211,7 +240,7 @@ def get_option_quote(symbol):
     return (bid, ask) if bid > 0 and ask > 0 else None
 
 # ---------------------------------------------------------
-# 7. اقتناص وشراء العقود بسرعة
+# 7. اقتناص وشراء العقود
 # ---------------------------------------------------------
 def choose_contract_fast(direction, underlying_price, high_confidence=False):
     opt_type = "call" if direction == "up" else "put"
@@ -294,7 +323,7 @@ def open_position_fast(direction, underlying_price, high_confidence=False):
     log.info("⚡ FAST ENTRY | Contract: %s | Qty: %d | Ask: $%.2f | SPY: $%.2f", contract, qty, ask, underlying_price)
 
 # ---------------------------------------------------------
-# 8. إدارة الصفقة فائقة السرعة
+# 8. إدارة الصفقة
 # ---------------------------------------------------------
 def manage_position_fast(current_underlying_price):
     pos = state.get("position")
@@ -365,12 +394,12 @@ def close_position_fast(pos, exit_price, reason):
 # 9. الحلقة الرئيسية
 # ---------------------------------------------------------
 def run():
-    log.info("⚡ SAFAA ULTRA-FAST ENGINE %s STARTED", VERSION)
+    log.info("⚡ SAFAA ENGINE %s STARTED", VERSION)
     if not state:
         state.update(new_state())
         save_state()
 
-    # إغلاق أي صفقات قديمة في Alpaca فور إقلاع البوت
+    # تنظيف وتصفية الصفقات والأوامر بشكل آمن
     close_all_old_positions_and_orders()
 
     while True:
