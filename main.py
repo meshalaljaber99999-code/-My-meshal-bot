@@ -1,16 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 =========================================================
-صَفاء التحليل v83.0 (INTEGRITY PATCH)
+صَفاء التحليل v83.1 (INTEGRITY PATCH + ACCOUNT DIAG)
 SPY 0-DTE | PAPER TRADING ONLY
 =========================================================
-Patches on v82:
-1. Partial fills during protect-arming → re-read broker qty; never flatten with stale entry qty
-2. resolve_entry_intent handles flatten stage / successful flatten without false HALT
-3. Fill ledger validates side=sell, symbol match; inconsistent cumulative value → HALT
-4. Exit resubmit forbidden while client_order_id is pending discovery
-5. Flatten path harvests fills and retries settlement before HALT
-6. Option quote max age gate
+Changes from v83.0:
+- Clear account/equity diagnostics (no more silent No equity)
+- Startup log: TRADING_URL + whether keys are set
+- get_equity logs API failure body / parse errors
 =========================================================
 """
 
@@ -25,7 +22,7 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 import requests
 
-VERSION = "v83.0"
+VERSION = "v83.1"
 SYMBOL = "SPY"
 NY = ZoneInfo("America/New_York")
 
@@ -112,10 +109,11 @@ def api_get(url, params=None, retries=3):
                 return True, data
             if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep(backoff); backoff *= 2; continue
-            return False, data
-        except Exception:
+            return False, {"status_code": r.status_code, "body": data}
+        except Exception as e:
+            last_err = str(e)
             time.sleep(backoff); backoff *= 2
-    return False, {}
+    return False, {"error": "request_failed", "detail": last_err if "last_err" in dir() else "unknown"}
 
 def api_delete(url):
     try:
@@ -1200,8 +1198,23 @@ def reconcile():
     return not state.get("halted")
 
 def get_equity():
+    if not API_KEY or not API_SECRET:
+        log.error("Missing API credentials (ALPACA_API_KEY / ALPACA_API_SECRET)")
+        return 0.0
     ok, acc = api_get(f"{TRADING_URL}/v2/account")
-    return float(acc["equity"]) if ok else 0.0
+    if not ok:
+        log.error("Account API failed | url=%s | response=%s", TRADING_URL, acc)
+        return 0.0
+    try:
+        eq = float(acc.get("equity") or 0)
+        log.info(
+            "Account OK | equity=%.2f | status=%s | account=%s",
+            eq, acc.get("status"), acc.get("account_number"),
+        )
+        return eq
+    except Exception as e:
+        log.error("Equity parse error: %s | body=%s", e, acc)
+        return 0.0
 
 def roll_day():
     if state.get("date") == today():
@@ -1704,12 +1717,19 @@ def _continue_exit(pos):
 
 def run():
     log.info("SAFAA %s", VERSION)
+    log.info(
+        "TRADING_URL=%s | key_set=%s | secret_set=%s",
+        TRADING_URL, bool(API_KEY), bool(API_SECRET),
+    )
     eq = get_equity()
     if eq <= 0:
-        log.error("No equity")
+        log.error("No equity (see Account API logs above)")
         return
     if not state:
         state.update(new_state(eq))
+        save_state()
+    elif not state.get("start_equity"):
+        state["start_equity"] = eq
         save_state()
     reconcile()
 
@@ -1719,30 +1739,3 @@ def run():
             ok, clock = api_get(f"{TRADING_URL}/v2/clock")
             if not ok or not clock.get("is_open"):
                 time.sleep(20)
-                continue
-            if not roll_day():
-                time.sleep(20)
-                continue
-            if time.time() - last > 30:
-                reconcile()
-                last = time.time()
-            refresh_bias()
-            check_daily_limit()
-            if state.get("position"):
-                manage_position()
-            if (not state.get("halted") and not state.get("broker_uncertain")
-                    and not state.get("position") and not state.get("entry_intent")):
-                n = now_ny().time()
-                if SIGNAL_START <= n <= SIGNAL_END:
-                    sig = opening_range_signal()
-                    if sig:
-                        open_position(*sig)
-            time.sleep(2)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            log.exception("Loop %s", e)
-            time.sleep(5)
-
-if __name__ == "__main__":
-    run()
