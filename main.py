@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 =========================================================
-صَفاء التحليل v86.0 (ULTRA-FAST HIGH VOLATILITY EDITION)
+صَفاء التحليل v86.1 (ULTRA-FAST WITH FLUSH OLD POSITIONS)
 Platform: Alpaca Paper Trading
 Deployment: Railway (Includes Flask Keep-Alive Port)
 =========================================================
@@ -37,7 +37,7 @@ Thread(target=start_flask, daemon=True).start()
 # ---------------------------------------------------------
 # 2. الإعدادات وسرعة الأداء
 # ---------------------------------------------------------
-VERSION = "v86.0-FastExecution"
+VERSION = "v86.1-FastExecution-AutoFlush"
 SYMBOL = "SPY"
 NY = ZoneInfo("America/New_York")
 
@@ -53,13 +53,13 @@ def env_first(*names, default=""):
 VIRTUAL_CAPITAL = 1000.0  # رأس مال ثابت 1000 دولار
 
 # إعدادات السرعة والتذبذب العالي
-LOOP_INTERVAL_SEC = 0.2         # فحص متواصل كل 200 مللي ثانية بدلاً من ثانتين
-MAX_SPREAD_PCT = 0.12            # رفع السبريد المقبول إلى 12% لمواكبة التذبذب العالي
-MAX_PREMIUM_PCT = 0.20          # تخصيص 20% كحد أقصى للصفقة الواحدة (200$)
+LOOP_INTERVAL_SEC = 0.2         # فحص متواصل كل 200 مللي ثانية
+MAX_SPREAD_PCT = 0.12            # رفع السبريد المقبول إلى 12%
+MAX_PREMIUM_PCT = 0.20          # تخصيص 20% كحد أقصى للصفقة الواحدة
 
 # قواعد حماية الأرباح عند التذبذب
-UNDERLYING_TRAIL_DIST = 0.25    # إغلاق الصفقة لحماية الربح إذا تراجع SPY بـ 0.25$ عن القمة
-BREAKEVEN_TRIGGER = 0.12        # نقل الوقف للمربح عند ربح 12% على العقد
+UNDERLYING_TRAIL_DIST = 0.25    # إغلاق الصفقة لحماية الربح إذا تراجع SPY بـ 0.25$
+BREAKEVEN_TRIGGER = 0.12        # نقل الوقف للمربح عند ربح 12%
 OPTION_TRAIL_ACTIVATION = 0.25  # تفعيل الوقف المتحرك للعقد عند ربح 25%
 OPTION_TRAIL_DISTANCE = 0.08    # مسافة التتبع 8%
 
@@ -91,7 +91,6 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-# استخدام Persistent HTTP Session للسرعة العالية
 session = requests.Session()
 session.headers.update(HEADERS)
 
@@ -115,6 +114,13 @@ def api_get(url, params=None):
 def api_post(url, body):
     try:
         r = session.post(url, json=body, timeout=3)
+        return r.ok, (r.json() if r.content else {}), r.status_code
+    except Exception as e:
+        return False, {"error": str(e)}, None
+
+def api_delete(url):
+    try:
+        r = session.delete(url, timeout=5)
         return r.ok, (r.json() if r.content else {}), r.status_code
     except Exception as e:
         return False, {"error": str(e)}, None
@@ -148,7 +154,32 @@ def new_state():
 state = load_state()
 
 # ---------------------------------------------------------
-# 5. البيانات والأسعار اللحظية
+# 5. تنظيف وتصفية الصفقات والأوامر القديمة
+# ---------------------------------------------------------
+def close_all_old_positions_and_orders():
+    """تغلق جميع الصفقات المفتوحة وتلغي الأوامر المعلقة في Alpaca وتصفر حالة البوت"""
+    log.info("🧹 FLUSHING OLD POSITIONS & ORDERS...")
+    
+    # 1. إلغاء جميع الأوامر المفتوحة
+    ok, res, _ = api_delete(f"{TRADING_URL}/v2/orders")
+    if ok:
+        log.info("✅ Cancelled all existing pending orders.")
+
+    # 2. إغلاق جميع عقود الخيارات والأسهم المفتوحة فوراً
+    ok, res, _ = api_delete(f"{TRADING_URL}/v2/positions")
+    if ok:
+        log.info("✅ Closed all existing open positions on Alpaca.")
+    else:
+        log.warning("⚠️ Could not close existing positions automatically: %s", res)
+
+    # 3. إعادة تصفير صفقة البوت في الذاكرة
+    if state.get("position"):
+        log.info("🧹 Resetting local active position state.")
+        state["position"] = None
+        save_state()
+
+# ---------------------------------------------------------
+# 6. البيانات والأسعار اللحظية
 # ---------------------------------------------------------
 def get_stock_bars(symbol, start, end):
     params = {
@@ -180,7 +211,7 @@ def get_option_quote(symbol):
     return (bid, ask) if bid > 0 and ask > 0 else None
 
 # ---------------------------------------------------------
-# 6. اقتناص وشراء العقود بسرعة
+# 7. اقتناص وشراء العقود بسرعة
 # ---------------------------------------------------------
 def choose_contract_fast(direction, underlying_price, high_confidence=False):
     opt_type = "call" if direction == "up" else "put"
@@ -238,7 +269,7 @@ def open_position_fast(direction, underlying_price, high_confidence=False):
         "symbol": contract,
         "qty": str(qty),
         "side": "buy",
-        "type": "market",  # شراء بسعر السوق لتنفيذ فوري ومباشر في التذبذب العالي
+        "type": "market",
         "time_in_force": "day",
         "client_order_id": f"f-{uuid.uuid4().hex[:10]}",
     })
@@ -263,7 +294,7 @@ def open_position_fast(direction, underlying_price, high_confidence=False):
     log.info("⚡ FAST ENTRY | Contract: %s | Qty: %d | Ask: $%.2f | SPY: $%.2f", contract, qty, ask, underlying_price)
 
 # ---------------------------------------------------------
-# 7. إدارة الصفقة فائقة السرعة
+# 8. إدارة الصفقة فائقة السرعة
 # ---------------------------------------------------------
 def manage_position_fast(current_underlying_price):
     pos = state.get("position")
@@ -276,7 +307,6 @@ def manage_position_fast(current_underlying_price):
     bid = q[0]
     direction = pos["direction"]
 
-    # تحديث الـ Peak للمؤشر والعقد
     if direction == "up":
         if current_underlying_price > pos["peak_underlying"]:
             pos["peak_underlying"] = current_underlying_price
@@ -290,20 +320,17 @@ def manage_position_fast(current_underlying_price):
     option_gain = bid - pos["entry"]
     gain_pct = option_gain / pos["entry"]
 
-    # 1. حماية الأرباح فور تراجع المؤشر عند التذبذب
     pullback = (pos["peak_underlying"] - current_underlying_price) if direction == "up" else (current_underlying_price - pos["peak_underlying"])
     if pullback >= UNDERLYING_TRAIL_DIST and gain_pct > 0.08:
         log.info("⚡ FAST PROFIT PROTECT: SPY Pulled back $%.2f. Closing immediately!", pullback)
         close_position_fast(pos, bid, "FAST_UNDERLYING_PROTECT")
         return
 
-    # 2. جني أرباح سريع للعقود البعيدة
     if pos.get("high_confidence") and option_gain >= QUICK_PROFIT_TARGET_USD:
         log.info("⚡ QUICK TARGET HIT ($+0.40)! Closing OTM Position.")
         close_position_fast(pos, bid, "QUICK_OTM_TARGET")
         return
 
-    # 3. trailing stop
     if gain_pct >= BREAKEVEN_TRIGGER and pos["stop"] < pos["entry"]:
         pos["stop"] = pos["entry"] * 1.01
 
@@ -320,7 +347,7 @@ def close_position_fast(pos, exit_price, reason):
         "symbol": pos["contract"],
         "qty": str(pos["qty"]),
         "side": "sell",
-        "type": "market",  # أمر ماركت فورس لإغلاق سريع جداً
+        "type": "market",
         "time_in_force": "day",
     })
 
@@ -335,13 +362,16 @@ def close_position_fast(pos, exit_price, reason):
     save_state()
 
 # ---------------------------------------------------------
-# 8. الحلقة الرئيسية ذات الاستجابة الفائقة (200ms)
+# 9. الحلقة الرئيسية
 # ---------------------------------------------------------
 def run():
     log.info("⚡ SAFAA ULTRA-FAST ENGINE %s STARTED", VERSION)
     if not state:
         state.update(new_state())
         save_state()
+
+    # إغلاق أي صفقات قديمة في Alpaca فور إقلاع البوت
+    close_all_old_positions_and_orders()
 
     while True:
         try:
@@ -369,7 +399,7 @@ def run():
                     elif last_price < vwap * 0.9990:
                         open_position_fast("down", last_price, high_confidence=high_conf)
 
-            time.sleep(LOOP_INTERVAL_SEC)  # استجابة كل 0.2 ثانية لتغطية التذبذب السريع
+            time.sleep(LOOP_INTERVAL_SEC)
 
         except Exception as e:
             log.exception("Loop Error: %s", e)
