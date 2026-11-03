@@ -740,14 +740,22 @@ def get_stock_bars(symbol, start, end, timeframe="1Min"):
         }
         if token:
             params["page_token"] = token
+            
         ok, data = api_get(f"{DATA_URL}/v2/stocks/{symbol}/bars", params=params)
-        if not ok:
+        
+        # حماية مشددة لمنع الانهيار إذا كانت الاستجابة فارغة أو None
+        if not ok or not data or not isinstance(data, dict):
             break
-        bars.extend(data.get("bars", []))
+            
+        fetched_bars = data.get("bars")
+        if fetched_bars and isinstance(fetched_bars, list):
+            bars.extend(fetched_bars)
+            
         token = data.get("next_page_token")
         if not token:
             break
     return bars
+
 
 def session_bars():
     n = now_ny()
