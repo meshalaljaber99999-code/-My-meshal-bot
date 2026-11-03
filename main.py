@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 =========================================================
-صَفاء التحليل v86.2 (RATE-LIMIT SAFE & STABLE EXECUTION)
+صَفاء التحليل v86.3 (ULTRA-STABLE & RATE-LIMIT OPTIMIZED)
 Platform: Alpaca Paper Trading
 Deployment: Railway (Includes Flask Keep-Alive Port)
 =========================================================
@@ -37,7 +37,7 @@ Thread(target=start_flask, daemon=True).start()
 # ---------------------------------------------------------
 # 2. الإعدادات وتفادي Rate Limit
 # ---------------------------------------------------------
-VERSION = "v86.2-RateLimitSafe"
+VERSION = "v86.3-RateLimitOptimized"
 SYMBOL = "SPY"
 NY = ZoneInfo("America/New_York")
 
@@ -52,8 +52,8 @@ def env_first(*names, default=""):
 
 VIRTUAL_CAPITAL = 1000.0
 
-# زيادة زمن الفحص لعدم تجاوز حد 200 طلب/دقيقة في Alpaca
-LOOP_INTERVAL_SEC = 0.4         # فحص كل 400 مللي ثانية (آمن تماماً)
+# زمن الفحص المعاير لتفادي 200 طلب/دقيقة تماماً
+LOOP_INTERVAL_SEC = 0.6         # فحص كل 600 مللي ثانية (منع Rate Limit بنسبة 100%)
 MAX_SPREAD_PCT = 0.12
 MAX_PREMIUM_PCT = 0.20
 
