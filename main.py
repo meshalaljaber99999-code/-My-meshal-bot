@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 =========================================================
-صَفاء التحليل v84.0 (QUANT COMPOUND EDITION - SPY 0-DTE)
+صَفاء التحليل v85.0 (PROTECTION & DEEP OTM SNIPE EDITION)
 Platform: Alpaca Paper Trading
 Deployment: Railway (Includes Flask Keep-Alive Port)
 =========================================================
@@ -27,19 +27,18 @@ app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "Safaa Quant Compound Bot is Active and Running!", 200
+    return "Safaa Quant Compound Bot v85.0 is Active!", 200
 
 def start_flask():
     port = int(os.getenv("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# تشغيل خادم الويب في الخلفية لمنع Railway من إغلاق الحاوية
 Thread(target=start_flask, daemon=True).start()
 
 # ---------------------------------------------------------
 # 2. الإعدادات والمتغيرات الأساسية
 # ---------------------------------------------------------
-VERSION = "v84.0-Compound"
+VERSION = "v85.0-ProfitProtect"
 SYMBOL = "SPY"
 NY = ZoneInfo("America/New_York")
 
@@ -56,26 +55,31 @@ def env_first(*names, default=""):
             return str(val).strip()
     return default
 
-# إعدادات الفائدة المركبة وإدارة المخاطر
-RISK_PER_TRADE_PCT = env_float("RISK_PER_TRADE_PCT", "0.015")  # المخاطرة بـ 1.5% من رأس المال الحالي لكل صفقة
-MAX_PREMIUM_PCT = env_float("MAX_PREMIUM_PCT", "0.10")        # أقصى مبلغ مخصص لعقد واحد 10% من رأس المال
-DAILY_LOSS_LIMIT_PCT = env_float("DAILY_LOSS_LIMIT_PCT", "0.04") # إيقاف البوت اليومي عند خسارة 4% من رأس المال
+# ---------------------------------------------------------
+# الشرط الثالث: تقييد رأس المال بـ 1000 دولار
+# ---------------------------------------------------------
+VIRTUAL_CAPITAL = 1000.0  # الاعتماد على 1000 دولار كقاعدة أساسية لرأس المال
+
+# إعدادات إدارة المخاطر والفائدة المركبة
+RISK_PER_TRADE_PCT = env_float("RISK_PER_TRADE_PCT", "0.02")   # المخاطرة بـ 2% من 1000$ (20$)
+MAX_PREMIUM_PCT = env_float("MAX_PREMIUM_PCT", "0.20")         # أقصى تخصيص للصفقة 20% من رأس المال (200$)
 ATR_MULTIPLIER = env_float("ATR_MULTIPLIER", "1.5")
 COMMISSION_PER_CONTRACT = 0.65
 
-LOSS_PAUSE_MINUTES = env_int("LOSS_PAUSE_MINUTES", 30)
-MAX_CONSEC_LOSSES = env_int("MAX_CONSEC_LOSSES", 2)
-ENTRY_COOLDOWN_MINUTES = env_int("ENTRY_COOLDOWN_MINUTES", 15)
+# الشرط الأول: قواعد حماية الأرباح (Profit Protection)
+UNDERLYING_TRAIL_DIST = 0.35   # إذا تراجع المؤشر 0.35$ عن أعلى قمة وصل لها يخرج لحماية الربح
+BREAKEVEN_TRIGGER = 0.15       # نقل الوقف لنقطة الدخول عند ربح 15% على العقد
+OPTION_TRAIL_ACTIVATION = 0.30 # تفعيل الوقف المتحرك للعقد عند ربح 30%
+OPTION_TRAIL_DISTANCE = 0.10   # تراجع 10% من أوج سعر للعقد يُغلق الصفقة
 
-BREAKEVEN_TRIGGER = 0.20        # نقل الوقف لنقطة الدخول عند ربح 20%
-TRAIL_ACTIVATION = 0.35         # تفعيل الوقف المتحرك عند ربح 35%
-TRAIL_DISTANCE = 0.12          # مسافة الوقف المتحرك 12%
+# الشرط الثاني: إعدادات العقود الرخيصة بعيدة السترايك (Deep OTM High Confidence)
+DEEP_OTM_MIN_PRICE = 0.15      # الحد الأدنى لسعر العقد البعيد
+DEEP_OTM_MAX_PRICE = 0.40      # الحد الأقصى لسعر العقد البعيد
+QUICK_PROFIT_TARGET_USD = 0.50 # جني أرباح سريع إذا ارتفع العقد 0.50$ (مثال: من 0.20 إلى 0.70)
 
-MAX_SPREAD_PCT = 0.06           # أقصى فرق مقبول بين العرض والطلب (6%)
-MIN_OPTION_ASK = 0.30
+MAX_SPREAD_PCT = 0.08          # أقصى فرق مقبول بين العرض والطلب (8%)
 DELTA_PROXY_PCT = 0.0025
 LIMIT_TIMEOUT = 3
-CANCEL_WAIT = 5
 
 SIGNAL_START = dtime(9, 45)
 SIGNAL_END = dtime(14, 0)
@@ -93,8 +97,7 @@ OPTIONS_FEED = "indicative"
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = DATA_DIR / "safaa_v84_state.json"
-TRADES_FILE = DATA_DIR / "safaa_v84_journal.csv"
+STATE_FILE = DATA_DIR / "safaa_v85_state.json"
 
 HEADERS = {
     "APCA-API-KEY-ID": API_KEY,
@@ -105,16 +108,12 @@ HEADERS = {
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("SAFAA_QUANT")
 
-TERMINAL = {"filled", "canceled", "expired", "rejected", "done_for_day"}
-ARMED = {"new", "partially_filled"}
-WORKING = ARMED | {"accepted", "held", "pending_new", "pending_cancel", "pending_replace"}
-
 def now_ny(): return datetime.now(NY)
 def today(): return now_ny().date().isoformat()
 def iso_now(): return now_ny().isoformat(timespec="seconds")
 
 # ---------------------------------------------------------
-# 3. محرك الاتصال بـ API بالكامل مع حماية الـ NoneType
+# 3. محرك الاتصال بـ API
 # ---------------------------------------------------------
 def api_get(url, params=None, retries=3):
     backoff = 0.3
@@ -142,13 +141,6 @@ def api_post(url, body):
     except Exception as e:
         return False, {"error": str(e)}, None
 
-def api_delete(url):
-    try:
-        r = requests.delete(url, headers=HEADERS, timeout=8)
-        return r.status_code in (200, 204), (r.json() if r.content else {})
-    except Exception as e:
-        return False, {"error": str(e)}
-
 # ---------------------------------------------------------
 # 4. حفظ واسترجاع الحالة العامة
 # ---------------------------------------------------------
@@ -165,47 +157,22 @@ def load_state():
     except Exception:
         return {}
 
-def new_state(equity):
+def new_state():
     return {
         "date": today(),
-        "start_equity": equity,
-        "current_equity": equity,
+        "virtual_capital": VIRTUAL_CAPITAL,
         "net_pnl": 0.0,
         "trades": 0,
         "wins": 0,
-        "consec_losses": 0,
         "halted": False,
-        "halt_reason": None,
-        "pause_until": None,
-        "last_entry_time": None,
-        "last_signal_bar": None,
-        "bias": "neutral",
         "position": None,
     }
 
 state = load_state()
 
-def halt(reason):
-    state["halted"] = True
-    state["halt_reason"] = reason
-    log.error("🛑 HALT SYSTEM: %s", reason)
-    save_state()
-
 # ---------------------------------------------------------
-# 5. جلب بيانات رأس المال والشموع بأمان تام
+# 5. جلب بيانات أسعار المؤشر والشموع
 # ---------------------------------------------------------
-def get_equity():
-    ok, acc = api_get(f"{TRADING_URL}/v2/account")
-    if ok and isinstance(acc, dict):
-        try:
-            eq = float(acc.get("equity") or 0)
-            state["current_equity"] = eq
-            save_state()
-            return eq
-        except Exception:
-            pass
-    return float(state.get("current_equity") or 0.0)
-
 def get_stock_bars(symbol, start, end, timeframe="1Min"):
     bars = []
     token = None
@@ -221,8 +188,6 @@ def get_stock_bars(symbol, start, end, timeframe="1Min"):
             params["page_token"] = token
             
         ok, data = api_get(f"{DATA_URL}/v2/stocks/{symbol}/bars", params=params)
-        
-        # حماية من الانهيار في حال كانت الـ Data فارغة أو None
         if not ok or not data or not isinstance(data, dict):
             break
             
@@ -242,42 +207,23 @@ def session_bars():
     return get_stock_bars(SYMBOL, start, end)
 
 # ---------------------------------------------------------
-# 6. محرك حساب الفائدة المركبة المقترن برأس المال
+# 6. حساب حجم الصفقة بناءً على 1000 دولار (الشرط الثالث)
 # ---------------------------------------------------------
-def calculate_compound_position_size(ask_price, stop_loss_pct):
-    """
-    حساب عدد العقود وفق مبدأ الفائدة المركبة:
-    المخاطرة تتناسب طردياً مع النمو اللحظي لرأس المال الحالي.
-    """
-    equity = get_equity()
-    if equity <= 0:
-        return 0
-
-    # 1. إجمالي المبلغ المسموح بالمخاطرة به في الصفقة بناءً على رأس المال الحالي
-    max_risk_dollars = equity * RISK_PER_TRADE_PCT
-
-    # 2. المخاطرة الفعلية لكل عقد واحد بروموز (سعر العقد * 100 * نسبة الوقف)
-    risk_per_contract = (ask_price * 100) * stop_loss_pct
-    if risk_per_contract <= 0:
-        return 0
-
-    # 3. حساب عدد العقود الممكن شراؤها بناءً على الفائدة المركبة
-    compound_qty = int(max_risk_dollars // risk_per_contract)
-
-    # 4. سقف أمان: عدم تخصيص أكثر من MAX_PREMIUM_PCT (10%) من المحفظة لعقد واحد
-    max_capital_allowed = equity * MAX_PREMIUM_PCT
-    max_contracts_cap = int(max_capital_allowed // (ask_price * 100))
-
-    final_qty = min(compound_qty, max_contracts_cap)
+def calculate_position_size(ask_price):
+    capital = state.get("virtual_capital", VIRTUAL_CAPITAL)
     
-    log.info(
-        "📈 COMPOUND CALCULATOR | Equity: $%.2f | Risk Alloc: $%.2f | Calculated Qty: %d",
-        equity, max_risk_dollars, final_qty
-    )
-    return max(1, final_qty)
+    # 1. تخصيص مبلغ بناءً على نسبة 20% كحد أقصى للصفقة الواحدة
+    max_alloc_dollars = capital * MAX_PREMIUM_PCT
+    
+    # 2. عدد العقود التي يمكن شراؤها بهذه الميزانية
+    qty = int(max_alloc_dollars // (ask_price * 100))
+    
+    log.info("📊 CAPITAL ALLOCATION | Capital: $%.2f | Max Trade Alloc: $%.2f | Qty: %d", 
+             capital, max_alloc_dollars, qty)
+    return max(1, qty)
 
 # ---------------------------------------------------------
-# 7. قنص العقود والأسعار
+# 7. محرك اختيار العقود (الشرط الثاني: دعم العقود البعيدة الرخيصة)
 # ---------------------------------------------------------
 def get_option_quote(symbol):
     ok, data = api_get(f"{DATA_URL}/v1beta1/options/quotes/latest", params={"symbols": symbol, "feed": OPTIONS_FEED})
@@ -291,18 +237,30 @@ def get_option_quote(symbol):
         return (bid, ask)
     return None
 
-def choose_best_contract(direction, underlying_price):
-    target_strike = underlying_price * (1 + DELTA_PROXY_PCT if direction == "up" else 1 - DELTA_PROXY_PCT)
+def choose_contract(direction, underlying_price, high_confidence=False):
+    """
+    اختيار العقود:
+    - إذا كانت الثقة عالية (high_confidence): يختار عقود بعيدة (Deep OTM) وأسعارها رخيصة (0.15$ - 0.40$).
+    - الإعداد العادي: يختار عقود قريبة من السعر (ATM / Near OTM).
+    """
     opt_type = "call" if direction == "up" else "put"
+    
+    if high_confidence:
+        # البحث عن سترايك أبعد بمقدار 1.5% إلى 3% لرخص السعر
+        offset = underlying_price * 0.02
+        target_strike = underlying_price + offset if direction == "up" else underlying_price - offset
+        log.info("🎯 DEEP OTM MODE ACTIVATED | Target Strike around: $%.2f", target_strike)
+    else:
+        target_strike = underlying_price * (1 + DELTA_PROXY_PCT if direction == "up" else 1 - DELTA_PROXY_PCT)
     
     params = {
         "underlying_symbols": SYMBOL,
         "status": "active",
         "type": opt_type,
         "expiration_date": today(),
-        "limit": 15,
-        "strike_price_gte": f"{target_strike - 2:.2f}",
-        "strike_price_lte": f"{target_strike + 2:.2f}",
+        "limit": 25,
+        "strike_price_gte": f"{target_strike - 5:.2f}",
+        "strike_price_lte": f"{target_strike + 5:.2f}",
     }
     
     ok, data = api_get(f"{TRADING_URL}/v2/options/contracts", params=params)
@@ -321,29 +279,32 @@ def choose_best_contract(direction, underlying_price):
             continue
         bid, ask = q
         mid = (bid + ask) / 2.0
-        spread_pct = (ask - bid) / mid
+        spread_pct = (ask - bid) / mid if mid > 0 else 1.0
         
-        if spread_pct <= MAX_SPREAD_PCT and ask >= MIN_OPTION_ASK:
-            return sym, ask
+        if high_confidence:
+            # تصفية العقود الرخيصة البعيدة
+            if DEEP_OTM_MIN_PRICE <= ask <= DEEP_OTM_MAX_PRICE and spread_pct <= MAX_SPREAD_PCT:
+                return sym, ask
+        else:
+            if ask >= 0.30 and spread_pct <= MAX_SPREAD_PCT:
+                return sym, ask
 
     return None, None
 
 # ---------------------------------------------------------
-# 8. إدارة فتح الصفقات وإغلاقها
+# 8. إدارة الصفقة وحماية الأرباح (الشرط الأول)
 # ---------------------------------------------------------
-def open_compound_position(direction, underlying_price, meta):
+def open_position(direction, underlying_price, high_confidence=False):
     if state.get("position") or state.get("halted"):
         return
 
-    contract, ask = choose_best_contract(direction, underlying_price)
+    contract, ask = choose_contract(direction, underlying_price, high_confidence)
     if not contract or not ask:
-        log.warning("⚠️ No valid contract found matching liquidity criteria.")
+        log.warning("⚠️ No suitable contract found matching current criteria.")
         return
 
-    stop_loss_pct = 0.25 # وقف خسارة افتراضي 25% على سعر العقد
-    qty = calculate_compound_position_size(ask, stop_loss_pct)
+    qty = calculate_position_size(ask)
     if qty < 1:
-        log.warning("⚠️ Compounded position size evaluated to < 1 contract.")
         return
 
     client_id = f"cmp-{uuid.uuid4().hex[:14]}"
@@ -358,27 +319,27 @@ def open_compound_position(direction, underlying_price, meta):
     })
 
     if not st:
-        log.error("Failed to submit entry order: %s", data)
+        log.error("Order submission failed: %s", data)
         return
 
-    fill_price = ask
     pos = {
         "contract": contract,
         "direction": direction,
         "qty": qty,
-        "entry": fill_price,
-        "peak": fill_price,
-        "stop": fill_price * (1 - stop_loss_pct),
+        "entry": ask,
+        "peak_option_price": ask,
+        "entry_underlying": underlying_price,
+        "peak_underlying": underlying_price,  # تتبع قمة المؤشر لحماية الأرباح
+        "stop": ask * 0.75,
+        "high_confidence": high_confidence,
         "entry_time": iso_now(),
-        "trail_active": False,
     }
     state["position"] = pos
-    state["trades"] += 1
-    state["last_entry_time"] = iso_now()
     save_state()
-    log.info("🚀 COMPOUND ENTRY | Symbol: %s | Qty: %d | Entry: $%.2f", contract, qty, fill_price)
+    log.info("🚀 POSITION OPENED | Contract: %s | Qty: %d | Entry Option: $%.2f | SPY Price: $%.2f",
+             contract, qty, ask, underlying_price)
 
-def manage_position():
+def manage_position(current_underlying_price):
     pos = state.get("position")
     if not pos:
         return
@@ -388,30 +349,56 @@ def manage_position():
         return
     bid = q[0]
 
-    # تحديث أعلى سعر وصل له العقد (Peak Price)
-    if bid > pos["peak"]:
-        pos["peak"] = bid
+    direction = pos["direction"]
+    
+    # --- 1. تحديث أعلى قمة للمؤشر الأساسي SPY (الشرط الأول) ---
+    if direction == "up":
+        if current_underlying_price > pos["peak_underlying"]:
+            pos["peak_underlying"] = current_underlying_price
+    else:
+        if current_underlying_price < pos["peak_underlying"]:
+            pos["peak_underlying"] = current_underlying_price
 
-    gain_pct = (bid - pos["entry"]) / pos["entry"]
-    peak_gain_pct = (pos["peak"] - pos["entry"]) / pos["entry"]
+    # --- 2. تحديث أوج سعر للعقد ---
+    if bid > pos["peak_option_price"]:
+        pos["peak_option_price"] = bid
 
-    # 1. تفعيل الوقف عند نقطة الدخول (Breakeven)
+    option_gain = bid - pos["entry"]
+    gain_pct = option_gain / pos["entry"]
+
+    # =========================================================
+    # الشرط الأول: حماية الأرباح عند تراجع المؤشر قبل الوصول للسترايك
+    # =========================================================
+    underlying_pullback = (pos["peak_underlying"] - current_underlying_price) if direction == "up" else (current_underlying_price - pos["peak_underlying"])
+
+    if underlying_pullback >= UNDERLYING_TRAIL_DIST and gain_pct > 0.10:
+        log.info("🛡️ PROTECTING PROFIT: SPY Pulled back $%.2f from peak ($%.2f). Selling now to secure gains!",
+                 underlying_pullback, pos["peak_underlying"])
+        close_position(pos, bid, "UNDERLYING_PROFIT_PROTECTION")
+        return
+
+    # =========================================================
+    # الشرط الثاني: بيع العقود البعيدة الرخيصة عند ارتفاعها بقيمة نص دولار
+    # =========================================================
+    if pos.get("high_confidence") and option_gain >= QUICK_PROFIT_TARGET_USD:
+        log.info("🎯 QUICK PROFIT TARGET REACHED ($+0.50)! Exiting OTM Contract.")
+        close_position(pos, bid, "QUICK_OTM_TARGET")
+        return
+
+    # --- 3. إدارة الوقف المتحرك النمطي للعقد ---
     if gain_pct >= BREAKEVEN_TRIGGER and pos["stop"] < pos["entry"]:
         pos["stop"] = pos["entry"] * 1.02
-        log.info("🛡️ BREAKEVEN ACTIVATED | New Stop: $%.2f", pos["stop"])
+        log.info("🔒 BREAKEVEN SET | New Stop: $%.2f", pos["stop"])
 
-    # 2. تفعيل الوقف المتحرك (Trailing Stop)
-    if peak_gain_pct >= TRAIL_ACTIVATION:
-        new_trail_stop = pos["peak"] * (1 - TRAIL_DISTANCE)
-        if new_trail_stop > pos["stop"]:
-            pos["stop"] = new_trail_stop
-            pos["trail_active"] = True
-            log.info("📈 TRAILING STOP UPDATED | Peak: $%.2f | New Stop: $%.2f", pos["peak"], pos["stop"])
+    if (pos["peak_option_price"] - pos["entry"]) / pos["entry"] >= OPTION_TRAIL_ACTIVATION:
+        new_stop = pos["peak_option_price"] * (1 - OPTION_TRAIL_DISTANCE)
+        if new_stop > pos["stop"]:
+            pos["stop"] = new_stop
+            log.info("📈 OPTION TRAILING STOP UPDATED | New Stop: $%.2f", pos["stop"])
 
-    # 3. شرط الخروج (الوصول للوقف أو نهاية اليوم)
+    # شرط الخروج بالوقف أو نهاية اليوم
     if bid <= pos["stop"] or now_ny().time() >= EOD_CLOSE:
-        reason = "TRAILING_STOP" if pos.get("trail_active") else ("EOD_CLOSE" if now_ny().time() >= EOD_CLOSE else "STOP_LOSS")
-        close_position(pos, bid, reason)
+        close_position(pos, bid, "STOP_OR_EOD")
 
 def close_position(pos, exit_price, reason):
     qty = pos["qty"]
@@ -426,28 +413,26 @@ def close_position(pos, exit_price, reason):
     gross_pnl = (exit_price - pos["entry"]) * 100 * qty
     net_pnl = gross_pnl - (qty * COMMISSION_PER_CONTRACT * 2)
 
+    # تحديث رأس المال الافتراضي (1000 دولار + الأرباح/الخسائر)
+    state["virtual_capital"] += net_pnl
     state["net_pnl"] += net_pnl
     if net_pnl > 0:
         state["wins"] += 1
-        state["consec_losses"] = 0
-    else:
-        state["consec_losses"] += 1
 
-    log.info("🏁 POSITION CLOSED [%s] | Exit: $%.2f | Net PnL: $%.2f", reason, exit_price, net_pnl)
+    log.info("🏁 POSITION CLOSED [%s] | Exit Option Price: $%.2f | Net PnL: $%.2f | New Virtual Capital: $%.2f",
+             reason, exit_price, net_pnl, state["virtual_capital"])
+    
     state["position"] = None
-    get_equity() # تحديث رأس المال للفائدة المركبة التالية
     save_state()
 
 # ---------------------------------------------------------
-# 9. الحلقة الرئيسية (Execution Engine)
+# 9. محرك التحليل والتشغيل الرئيسي
 # ---------------------------------------------------------
 def run():
-    log.info("⚡ SAFAA QUANT %s STARTED", VERSION)
-    eq = get_equity()
-    log.info("💰 STARTING CAPITAL: $%.2f", eq)
+    log.info("⚡ SAFAA QUANT %s STARTED | Virtual Capital Fixed to $%.2f", VERSION, VIRTUAL_CAPITAL)
 
     if not state:
-        state.update(new_state(eq))
+        state.update(new_state())
         save_state()
 
     while True:
@@ -461,23 +446,27 @@ def run():
             if bars:
                 last_price = float(bars[-1]["c"])
                 
-                # إدارة الصفقة القائمة
+                # إدارة الصفقة القائمة بمراقبة سعر المؤشر الحاضر SPY
                 if state.get("position"):
-                    manage_position()
+                    manage_position(last_price)
                 
-                # البحث عن إشارات دخول جديدة إذا لم تكن هناك صفقة مفتوحة
+                # البحث عن صفقات جديدة
                 elif not state.get("halted") and SIGNAL_START <= now_ny().time() <= SIGNAL_END:
-                    # استراتيجية اختراق بسيطة وعالية الزخم (VWAP Breakout)
+                    # حساب مؤشر الفواب (VWAP) والزخم
                     pv = sum((float(b["h"]) + float(b["l"]) + float(b["c"])) / 3.0 * float(b["v"]) for b in bars)
                     vol = sum(float(b["v"]) for b in bars)
                     vwap = pv / vol if vol > 0 else last_price
 
-                    if last_price > vwap * 1.001:
-                        open_compound_position("up", last_price, {"signal": "vwap_bull"})
-                    elif last_price < vwap * 0.999:
-                        open_compound_position("down", last_price, {"signal": "vwap_bear"})
+                    # تقييم قوة الثقة بالتحليل الكمي (High Confidence Detection)
+                    momentum = (last_price - float(bars[0]["c"])) / float(bars[0]["c"])
+                    high_confidence = abs(momentum) >= 0.004  # صعود/هبوط قوي بـ 0.4%+ في الجلسة
 
-            time.sleep(2) # تحديث كل ثانيتين لضمان استجابة فائقة السرعة
+                    if last_price > vwap * 1.0015:
+                        open_position("up", last_price, high_confidence=high_confidence)
+                    elif last_price < vwap * 0.9985:
+                        open_position("down", last_price, high_confidence=high_confidence)
+
+            time.sleep(2) # فحص متواصل كل ثانيتين
 
         except Exception as e:
             log.exception("Error in main loop: %s", e)
