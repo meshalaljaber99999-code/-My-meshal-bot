@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 =========================================================
-صَفاء التحليل v86.8 (ULTIMATE ZERO-LOSS & STRIKE HOLD)
+صَفاء التحليل v87.0 (MULTI-POSITION ZERO-LOSS ENGINE)
 Platform: Alpaca Paper Trading
 Deployment: Railway (Includes Flask Keep-Alive Port)
 =========================================================
@@ -26,7 +26,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "Safaa Quant Stable Engine Active!", 200
+    return "Safaa Quant Multi-Engine Active!", 200
 
 def start_flask():
     port = int(os.getenv("PORT", 8080))
@@ -37,7 +37,7 @@ Thread(target=start_flask, daemon=True).start()
 # ---------------------------------------------------------
 # 2. الإعدادات وتفادي Rate Limit
 # ---------------------------------------------------------
-VERSION = "v86.8-UltimateScalper"
+VERSION = "v87.0-MultiPositionZeroLoss"
 SYMBOL = "SPY"
 NY = ZoneInfo("America/New_York")
 
@@ -50,19 +50,16 @@ def env_first(*names, default=""):
             return str(val).strip()
     return default
 
-# رأس المال المخصص للتداول
-VIRTUAL_CAPITAL = 1000.0        # حساب افتراضي 1000 دولار
-MAX_PREMIUM_PCT = 0.25          # تخصيص 25% كحد أقصى للصفقة الواحدة (250$)
+VIRTUAL_CAPITAL = 1000.0
+MAX_PREMIUM_PCT = 0.20          # تخصيص 20% لكل صفقة لإنشاء صفقات متعددة بحماية
+MAX_OPEN_POSITIONS = 3          # الحد الأقصى للصفقات المفتوحة بوقت واحد
 
 LOOP_INTERVAL_SEC = 0.6         
-MAX_SPREAD_PCT = 0.08           # تشديد الفارق بين العرض والطلب إلى 8%
-MIN_CONTRACT_PRICE = 0.20       # استبعاد العقود الميتة (أقل من 0.20$)
+MAX_SPREAD_PCT = 0.08           
+MIN_CONTRACT_PRICE = 0.20       
 MAX_CONTRACT_PRICE = 2.50       
 
-QUICK_PROFIT_TARGET_PCT = 0.12  # فحص جني الأرباح عند 12%
-QUICK_STOP_LOSS_PCT = -0.08     # وقف خسارة أولي 8% قبل تفعيل درع الحماية
-
-SIGNAL_START = dtime(9, 30)     # البدء فور فتح السوق (9:30 AM نيويورك)
+SIGNAL_START = dtime(9, 30)     
 SIGNAL_END = dtime(15, 30)
 EOD_CLOSE = dtime(15, 45)
 
@@ -78,7 +75,7 @@ OPTIONS_FEED = "indicative"
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = DATA_DIR / "safaa_v86_state.json"
+STATE_FILE = DATA_DIR / "safaa_v87_state.json"
 
 HEADERS = {
     "APCA-API-KEY-ID": API_KEY,
@@ -97,7 +94,7 @@ def today(): return now_ny().date().isoformat()
 def iso_now(): return now_ny().isoformat(timespec="seconds")
 
 # ---------------------------------------------------------
-# 3. محرك الاتصال الآمن مع حماية Rate-Limit
+# 3. محرك الاتصال الآمن
 # ---------------------------------------------------------
 def safe_api_call(method, url, params=None, json_body=None, max_retries=3):
     for attempt in range(max_retries):
@@ -110,7 +107,6 @@ def safe_api_call(method, url, params=None, json_body=None, max_retries=3):
                 r = session.delete(url, timeout=5)
 
             if r.status_code == 429:  
-                log.warning("⚠️ Rate limit hit (429). Waiting 2 seconds before retry...")
                 time.sleep(2)
                 continue
 
@@ -125,7 +121,7 @@ def api_post(url, body): return safe_api_call("POST", url, json_body=body)
 def api_delete(url): return safe_api_call("DELETE", url)
 
 # ---------------------------------------------------------
-# 4. إدارة الحالة العامة
+# 4. الحالة العامة (دعم صفقات متعددة)
 # ---------------------------------------------------------
 def save_state():
     tmp = Path(str(STATE_FILE) + ".tmp")
@@ -136,7 +132,10 @@ def save_state():
 def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            st = json.load(f)
+            if "positions" not in st:
+                st["positions"] = {}
+            return st
     except Exception:
         return {}
 
@@ -147,13 +146,13 @@ def new_state():
         "net_pnl": 0.0,
         "trades": 0,
         "wins": 0,
-        "position": None,
+        "positions": {}, # قاموس يحتوي على كل الصفقات المفتوحة
     }
 
 state = load_state()
 
 # ---------------------------------------------------------
-# 5. تنظيف وتصفية الصفقات القيمة (Batched Flush)
+# 5. تنظيف وتصفية الصفقات عند البدء
 # ---------------------------------------------------------
 def close_all_old_positions_and_orders():
     log.info("🧹 FLUSHING OLD POSITIONS & ORDERS SAFELY...")
@@ -185,9 +184,8 @@ def close_all_old_positions_and_orders():
                 time.sleep(0.5)
 
     api_delete(f"{TRADING_URL}/v2/positions")
-    state["position"] = None
+    state["positions"] = {}
     save_state()
-    log.info("✅ Local state and positions successfully cleaned.")
 
 # ---------------------------------------------------------
 # 6. البيانات والأسعار اللحظية
@@ -222,11 +220,10 @@ def get_option_quote(symbol):
     return (bid, ask) if bid > 0 and ask > 0 else None
 
 # ---------------------------------------------------------
-# 7. اختيار العقود القريبة فقط (ATM / Near OTM)
+# 7. اختيار العقود القريبة فقط (ATM)
 # ---------------------------------------------------------
 def choose_contract_fast(direction, underlying_price):
     opt_type = "call" if direction == "up" else "put"
-    # اختيار سترايك ملاصق للسعر الحقيقي (فارق 0.50$ فقط)
     target_strike = underlying_price + 0.50 if direction == "up" else underlying_price - 0.50
 
     params = {
@@ -241,7 +238,7 @@ def choose_contract_fast(direction, underlying_price):
     
     ok, data = api_get(f"{TRADING_URL}/v2/options/contracts", params=params)
     if not ok or not isinstance(data, dict):
-        return None, None, None
+        return None, None
 
     contracts = sorted(
         data.get("option_contracts") or [],
@@ -250,6 +247,10 @@ def choose_contract_fast(direction, underlying_price):
 
     for c in contracts:
         sym = c["symbol"]
+        # عدم تكرار العقد إذا كان مفتوحاً بالفعل
+        if sym in state["positions"]:
+            continue
+
         q = get_option_quote(sym)
         if not q:
             continue
@@ -258,16 +259,16 @@ def choose_contract_fast(direction, underlying_price):
         spread_pct = (ask - bid) / mid if mid > 0 else 1.0
         
         if spread_pct <= MAX_SPREAD_PCT and MIN_CONTRACT_PRICE <= ask <= MAX_CONTRACT_PRICE:
-            strike_val = float(c.get("strike_price", target_strike))
-            return sym, ask, strike_val
+            return sym, ask
 
-    return None, None, None
+    return None, None
 
 def open_position_fast(direction, underlying_price):
-    if state.get("position"):
+    # التحقق من أن الصفقات المفتوحة أقل من الحد الأقصى
+    if len(state["positions"]) >= MAX_OPEN_POSITIONS:
         return
 
-    contract, ask, strike_val = choose_contract_fast(direction, underlying_price)
+    contract, ask = choose_contract_fast(direction, underlying_price)
     if not contract or not ask:
         return
 
@@ -292,91 +293,62 @@ def open_position_fast(direction, underlying_price):
         "qty": qty,
         "entry": ask,
         "peak_option_price": ask,
-        "entry_underlying": underlying_price,
-        "strike": strike_val,
-        "stop": ask * (1 + QUICK_STOP_LOSS_PCT),
+        "stop": ask * 0.92, # وقف خسارة أولي صارم 8%
         "entry_time": iso_now(),
     }
-    state["position"] = pos
+    state["positions"][contract] = pos
     save_state()
-    log.info("⚡ ENTERED ATM POSITION | Contract: %s | Strike: $%.2f | Ask: $%.2f | SPY: $%.2f", contract, strike_val, ask, underlying_price)
+    log.info("⚡ OPENED POSITION [%s] | Qty: %d | Ask: $%.2f", contract, qty, ask)
 
 # ---------------------------------------------------------
-# 8. محرك إدارة الصفقة الذكي (Zero Loss & Strike Hold)
+# 8. إدارة كل الصفقات المفتوحة مستقلة (البيع الفوري عند عكس المؤشر)
 # ---------------------------------------------------------
-def manage_position_fast(current_underlying_price):
-    pos = state.get("position")
-    if not pos:
+def manage_all_positions(current_underlying_price):
+    active_contracts = list(state["positions"].keys())
+    if not active_contracts:
         return
 
-    q = get_option_quote(pos["contract"])
-    if not q:
-        return
-        
-    bid = q[0] # سعر البيع اللحظي
-    entry = pos["entry"]
-    direction = pos["direction"]
-    strike = pos.get("strike", 0.0)
-    
-    gain_pct = (bid - entry) / entry
+    for contract in active_contracts:
+        pos = state["positions"].get(contract)
+        if not pos:
+            continue
 
-    if bid > pos.get("peak_option_price", entry):
-        pos["peak_option_price"] = bid
+        q = get_option_quote(contract)
+        if not q:
+            continue
+            
+        bid = q[0] # سعر البيع اللحظي
+        entry = pos["entry"]
+        qty = pos["qty"]
+        dollar_pnl = (bid - entry) * 100 * qty
 
-    peak_gain_pct = (pos["peak_option_price"] - entry) / entry
+        # 1. تحديث أعلى سعر وصل له العقد
+        if bid > pos.get("peak_option_price", entry):
+            pos["peak_option_price"] = bid
 
-    # -----------------------------------------------------------------
-    # أ: درع منع الخسارة المباشر (Zero Loss Breakeven Shield)
-    # -----------------------------------------------------------------
-    # بمجرد أن يرتفع العقد 3% فقط، يرفع وقف الخسارة لسعر التكلفة + العمولة فوراً
-    if gain_pct >= 0.03 and pos["stop"] < (entry * 1.025):
-        pos["stop"] = entry * 1.025
-        log.info("🛡️ BREAKEVEN SHIELD ACTIVE: Stop moved to $%.2f (Entry: $%.2f). Zero Loss Guaranteed!", pos["stop"], entry)
+        peak_price = pos["peak_option_price"]
 
-    # -----------------------------------------------------------------
-    # ب: البيع المباشر عند تراجع العقد/المؤشر (Trailing Drop Lock)
-    # -----------------------------------------------------------------
-    # إذا نزل العقد 3% من أعلى قمة وصل لها بعد تحقيق 6% ربح، اخرج واحفظ الأرباح
-    if peak_gain_pct >= 0.06:
-        pullback_from_peak = (pos["peak_option_price"] - bid) / pos["peak_option_price"]
-        
-        dist_to_strike = abs(strike - current_underlying_price) if strike > 0 else 999.0
-        is_close_to_strike = dist_to_strike <= 0.30
-        
-        if pullback_from_peak >= 0.03:
-            if not is_close_to_strike:
-                log.info("⚡ DROP DETECTED! Option pulled back %.2f%% from peak $%.2f -> Selling at $%.2f to lock gain!", 
-                         pullback_from_peak * 100, pos["peak_option_price"], bid)
-                close_position_fast(pos, bid, "TRAILING_DROP_PROFIT_LOCK")
-                return
+        # 2. درع التعادل والربح: ارفع وقف الخسارة لسعر التكلفة + تغطية العمولات فور تفعيل أي ربح بسيط ($3.00+)
+        if dollar_pnl >= 3.0 and pos["stop"] < (entry + 0.02):
+            pos["stop"] = entry + 0.02
+            log.info("🛡️ BREAKEVEN LOCKED [%s]: Stop set at Entry+Fees ($%.2f)", contract, pos["stop"])
 
-    # -----------------------------------------------------------------
-    # ج: جني الأرباح أو حظر البيع عند ضمان وصول السترايك
-    # -----------------------------------------------------------------
-    if gain_pct >= QUICK_PROFIT_TARGET_PCT:
-        is_strong_momentum = (current_underlying_price > pos["entry_underlying"] + 0.30) if direction == "up" else (current_underlying_price < pos["entry_underlying"] - 0.30)
-        dist_to_strike = abs(strike - current_underlying_price) if strike > 0 else 999.0
-        
-        # حظر البيع إذا كان السهم متجهاً بزخم قوي للسترايك
-        if dist_to_strike <= 0.30 or is_strong_momentum:
-            pos["stop"] = max(pos["stop"], entry * 1.08)
-            log.info("🚀 STRIKE IN REACH / STRONG MOMENTUM! Holding contract for maximum profit. Stop locked at +8%% ($%.2f)", pos["stop"])
-        else:
-            log.info("⚡ SCALP PROFIT TARGET HIT! Option Gain: %.2f%% ($%.2f -> $%.2f)", gain_pct * 100, entry, bid)
-            close_position_fast(pos, bid, "SCALP_PROFIT_TARGET")
-            return
+        # 3. الشرط الجوهري: البيع المباشر عند أي هبوط من القمة (حركة عكسية للمؤشر/العقد)
+        # إذا ارتفع السعر وأظهر تراجعاً بمقدار 0.03$ أو أكثر من أقصى قمة، اخرج فوراً واحفظ الربح
+        if peak_price > entry and (peak_price - bid) >= 0.03:
+            log.info("⚡ REVERSAL DETECTED [%s]! Dropped $0.03 from peak ($%.2f -> $%.2f). Selling NOW!", 
+                     contract, peak_price, bid)
+            close_position_fast(pos, bid, "REVERSAL_PROFIT_LOCK")
+            continue
 
-    # -----------------------------------------------------------------
-    # د: الخروج عند ضرب وقف الخسارة أو نهاية الجلسة
-    # -----------------------------------------------------------------
-    if bid <= pos["stop"] or now_ny().time() >= EOD_CLOSE:
-        reason = "PROTECTED_BREAKEVEN_EXIT" if pos["stop"] >= entry else "STOP_LOSS"
-        log.info("🛑 EXIT EXECUTED [%s] at $%.2f", reason, bid)
-        close_position_fast(pos, bid, reason)
+        # 4. الخروج المباشر عند الوصول لوقف الخسارة أو نهاية الجلسة
+        if bid <= pos["stop"] or now_ny().time() >= EOD_CLOSE:
+            close_position_fast(pos, bid, "STOP_OR_EOD_EXIT")
 
 def close_position_fast(pos, exit_price, reason):
+    contract = pos["contract"]
     api_post(f"{TRADING_URL}/v2/orders", {
-        "symbol": pos["contract"],
+        "symbol": contract,
         "qty": str(pos["qty"]),
         "side": "sell",
         "type": "market",
@@ -388,9 +360,9 @@ def close_position_fast(pos, exit_price, reason):
     state["net_pnl"] += net_pnl
     if net_pnl > 0: state["wins"] += 1
 
-    log.info("🏁 FAST EXIT [%s] | Exit Price: $%.2f | Net PnL: $%.2f | Virtual Cap: $%.2f",
-             reason, exit_price, net_pnl, state["virtual_capital"])
-    state["position"] = None
+    log.info("🏁 CLOSED POSITION [%s] | Reason: %s | Net PnL: $%.2f", contract, reason, net_pnl)
+    if contract in state["positions"]:
+        del state["positions"][contract]
     save_state()
 
 # ---------------------------------------------------------
@@ -415,17 +387,20 @@ def run():
             if bars:
                 last_price = float(bars[-1]["c"])
                 
-                if state.get("position"):
-                    manage_position_fast(last_price)
-                elif SIGNAL_START <= now_ny().time() <= SIGNAL_END:
-                    pv = sum((float(b["h"]) + float(b["l"]) + float(b["c"])) / 3.0 * float(b["v"]) for b in bars)
-                    vol = sum(float(b["v"]) for b in bars)
-                    vwap = pv / vol if vol > 0 else last_price
+                # 1. إدارة جميع الصفقات المفتوحة وتأمينها
+                manage_all_positions(last_price)
 
-                    if last_price > vwap * 1.0005:
-                        open_position_fast("up", last_price)
-                    elif last_price < vwap * 0.9995:
-                        open_position_fast("down", last_price)
+                # 2. البحث عن صفقات جديدة إذا لم نتجاوز الحد الأقصى (3 صفقات)
+                if SIGNAL_START <= now_ny().time() <= SIGNAL_END:
+                    if len(state["positions"]) < MAX_OPEN_POSITIONS:
+                        pv = sum((float(b["h"]) + float(b["l"]) + float(b["c"])) / 3.0 * float(b["v"]) for b in bars)
+                        vol = sum(float(b["v"]) for b in bars)
+                        vwap = pv / vol if vol > 0 else last_price
+
+                        if last_price > vwap * 1.0005:
+                            open_position_fast("up", last_price)
+                        elif last_price < vwap * 0.9995:
+                            open_position_fast("down", last_price)
 
             time.sleep(LOOP_INTERVAL_SEC)
 
