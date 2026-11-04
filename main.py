@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 =========================================================
-صَفاء التحليل v88.0 (DYNAMIC TRAILING STOP ENGINE)
+صَفاء التحليل v89.0 (FIXED TAKE-PROFIT & BREAKEVEN ENGINE)
 Platform: Alpaca Paper Trading
 Deployment: Railway (Includes Flask Keep-Alive Port)
 =========================================================
@@ -26,7 +26,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "Safaa Quant Multi-Engine Active! (v88.0)", 200
+    return "Safaa Quant Multi-Engine Active! (v89.0)", 200
 
 def start_flask():
     port = int(os.getenv("PORT", 8080))
@@ -37,7 +37,7 @@ Thread(target=start_flask, daemon=True).start()
 # ---------------------------------------------------------
 # 2. الإعدادات وتفادي Rate Limit
 # ---------------------------------------------------------
-VERSION = "v88.0-DynamicTrailingStop"
+VERSION = "v89.0-FixedTP-Breakeven"
 SYMBOL = "SPY"
 NY = ZoneInfo("America/New_York")
 
@@ -75,7 +75,7 @@ OPTIONS_FEED = "indicative"
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = DATA_DIR / "safaa_v88_state.json"
+STATE_FILE = DATA_DIR / "safaa_v89_state.json"
 
 HEADERS = {
     "APCA-API-KEY-ID": API_KEY,
@@ -146,7 +146,7 @@ def new_state():
         "net_pnl": 0.0,
         "trades": 0,
         "wins": 0,
-        "positions": {}, # قاموس يحتوي على كل الصفقات المفتوحة
+        "positions": {}, 
     }
 
 state = load_state()
@@ -299,7 +299,7 @@ def open_position_fast(direction, underlying_price):
     log.info("⚡ OPENED POSITION [%s] | Qty: %d | Ask: $%.2f", contract, qty, ask)
 
 # ---------------------------------------------------------
-# 8. إدارة كل الصفقات المفتوحة (تأمين الأرباح المتدرج والوقف المتحرك)
+# 8. إدارة كل الصفقات المفتوحة (هدف ربح ثابت + تأمين نقطة التعادل)
 # ---------------------------------------------------------
 def manage_all_positions(current_underlying_price):
     active_contracts = list(state["positions"].keys())
@@ -318,44 +318,33 @@ def manage_all_positions(current_underlying_price):
         bid = q[0] # سعر البيع اللحظي الفعلي
         entry = pos["entry"]
         qty = pos["qty"]
-        profit_pct = (bid - entry) / entry # حساب النسبة المئوية للربح/الخسارة
+        dollar_pnl = (bid - entry) * 100 * qty - (qty * 1.30) # حساب صافي الربح بالدولار بعد العمولات
 
-        # 1. تحديث أعلى سعر (قمة) وصل له العقد منذ الشراء
+        # 1. تحديث أعلى سعر (قمة) وصل له العقد
         if bid > pos.get("peak_option_price", entry):
             pos["peak_option_price"] = bid
 
         peak_price = pos["peak_option_price"]
 
-        # 2. نظام تأمين الأرباح المتدرج (Step-up Trailing Stop)
-        # يضمن عدم تحول الصفقة الرابحة إلى خاسرة
-        new_stop = pos["stop"]
-        
-        if profit_pct >= 0.30:     # إذا الربح 30% أو أكثر
-            new_stop = max(new_stop, entry * 1.15)  # احجز 15% ربح كحد أدنى
-        elif profit_pct >= 0.20:   # إذا الربح 20% أو أكثر
-            new_stop = max(new_stop, entry * 1.10)  # احجز 10% ربح كحد أدنى
-        elif profit_pct >= 0.10:   # إذا الربح 10% أو أكثر
-            new_stop = max(new_stop, entry * 1.05)  # احجز 5% ربح كحد أدنى
-        elif profit_pct >= 0.05:   # إذا الربح 5% أو أكثر
-            new_stop = max(new_stop, entry * 1.01)  # ارفع الوقف لنقطة الدخول + عمولات (التعادل)
-            
-        # تطبيق الوقف الجديد فقط إذا كان أعلى من الوقف السابق
-        if new_stop > pos["stop"]:
-            pos["stop"] = new_stop
-            log.info("🛡️ PROFIT LOCKED [%s]: Stop moved up to $%.2f", contract, pos["stop"])
+        # 2. هدف ربح ثابت ومجزي: الخروج المباشر والبيع فور تحقيق ربح $20 أو أكثر
+        if dollar_pnl >= 20.0:
+            log.info("💰 TARGET PROFIT REACHED [%s]! Net PnL: $%.2f. Selling NOW!", contract, dollar_pnl)
+            close_position_fast(pos, bid, "TARGET_PROFIT_20")
+            continue
 
-        # 3. جني الأرباح عند الارتداد من القمة (Trailing Reversal)
-        # حساب نسبة تراجع السعر اللحظي من أعلى قمة سجلها العقد
-        drop_from_peak_pct = (peak_price - bid) / peak_price
-        
-        # إذا كنا في منطقة ربح (أعلى من التعادل) وتراجع السعر بنسبة 8% من القمة
-        if peak_price > (entry * 1.02) and drop_from_peak_pct >= 0.08:
-            log.info("⚡ REVERSAL DETECTED [%s]! Dropped 8%% from peak ($%.2f -> $%.2f). Selling NOW!", 
-                     contract, peak_price, bid)
+        # 3. درع التعادل السريع: إذا وصل الصافي إلى $5، ارفع الوقف فوراً لسعر الدخول + العمولات
+        if dollar_pnl >= 5.0 and pos["stop"] < (entry + 0.02):
+            pos["stop"] = entry + 0.02
+            log.info("🛡️ BREAKEVEN LOCKED [%s]: Stop moved to Entry + Fees", contract)
+
+        # 4. جني الأرباح عند الارتداد من القمة (Trailing Reversal)
+        drop_from_peak_pct = (peak_price - bid) / peak_price if peak_price > 0 else 0
+        if peak_price > (entry * 1.05) and drop_from_peak_pct >= 0.08:
+            log.info("⚡ REVERSAL DETECTED [%s]! Dropped 8%% from peak. Selling NOW!", contract)
             close_position_fast(pos, bid, "REVERSAL_PROFIT_LOCK")
             continue
 
-        # 4. الخروج المباشر عند ضرب وقف الخسارة أو الإغلاق التلقائي نهاية اليوم
+        # 5. الخروج المباشر عند ضرب وقف الخسارة أو نهاية الجلسة
         if bid <= pos["stop"] or now_ny().time() >= EOD_CLOSE:
             close_position_fast(pos, bid, "STOP_OR_EOD_EXIT")
 
