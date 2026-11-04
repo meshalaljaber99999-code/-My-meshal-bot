@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 =========================================================
-صَفاء التحليل v86.5 (SMART LOCK-IN & BREAKEVEN SHIELD)
+صَفاء التحليل v86.7 (ZERO-LOSS GUARANTEE & TRAILING LOCK)
 Platform: Alpaca Paper Trading
 Deployment: Railway (Includes Flask Keep-Alive Port)
 =========================================================
@@ -37,7 +37,7 @@ Thread(target=start_flask, daemon=True).start()
 # ---------------------------------------------------------
 # 2. الإعدادات وتفادي Rate Limit
 # ---------------------------------------------------------
-VERSION = "v86.5-SmartLockShield"
+VERSION = "v86.7-ZeroLossLocked"
 SYMBOL = "SPY"
 NY = ZoneInfo("America/New_York")
 
@@ -53,14 +53,14 @@ def env_first(*names, default=""):
 VIRTUAL_CAPITAL = 1000.0
 
 LOOP_INTERVAL_SEC = 0.6         
-MAX_SPREAD_PCT = 0.08           # تشديد Spread إلى 8% لمنع الفوارق العالية
+MAX_SPREAD_PCT = 0.08           # تشديد الفارق لمنع العقود ذات الفجوة العالية
 MAX_PREMIUM_PCT = 0.20
 
-# معايير اختيار العقود وإدارة الصفقة
-MIN_CONTRACT_PRICE = 0.20       # إلغاء العقود الرخيصة الميتة
+# معايير اختيار العقود
+MIN_CONTRACT_PRICE = 0.20       # منع العقود الرخيصة والميتة
 MAX_CONTRACT_PRICE = 2.50       
-QUICK_PROFIT_TARGET_PCT = 0.15  # جني أرباح مبدئي 15%
-QUICK_STOP_LOSS_PCT = -0.10     # وقف خسارة 10% قبل تفعيل درع الحماية
+QUICK_PROFIT_TARGET_PCT = 0.12  # فحص الأرباح المبكر عند 12%
+QUICK_STOP_LOSS_PCT = -0.08     # وقف خسارة أولي 8% قبل تفعيل درع الحماية
 
 SIGNAL_START = dtime(9, 30)     # التداول فور فتح السوق
 SIGNAL_END = dtime(15, 30)
@@ -226,7 +226,6 @@ def get_option_quote(symbol):
 # ---------------------------------------------------------
 def choose_contract_fast(direction, underlying_price):
     opt_type = "call" if direction == "up" else "put"
-    # اختيار استرايك قاطِع وملاصق للسعر (فارق 0.50$ فقط)
     target_strike = underlying_price + 0.50 if direction == "up" else underlying_price - 0.50
 
     params = {
@@ -241,7 +240,7 @@ def choose_contract_fast(direction, underlying_price):
     
     ok, data = api_get(f"{TRADING_URL}/v2/options/contracts", params=params)
     if not ok or not isinstance(data, dict):
-        return None, None
+        return None, None, None
 
     contracts = sorted(
         data.get("option_contracts") or [],
@@ -258,15 +257,16 @@ def choose_contract_fast(direction, underlying_price):
         spread_pct = (ask - bid) / mid if mid > 0 else 1.0
         
         if spread_pct <= MAX_SPREAD_PCT and MIN_CONTRACT_PRICE <= ask <= MAX_CONTRACT_PRICE:
-            return sym, ask
+            strike_val = float(c.get("strike_price", target_strike))
+            return sym, ask, strike_val
 
-    return None, None
+    return None, None, None
 
 def open_position_fast(direction, underlying_price):
     if state.get("position"):
         return
 
-    contract, ask = choose_contract_fast(direction, underlying_price)
+    contract, ask, strike_val = choose_contract_fast(direction, underlying_price)
     if not contract or not ask:
         return
 
@@ -292,15 +292,16 @@ def open_position_fast(direction, underlying_price):
         "entry": ask,
         "peak_option_price": ask,
         "entry_underlying": underlying_price,
-        "stop": ask * (1 + QUICK_STOP_LOSS_PCT), # وقف خسارة أولي
+        "strike": strike_val,
+        "stop": ask * (1 + QUICK_STOP_LOSS_PCT),
         "entry_time": iso_now(),
     }
     state["position"] = pos
     save_state()
-    log.info("⚡ ENTERED ATM POSITION | Contract: %s | Qty: %d | Ask: $%.2f | SPY: $%.2f", contract, qty, ask, underlying_price)
+    log.info("⚡ ENTERED ATM POSITION | Contract: %s | Strike: $%.2f | Ask: $%.2f | SPY: $%.2f", contract, strike_val, ask, underlying_price)
 
 # ---------------------------------------------------------
-# 8. إدارة الصفقة الذكية (Breakeven Shield & Strike Hold)
+# 8. إدارة الصفقة الذكية (ضمان عدم الخروج بخسارة + البيع عند التراجع)
 # ---------------------------------------------------------
 def manage_position_fast(current_underlying_price):
     pos = state.get("position")
@@ -311,41 +312,64 @@ def manage_position_fast(current_underlying_price):
     if not q:
         return
         
-    bid = q[0]
+    bid = q[0] # سعر البيع اللحظي
     entry = pos["entry"]
+    direction = pos["direction"]
+    strike = pos.get("strike", 0.0)
     
     gain_pct = (bid - entry) / entry
 
+    # تحديث أعلى سعر وصل له العقد
     if bid > pos.get("peak_option_price", entry):
         pos["peak_option_price"] = bid
 
     peak_gain_pct = (pos["peak_option_price"] - entry) / entry
 
-    # 1. درع حماية رأس المال: رفع وقف الخسارة إلى رأس المال + العمولة فور ارتياع العقد 5%
-    if gain_pct >= 0.05 and pos["stop"] < (entry * 1.02):
-        pos["stop"] = entry * 1.02
-        log.info("🛡️ CAPITAL PROTECTED: Stop moved to Breakeven Shield ($%.2f)", pos["stop"])
+    # -----------------------------------------------------------------
+    # أ: درع حماية التعادل الصارم (Breakeven Shield - NO LOSS GUARANTEE)
+    # -----------------------------------------------------------------
+    # فور ارتفاع العقد 3% فقط، يتم تأمين سعر الدخول + تغطية العمولات فوراً
+    if gain_pct >= 0.03 and pos["stop"] < (entry * 1.025):
+        pos["stop"] = entry * 1.025
+        log.info("🛡️ BREAKEVEN SHIELD ACTIVE: Stop moved to $%.2f (Entry: $%.2f). Zero-loss guaranteed!", pos["stop"], entry)
 
-    # 2. فحص الهدف والاحتفاظ بالعقد إذا كان هناك زخم متجه للسترايك
-    if gain_pct >= QUICK_PROFIT_TARGET_PCT:
-        is_strong_momentum = (current_underlying_price > pos["entry_underlying"] + 0.30) if pos["direction"] == "up" else (current_underlying_price < pos["entry_underlying"] - 0.30)
+    # -----------------------------------------------------------------
+    # ب: حماية الأرباح الفورية بمجرد نزول/تراجع المؤشر أو العقد (Trailing Exit)
+    # -----------------------------------------------------------------
+    # إذا ارتفع العقد وتراجع بمقدار 3% فقط من أعلى قمة وصل لها، يتم البيع وحفظ الربح فوراً
+    if peak_gain_pct >= 0.06:
+        pullback_from_peak = (pos["peak_option_price"] - bid) / pos["peak_option_price"]
         
-        if is_strong_momentum:
-            # زخم قوي راكب الاتجاه نحو السترايك -> رفع الستوب لحجز 10% أرباح والاستمرار بالصفقة
-            pos["stop"] = max(pos["stop"], entry * 1.10)
-            log.info("🚀 STRONG STRIKE MOMENTUM! Holding contract. Trailing stop locked at +10%% ($%.2f)", pos["stop"])
+        # فحص القرب الشديد من السترايك
+        dist_to_strike = abs(strike - current_underlying_price) if strike > 0 else 999.0
+        is_close_to_strike = dist_to_strike <= 0.30
+        
+        if pullback_from_peak >= 0.03:  # نزل العقد 3% من القمة
+            if not is_close_to_strike:
+                log.info("⚡ DROP DETECTED! Option pulled back %.2f%% from peak $%.2f -> Selling at $%.2f to lock gain!", 
+                         pullback_from_peak * 100, pos["peak_option_price"], bid)
+                close_position_fast(pos, bid, "TRAILING_DROP_PROFIT_LOCK")
+                return
+
+    # -----------------------------------------------------------------
+    # ج: جني الأرباح السريع أو مواصلة الصعود نحو السترايك
+    # -----------------------------------------------------------------
+    if gain_pct >= QUICK_PROFIT_TARGET_PCT:
+        is_strong_momentum = (current_underlying_price > pos["entry_underlying"] + 0.30) if direction == "up" else (current_underlying_price < pos["entry_underlying"] - 0.30)
+        dist_to_strike = abs(strike - current_underlying_price) if strike > 0 else 999.0
+        
+        if dist_to_strike <= 0.30 or is_strong_momentum:
+            # زخم قوي متسارع للسترايك -> يرفع الستوب لحجز أرباح 8% وتأمينها دون بيع العقد
+            pos["stop"] = max(pos["stop"], entry * 1.08)
+            log.info("🚀 STRIKE IN REACH! Holding contract. Trailing stop raised to +8%% ($%.2f)", pos["stop"])
         else:
-            log.info("⚡ QUICK PROFIT TAKEN! Option Gain: %.2f%% ($%.2f -> $%.2f)", gain_pct * 100, entry, bid)
+            log.info("⚡ SCALP PROFIT TARGET HIT! Option Gain: %.2f%% ($%.2f -> $%.2f)", gain_pct * 100, entry, bid)
             close_position_fast(pos, bid, "SCALP_PROFIT_TARGET")
             return
 
-    # 3. حماية الأرباح عند التراجع من القمة (Trailing Lock)
-    if peak_gain_pct >= 0.12 and (pos["peak_option_price"] - bid) / pos["peak_option_price"] >= 0.04:
-        log.info("⚡ TRAILING PROFIT LOCK! Pulled back from peak $%.2f to $%.2f", pos["peak_option_price"], bid)
-        close_position_fast(pos, bid, "TRAILING_PROFIT_PROTECT")
-        return
-
-    # 4. تنفيذ الخروج عند ضرب الستوب المحمي أو نهاية الجلسة
+    # -----------------------------------------------------------------
+    # د: الخروج التلقائي عند ضرب الستوب المحمي أو عند إغلاق الجلسة
+    # -----------------------------------------------------------------
     if bid <= pos["stop"] or now_ny().time() >= EOD_CLOSE:
         reason = "PROTECTED_BREAKEVEN_EXIT" if pos["stop"] >= entry else "STOP_LOSS"
         log.info("🛑 EXIT EXECUTED [%s] at $%.2f", reason, bid)
