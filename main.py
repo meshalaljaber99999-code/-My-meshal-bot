@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 =========================================================
-صَفاء التحليل v86.3 (ULTRA-STABLE & RATE-LIMIT OPTIMIZED)
+صَفاء التحليل v86.4 (ATM & FAST SCALPER OPTIMIZED)
 Platform: Alpaca Paper Trading
 Deployment: Railway (Includes Flask Keep-Alive Port)
 =========================================================
@@ -37,7 +37,7 @@ Thread(target=start_flask, daemon=True).start()
 # ---------------------------------------------------------
 # 2. الإعدادات وتفادي Rate Limit
 # ---------------------------------------------------------
-VERSION = "v86.3-RateLimitOptimized"
+VERSION = "v86.4-ATM-Scalper"
 SYMBOL = "SPY"
 NY = ZoneInfo("America/New_York")
 
@@ -52,22 +52,19 @@ def env_first(*names, default=""):
 
 VIRTUAL_CAPITAL = 1000.0
 
-# زمن الفحص المعاير لتفادي 200 طلب/دقيقة تماماً
-LOOP_INTERVAL_SEC = 0.6         # فحص كل 600 مللي ثانية (منع Rate Limit بنسبة 100%)
-MAX_SPREAD_PCT = 0.12
+# زمن الفحص المعاير لتفادي 200 طلب/دقيقة
+LOOP_INTERVAL_SEC = 0.6         
+MAX_SPREAD_PCT = 0.08           # تشديد Spread إلى 8% لمنع الفوارق العالية
 MAX_PREMIUM_PCT = 0.20
 
-UNDERLYING_TRAIL_DIST = 0.25
-BREAKEVEN_TRIGGER = 0.12
-OPTION_TRAIL_ACTIVATION = 0.25
-OPTION_TRAIL_DISTANCE = 0.08
+# معايير إدارة الصفقة السريعة
+MIN_CONTRACT_PRICE = 0.20       # إلغاء العقود الرخيصة الميتة (أقل من 0.20$)
+MAX_CONTRACT_PRICE = 2.50       # الحد الأقصى لسعر العقد
+QUICK_PROFIT_TARGET_PCT = 0.15  # جني أرباح سريع فور ارتياع العقد 15%
+QUICK_STOP_LOSS_PCT = -0.10     # وقف خسارة صارم عند تراجع العقد 10%
 
-DEEP_OTM_MIN_PRICE = 0.10
-DEEP_OTM_MAX_PRICE = 0.60
-QUICK_PROFIT_TARGET_USD = 0.40
-
-SIGNAL_START = dtime(9, 45)
-SIGNAL_END = dtime(14, 0)
+SIGNAL_START = dtime(9, 30)     # البدء فور فتح السوق (9:30 صباحاً نيويورك)
+SIGNAL_END = dtime(15, 30)
 EOD_CLOSE = dtime(15, 45)
 
 KEY_NAMES = ["ALPACA_API_KEY", "APCA_API_KEY_ID", "ALPACA_KEY", "API_KEY"]
@@ -104,7 +101,6 @@ def iso_now(): return now_ny().isoformat(timespec="seconds")
 # 3. محرك الاتصال الآمن مع حماية Rate-Limit
 # ---------------------------------------------------------
 def safe_api_call(method, url, params=None, json_body=None, max_retries=3):
-    """إرسال الطلبات مع إعادة المحاولة تلقائياً عند ظهور خطأ Too Many Requests (429)"""
     for attempt in range(max_retries):
         try:
             if method == "GET":
@@ -114,7 +110,7 @@ def safe_api_call(method, url, params=None, json_body=None, max_retries=3):
             elif method == "DELETE":
                 r = session.delete(url, timeout=5)
 
-            if r.status_code == 429:  # Too Many Requests
+            if r.status_code == 429:  
                 log.warning("⚠️ Rate limit hit (429). Waiting 2 seconds before retry...")
                 time.sleep(2)
                 continue
@@ -158,16 +154,12 @@ def new_state():
 state = load_state()
 
 # ---------------------------------------------------------
-# 5. تنظيف وتصفية الصفقات القوي والتجزيئي (Batched Flush)
+# 5. تنظيف وتصفية الصفقات (Batched Flush)
 # ---------------------------------------------------------
 def close_all_old_positions_and_orders():
-    """تصفية إجبارية وتجزيئية لكافة الصفقات والأوامر القديمة"""
     log.info("🧹 FLUSHING OLD POSITIONS & ORDERS SAFELY...")
-    
-    # 1. إلغاء جميع الأوامر المعلقة
     api_delete(f"{TRADING_URL}/v2/orders")
     
-    # 2. جلب جميع الصفقات المفتوحة في الحساب
     ok, positions = api_get(f"{TRADING_URL}/v2/positions")
     if ok and isinstance(positions, list):
         for pos in positions:
@@ -176,12 +168,8 @@ def close_all_old_positions_and_orders():
             if total_qty == 0:
                 continue
 
-            log.info("Closing open position: %s | Total Qty: %d", symbol, total_qty)
-
-            # إغلاق على دفعات لتجنب الرفض بسبب الكمية الكبيرة
             batch_size = 100
             remaining = total_qty
-            
             while remaining > 0:
                 current_batch = min(remaining, batch_size)
                 st, res, code = api_post(f"{TRADING_URL}/v2/orders", {
@@ -192,17 +180,12 @@ def close_all_old_positions_and_orders():
                     "time_in_force": "day"
                 })
                 if st:
-                    log.info("✅ Batch of %d units sent for %s", current_batch, symbol)
                     remaining -= current_batch
                 else:
-                    log.warning("⚠️ Failed batch sell for %s: %s", symbol, res)
                     break
                 time.sleep(0.5)
 
-    # 3. محاولة تصفية شامّلة إضافية عبر API
     api_delete(f"{TRADING_URL}/v2/positions")
-
-    # 4. تصفير الذاكرة المحفوظة
     state["position"] = None
     save_state()
     log.info("✅ Local state and positions successfully cleaned.")
@@ -240,21 +223,21 @@ def get_option_quote(symbol):
     return (bid, ask) if bid > 0 and ask > 0 else None
 
 # ---------------------------------------------------------
-# 7. اقتناص وشراء العقود
+# 7. اختيار العقود القريبة فقط (ATM / Near OTM)
 # ---------------------------------------------------------
-def choose_contract_fast(direction, underlying_price, high_confidence=False):
+def choose_contract_fast(direction, underlying_price):
     opt_type = "call" if direction == "up" else "put"
-    offset = underlying_price * (0.015 if high_confidence else 0.002)
-    target_strike = underlying_price + offset if direction == "up" else underlying_price - offset
+    # الالتزام باسترايك ملاصق للسعر الحقيقي (فارق 0.50$ فقط)
+    target_strike = underlying_price + 0.50 if direction == "up" else underlying_price - 0.50
 
     params = {
         "underlying_symbols": SYMBOL,
         "status": "active",
         "type": opt_type,
         "expiration_date": today(),
-        "limit": 15,
-        "strike_price_gte": f"{target_strike - 3:.2f}",
-        "strike_price_lte": f"{target_strike + 3:.2f}",
+        "limit": 10,
+        "strike_price_gte": f"{target_strike - 1.00:.2f}",
+        "strike_price_lte": f"{target_strike + 1.00:.2f}",
     }
     
     ok, data = api_get(f"{TRADING_URL}/v2/options/contracts", params=params)
@@ -275,19 +258,17 @@ def choose_contract_fast(direction, underlying_price, high_confidence=False):
         mid = (bid + ask) / 2.0
         spread_pct = (ask - bid) / mid if mid > 0 else 1.0
         
-        if spread_pct <= MAX_SPREAD_PCT:
-            if high_confidence and DEEP_OTM_MIN_PRICE <= ask <= DEEP_OTM_MAX_PRICE:
-                return sym, ask
-            elif not high_confidence and ask >= 0.20:
-                return sym, ask
+        # استبعاد العقود الرخيصة جداً (0.02$) أو العقود ذات الفارق الواسع بين Ask و Bid
+        if spread_pct <= MAX_SPREAD_PCT and MIN_CONTRACT_PRICE <= ask <= MAX_CONTRACT_PRICE:
+            return sym, ask
 
     return None, None
 
-def open_position_fast(direction, underlying_price, high_confidence=False):
+def open_position_fast(direction, underlying_price):
     if state.get("position"):
         return
 
-    contract, ask = choose_contract_fast(direction, underlying_price, high_confidence)
+    contract, ask = choose_contract_fast(direction, underlying_price)
     if not contract or not ask:
         return
 
@@ -313,17 +294,14 @@ def open_position_fast(direction, underlying_price, high_confidence=False):
         "entry": ask,
         "peak_option_price": ask,
         "entry_underlying": underlying_price,
-        "peak_underlying": underlying_price,
-        "stop": ask * 0.80,
-        "high_confidence": high_confidence,
         "entry_time": iso_now(),
     }
     state["position"] = pos
     save_state()
-    log.info("⚡ FAST ENTRY | Contract: %s | Qty: %d | Ask: $%.2f | SPY: $%.2f", contract, qty, ask, underlying_price)
+    log.info("⚡ ENTERED ATM POSITION | Contract: %s | Qty: %d | Ask: $%.2f | SPY: $%.2f", contract, qty, ask, underlying_price)
 
 # ---------------------------------------------------------
-# 8. إدارة الصفقة
+# 8. إدارة الصفقة الخاطفة (تثبيت الأرباح مباشرة)
 # ---------------------------------------------------------
 def manage_position_fast(current_underlying_price):
     pos = state.get("position")
@@ -333,43 +311,34 @@ def manage_position_fast(current_underlying_price):
     q = get_option_quote(pos["contract"])
     if not q:
         return
+        
     bid = q[0]
-    direction = pos["direction"]
+    entry = pos["entry"]
+    
+    # نسبة الربح/الخسارة اللحظية للعقد
+    gain_pct = (bid - entry) / entry
 
-    if direction == "up":
-        if current_underlying_price > pos["peak_underlying"]:
-            pos["peak_underlying"] = current_underlying_price
-    else:
-        if current_underlying_price < pos["peak_underlying"]:
-            pos["peak_underlying"] = current_underlying_price
-
-    if bid > pos["peak_option_price"]:
+    if bid > pos.get("peak_option_price", entry):
         pos["peak_option_price"] = bid
 
-    option_gain = bid - pos["entry"]
-    gain_pct = option_gain / pos["entry"]
+    peak_gain_pct = (pos["peak_option_price"] - entry) / entry
 
-    pullback = (pos["peak_underlying"] - current_underlying_price) if direction == "up" else (current_underlying_price - pos["peak_underlying"])
-    if pullback >= UNDERLYING_TRAIL_DIST and gain_pct > 0.08:
-        log.info("⚡ FAST PROFIT PROTECT: SPY Pulled back $%.2f. Closing immediately!", pullback)
-        close_position_fast(pos, bid, "FAST_UNDERLYING_PROTECT")
+    # 1. جني أرباح سريع فور ارتفاع العقد بنسبة 15%
+    if gain_pct >= QUICK_PROFIT_TARGET_PCT:
+        log.info("⚡ QUICK PROFIT TAKEN! Option Gain: %.2f%% ($%.2f -> $%.2f)", gain_pct * 100, entry, bid)
+        close_position_fast(pos, bid, "SCALP_PROFIT_TARGET")
         return
 
-    if pos.get("high_confidence") and option_gain >= QUICK_PROFIT_TARGET_USD:
-        log.info("⚡ QUICK TARGET HIT ($+0.40)! Closing OTM Position.")
-        close_position_fast(pos, bid, "QUICK_OTM_TARGET")
+    # 2. حماية الأرباح (Trailing Stop): إذا ارتفع العقد 10% ثم تراجع 4% من القمة، اغلق فوراً
+    if peak_gain_pct >= 0.10 and (pos["peak_option_price"] - bid) / pos["peak_option_price"] >= 0.04:
+        log.info("⚡ TRAILING PROFIT PROTECT! Pulled back from peak $%.2f to $%.2f", pos["peak_option_price"], bid)
+        close_position_fast(pos, bid, "TRAILING_PROFIT_PROTECT")
         return
 
-    if gain_pct >= BREAKEVEN_TRIGGER and pos["stop"] < pos["entry"]:
-        pos["stop"] = pos["entry"] * 1.01
-
-    if (pos["peak_option_price"] - pos["entry"]) / pos["entry"] >= OPTION_TRAIL_ACTIVATION:
-        new_stop = pos["peak_option_price"] * (1 - OPTION_TRAIL_DISTANCE)
-        if new_stop > pos["stop"]:
-            pos["stop"] = new_stop
-
-    if bid <= pos["stop"] or now_ny().time() >= EOD_CLOSE:
-        close_position_fast(pos, bid, "STOP_OR_EOD")
+    # 3. وقف خسارة سريع ومباشر عند تراجع 10%
+    if gain_pct <= QUICK_STOP_LOSS_PCT or now_ny().time() >= EOD_CLOSE:
+        log.info("🛑 STOP LOSS HIT! Loss: %.2f%%", gain_pct * 100)
+        close_position_fast(pos, bid, "STOP_LOSS_OR_EOD")
 
 def close_position_fast(pos, exit_price, reason):
     api_post(f"{TRADING_URL}/v2/orders", {
@@ -399,7 +368,6 @@ def run():
         state.update(new_state())
         save_state()
 
-    # تنظيف وتصفية الصفقات والأوامر بشكل آمن
     close_all_old_positions_and_orders()
 
     while True:
@@ -420,13 +388,10 @@ def run():
                     vol = sum(float(b["v"]) for b in bars)
                     vwap = pv / vol if vol > 0 else last_price
 
-                    momentum = (last_price - float(bars[0]["c"])) / float(bars[0]["c"])
-                    high_conf = abs(momentum) >= 0.003
-
-                    if last_price > vwap * 1.0010:
-                        open_position_fast("up", last_price, high_confidence=high_conf)
-                    elif last_price < vwap * 0.9990:
-                        open_position_fast("down", last_price, high_confidence=high_conf)
+                    if last_price > vwap * 1.0005:
+                        open_position_fast("up", last_price)
+                    elif last_price < vwap * 0.9995:
+                        open_position_fast("down", last_price)
 
             time.sleep(LOOP_INTERVAL_SEC)
 
