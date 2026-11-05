@@ -1152,25 +1152,23 @@ def get_option_snapshots(symbols):
             continue
 
                 result = options_data_api(
-            "GET",
-            f"/v1beta1/options/snapshots/{UNDERLYING}"
-        )
+    "GET",
+    "/v1beta1/options/snapshots",
+    params={
+        "symbols": ",".join(batch)
+    }
+)
 
-        batch_snapshots = result.get("snapshots", {})
+batch_snapshots = result.get("snapshots", {})
 
-        if not isinstance(batch_snapshots, dict):
-            raise APIError(
-                "استجابة بيانات الخيارات غير صالحة."
-            )
+if not isinstance(batch_snapshots, dict):
+    raise APIError(
+        "استجابة بيانات الخيارات غير صالحة."
+    )
 
-        # استخراج العقود المطلوبة فقط من سلسلة الخيارات
-        for symbol in batch:
-            snapshot = batch_snapshots.get(symbol)
+snapshots.update(batch_snapshots)
 
-            if snapshot is not None:
-                snapshots[symbol] = snapshot
-    return snapshots
-
+return snapshots
 
 def extract_snapshot_values(snapshot):
     quote = snapshot.get("latestQuote") or {}
