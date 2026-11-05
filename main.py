@@ -595,58 +595,197 @@ def check_daily_risk():
 
 
 # =========================================================
-# 10) MARKET DATA
+# 10) MARKET DATA — SMART RETRY & FAIL-SOFT
 # =========================================================
+
+MIN_SPY_BARS = 40
+SPY_DATA_RETRIES = 3
+SPY_RETRY_DELAY = 2.5
+SPY_MAX_BAR_AGE_SECONDS = 180
+
+
+class MarketDataUnavailable(Exception):
+    """نقص مؤقت في بيانات السوق، وليس عطلاً يستوجب إيقاف البوت."""
+    pass
+
 
 def get_spy_bars(limit=120):
     """
-    جلب شموع SPY على إطار الدقيقة.
-    نستخدم الشموع المكتملة فقط لتقليل إشارات الشمعة المتغيرة.
+    جلب شموع SPY مع إعادة المحاولة.
+    لا يتم إيقاف البوت عند نقص البيانات.
+    لا يتم تخفيض الحد الأدنى للشموع.
     """
 
-    params = {
-        "timeframe": "1Min",
-        "limit": limit,
-        "adjustment": "raw",
-        "feed": os.getenv("ALPACA_STOCK_FEED", "iex")
-    }
+    last_error = None
 
-    result = data_api(
-        "GET",
-        f"/v2/stocks/{UNDERLYING}/bars",
-        params=params
-    )
+    for attempt in range(1, SPY_DATA_RETRIES + 1):
 
-    bars = result.get("bars", [])
-
-    if len(bars) < 40:
-        raise APIError(
-            f"بيانات SPY غير كافية: {len(bars)} شمعة."
-        )
-
-    # استبعاد آخر شمعة لأنها قد تكون غير مكتملة.
-    bars = bars[:-1]
-
-    normalized = []
-
-    for bar in bars:
         try:
-            normalized.append({
-                "timestamp": bar["t"],
-                "open": float(bar["o"]),
-                "high": float(bar["h"]),
-                "low": float(bar["l"]),
-                "close": float(bar["c"]),
-                "volume": float(bar["v"])
-            })
-        except (KeyError, TypeError, ValueError):
-            continue
+            params = {
+                "timeframe": "1Min",
+                "limit": limit,
+                "adjustment": "raw",
+                "feed": os.getenv(
+                    "ALPACA_STOCK_FEED", "iex"
+                ),
+                "sort": "asc"
+            }
 
-    if len(normalized) < 40:
-        raise APIError("الشموع الصالحة أقل من الحد المطلوب.")
+            result = data_api(
+                "GET",
+                f"/v2/stocks/{UNDERLYING}/bars",
+                params=params
+            )
 
-    return normalized
+            bars = result.get("bars", [])
 
+            if not isinstance(bars, list):
+                raise MarketDataUnavailable(
+                    "استجابة شموع SPY ليست قائمة."
+                )
+
+            normalized = []
+
+            for bar in bars:
+                try:
+                    timestamp = datetime.fromisoformat(
+                        bar["t"].replace("Z", "+00:00")
+                    )
+
+                    if timestamp.tzinfo is None:
+                        timestamp = timestamp.replace(tzinfo=UTC)
+
+                    normalized.append({
+                        "timestamp": bar["t"],
+                        "_datetime": timestamp,
+                        "open": float(bar["o"]),
+                        "high": float(bar["h"]),
+                        "low": float(bar["l"]),
+                        "close": float(bar["c"]),
+                        "volume": float(bar["v"])
+                    })
+
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError
+                ):
+                    continue
+
+            normalized.sort(
+                key=lambda x: x["_datetime"]
+            )
+
+            # استبعاد الشمعة الحالية غير المكتملة.
+            now = datetime.now(UTC)
+
+            completed = []
+
+            for bar in normalized:
+
+                candle_end = (
+                    bar["_datetime"]
+                    + timedelta(minutes=1)
+                )
+
+                if candle_end <= now:
+                    completed.append(bar)
+
+            # التحقق من الأسعار.
+            valid = []
+
+            for bar in completed:
+
+                if (
+                    bar["open"] <= 0
+                    or bar["high"] <= 0
+                    or bar["low"] <= 0
+                    or bar["close"] <= 0
+                ):
+                    continue
+
+                if bar["high"] < bar["low"]:
+                    continue
+
+                if bar["volume"] < 0:
+                    continue
+
+                valid.append(bar)
+
+            if len(valid) < MIN_SPY_BARS:
+
+                raise MarketDataUnavailable(
+                    f"شموع SPY غير كافية: "
+                    f"{len(valid)}/{MIN_SPY_BARS}"
+                )
+
+            # التأكد من حداثة آخر شمعة.
+            last_bar = valid[-1]
+
+            age = (
+                now - last_bar["_datetime"]
+            ).total_seconds()
+
+            if age > SPY_MAX_BAR_AGE_SECONDS:
+
+                raise MarketDataUnavailable(
+                    f"بيانات SPY قديمة: "
+                    f"{age:.0f} ثانية."
+                )
+
+            # إزالة الحقل الداخلي.
+            for bar in valid:
+                bar.pop("_datetime", None)
+
+            log.info(
+                "SPY DATA OK | Candles=%s | Last=%s | Attempt=%s",
+                len(valid),
+                valid[-1]["timestamp"],
+                attempt
+            )
+
+            return valid
+
+        except MarketDataUnavailable as exc:
+
+            last_error = exc
+
+            log.warning(
+                "SPY DATA RETRY %s/%s: %s",
+                attempt,
+                SPY_DATA_RETRIES,
+                exc
+            )
+
+        except APIError as exc:
+
+            last_error = exc
+
+            log.warning(
+                "SPY API RETRY %s/%s: %s",
+                attempt,
+                SPY_DATA_RETRIES,
+                exc
+            )
+
+        except Exception as exc:
+
+            last_error = exc
+
+            log.exception(
+                "خطأ أثناء جلب بيانات SPY."
+            )
+
+        if attempt < SPY_DATA_RETRIES:
+            time.sleep(
+                SPY_RETRY_DELAY * attempt
+            )
+
+    raise MarketDataUnavailable(
+        f"تعذر الحصول على بيانات SPY الكافية "
+        f"بعد {SPY_DATA_RETRIES} محاولات. "
+        f"آخر خطأ: {last_error}"
+    )
 
 # =========================================================
 # 11) TECHNICAL INDICATORS
@@ -2579,10 +2718,11 @@ def manage_open_positions():
 
 
 # =========================================================
-# 35) MARKET SCAN
+# 35) MARKET SCAN — FAIL-SOFT DATA HANDLING
 # =========================================================
 
 def scan_for_entry():
+
     ensure_not_halted()
 
     if not market_is_open():
@@ -2605,11 +2745,52 @@ def scan_for_entry():
         log.info("يوجد مركز مفتوح؛ لا دخول جديد.")
         return
 
-    bars = get_spy_bars()
+    # جلب البيانات دون إيقاف البوت عند النقص.
+    try:
 
-    indicators = calculate_market_indicators(bars)
+        bars = get_spy_bars()
 
-    signal = get_market_signal(indicators)
+    except MarketDataUnavailable as exc:
+
+        log.warning(
+            "تأجيل تحليل الدخول بسبب نقص بيانات SPY: %s",
+            exc
+        )
+
+        return
+
+    except APIError as exc:
+
+        log.warning(
+            "تعذر الوصول إلى بيانات SPY مؤقتاً: %s",
+            exc
+        )
+
+        return
+
+    # لا نسمح بتحليل بيانات ناقصة.
+    if not bars or len(bars) < MIN_SPY_BARS:
+
+        log.warning(
+            "تأجيل الدخول: عدد الشموع غير كافٍ."
+        )
+
+        return
+
+    try:
+
+        indicators = calculate_market_indicators(bars)
+
+        signal = get_market_signal(indicators)
+
+    except (APIError, ValueError, ZeroDivisionError) as exc:
+
+        log.warning(
+            "تعذر حساب المؤشرات؛ تخطي دورة الدخول: %s",
+            exc
+        )
+
+        return
 
     candle_id = make_candle_id(
         indicators["timestamp"]
@@ -2639,10 +2820,21 @@ def scan_for_entry():
         log.info("هذه الشمعة تمت معالجتها مسبقاً.")
         return
 
-    contract = select_option_contract(
-        signal["direction"],
-        indicators["price"]
-    )
+    try:
+
+        contract = select_option_contract(
+            signal["direction"],
+            indicators["price"]
+        )
+
+    except APIError as exc:
+
+        log.warning(
+            "تعذر جلب عقود الخيارات: %s",
+            exc
+        )
+
+        return
 
     if not contract:
         return
@@ -2690,72 +2882,79 @@ def run_reconciliation_if_due():
 # 37) MAIN LOOP
 # =========================================================
 
-def run_bot():
-    log.info("=" * 60)
-    log.info("صَفاء التحليل v%s", VERSION)
-    log.info("Underlying: %s", UNDERLYING)
-    log.info("Trading URL: %s", TRADING_URL)
-    log.info("Paper mode: %s", PAPER_REQUIRED)
-    log.info("=" * 60)
-
-    acquire_instance_lock()
-
-    initialize_storage()
-
-    ensure_not_halted()
-    ensure_position_metadata()
-
-    # لا يبدأ التداول قبل المصالحة الأولية.
-    reconcile_all_orders()
-
     while True:
+
         try:
+
             ensure_not_halted()
 
             refresh_daily_baseline()
 
             check_daily_risk()
 
-            # المصالحة حتى بعد إغلاق السوق.
+            # المصالحة الدورية.
             run_reconciliation_if_due()
 
-            # إدارة المراكز أولاً.
+            # إدارة المراكز أولاً دائماً.
             positions = reconcile_positions()
 
             if positions:
-                manage_open_positions()
+
+                try:
+                    manage_open_positions()
+
+                except APIError as exc:
+
+                    log.error(
+                        "تعذر تحديث بيانات المركز: %s",
+                        exc
+                    )
 
             elif market_is_open():
-                scan_for_entry()
+
+                try:
+                    scan_for_entry()
+
+                except MarketDataUnavailable as exc:
+
+                    log.warning(
+                        "تخطي الدخول مؤقتاً: %s",
+                        exc
+                    )
 
             time.sleep(SCAN_SECONDS)
 
         except SafetyHalt as exc:
+
             halt_bot(str(exc))
+
             log.critical(
                 "توقف البوت لأسباب السلامة: %s",
                 exc
             )
+
             break
 
         except KeyboardInterrupt:
+
             log.warning(
                 "تم إيقاف البوت يدوياً."
             )
+
             break
 
         except Exception as exc:
+
             log.exception(
                 "خطأ في دورة التشغيل: %s",
                 exc
             )
 
-            # لا نكمل التداول بعد خطأ غير معروف.
             halt_bot(
                 f"خطأ غير متوقع: {exc}"
             )
-            break
 
+            break
 
 # =========================================================
 # 38) ENTRY POINT
