@@ -3179,59 +3179,72 @@ def sync_all_pending_fills():
 # 38) RECONCILE ALL ORDERS
 # =========================================================
 
+
 def reconcile_all_orders():
 
-    log.info(
-        "بدء المصالحة الدورية للأوامر."
-    )
+    log.info("بدء المصالحة الدورية للأوامر.")
 
     try:
-
         broker_orders = get_orders(
             status="all",
             limit=500
         )
 
     except Exception as exc:
-
-        log.error(
-            "تعذر جلب أوامر الوسيط: %s",
-            exc
-        )
-
+        log.error("تعذر جلب أوامر الوسيط: %s", exc)
         return False
 
-    known_ids = set(
-        LEDGER["orders"].keys()
-    )
+    known_ids = set(LEDGER["orders"].keys())
+
+    active_statuses = {
+        "new",
+        "accepted",
+        "pending_new",
+        "partially_filled",
+        "pending_cancel",
+        "pending_replace",
+        "held",
+        "stopped",
+        "calculated",
+    }
 
     for broker_order in broker_orders:
 
-        client_id = broker_order.get(
-            "client_order_id"
-        )
+        client_id = broker_order.get("client_order_id")
+        status = str(
+            broker_order.get("status", "")
+        ).lower()
 
         if not client_id:
             continue
 
         if client_id not in known_ids:
 
+            # الأمر المجهول المكتمل أو الملغي لا يوقف البوت
+            if status not in active_statuses:
+                log.info(
+                    "تجاهل أمر تاريخي غير نشط وغير مسجل محلياً | %s | %s",
+                    client_id,
+                    status
+                )
+                continue
+
+            # الأمر المجهول النشط يظل سبباً لإيقاف التداول
             log.critical(
-                "UNKNOWN BROKER ORDER | %s",
-                client_id
+                "UNKNOWN ACTIVE BROKER ORDER | %s | %s",
+                client_id,
+                status
             )
 
             halt_bot(
-                f"أمر غير معروف لدى الوسيط: {client_id}"
+                f"أمر نشط غير معروف لدى الوسيط: {client_id}"
             )
 
             return False
 
-        apply_broker_order_update(
-            broker_order
-        )
+        apply_broker_order_update(broker_order)
 
-    # فحص الأوامر المحلية التي لم تظهر لدى الوسيط
+    # فحص الأوامر المحلية ذات نتيجة الإرسال غير المحسومة
     for client_id, record in LEDGER["orders"].items():
 
         if (
@@ -3239,42 +3252,31 @@ def reconcile_all_orders():
             and not record.get("broker_order_id")
         ):
 
-            found = lookup_order_after_submit(
-                client_id
-            )
+            found = lookup_order_after_submit(client_id)
 
             if found:
-
-                apply_broker_order_update(
-                    found
-                )
+                apply_broker_order_update(found)
 
             else:
-
                 log.warning(
                     "UNRESOLVED ORDER | %s",
                     client_id
                 )
-
                 return False
 
     fills_ok = sync_all_pending_fills()
 
     if not fills_ok:
-
         log.warning(
             "المصالحة لم تكتمل: توجد تنفيذات قيد المزامنة."
         )
-
         return False
 
     STATE["last_reconciliation"] = utc_now()
 
     save_state()
 
-    log.info(
-        "اكتملت المصالحة الدورية للأوامر."
-    )
+    log.info("اكتملت المصالحة الدورية للأوامر.")
 
     return True
 
