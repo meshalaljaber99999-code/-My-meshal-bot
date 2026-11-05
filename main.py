@@ -1960,7 +1960,16 @@ def calculate_contract_quantity(
 # 24) SELECT BEST CONTRACT
 # =========================================================
 
+
+# ضع هذا المتغير مرة واحدة بجانب إعدادات البوت
+LAST_CONTRACT_REJECT_LOG = 0
+LAST_CONTRACT_REJECT_KEY = None
+
+
 def select_option_contract(option_type):
+
+    global LAST_CONTRACT_REJECT_LOG
+    global LAST_CONTRACT_REJECT_KEY
 
     candidates, stats = discover_option_candidates(
         option_type
@@ -1968,11 +1977,9 @@ def select_option_contract(option_type):
 
     if not candidates:
 
-        log.warning(
-            "لا يوجد عقد اجتاز فلاتر السوق. "
-            "Direction=%s | Discovered=%s | "
-            "SnapshotMissing=%s | Stale=%s | "
-            "SpreadRejected=%s | DeltaRejected=%s",
+        now = time.time()
+
+        reject_key = (
             option_type.upper(),
             stats["discovered"],
             stats["snapshot_missing"],
@@ -1980,6 +1987,27 @@ def select_option_contract(option_type):
             stats["spread_too_wide"],
             stats["delta_outside_range"]
         )
+
+        # سجل عند تغير السبب أو بعد مرور 60 ثانية
+        if (
+            reject_key != LAST_CONTRACT_REJECT_KEY
+            or now - LAST_CONTRACT_REJECT_LOG >= 60
+        ):
+
+            log.warning(
+                "[CONTRACT_REJECT] Direction=%s | "
+                "Discovered=%s | Missing=%s | "
+                "Stale=%s | Spread=%s | Delta=%s",
+                option_type.upper(),
+                stats["discovered"],
+                stats["snapshot_missing"],
+                stats["quote_stale"],
+                stats["spread_too_wide"],
+                stats["delta_outside_range"]
+            )
+
+            LAST_CONTRACT_REJECT_LOG = now
+            LAST_CONTRACT_REJECT_KEY = reject_key
 
         return None
 
@@ -1993,17 +2021,13 @@ def select_option_contract(option_type):
         )
 
         if quantity <= 0:
-
             stats["budget_rejected"] += 1
-
             continue
 
         candidate["quantity"] = quantity
 
         candidate["estimated_cost"] = (
-            candidate["ask"]
-            * 100.0
-            * quantity
+            candidate["ask"] * 100.0 * quantity
         )
 
         candidate["budget"] = budget
@@ -2028,14 +2052,6 @@ def select_option_contract(option_type):
         log_contract_stats(stats)
 
         return candidate
-
-    log.warning(
-        "العقود اجتازت شروط السوق، "
-        "لكن الميزانية لا تسمح بشراء عقد واحد. "
-        "Equity=$%.2f | Budget=$%.2f",
-        budget["equity"],
-        budget["allowed_budget"]
-    )
 
     log_contract_stats(stats)
 
