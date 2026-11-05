@@ -1137,8 +1137,8 @@ def get_option_contracts(option_type):
 
 def get_option_snapshots(symbols):
     """
-    طلب بيانات العقود على دفعات.
-    إذا فشل الطلب، لا نعتبر ذلك عدم وجود عقود.
+    جلب بيانات عقود الخيارات على دفعات.
+    نستخدم endpoint المخصص لرموز العقود.
     """
 
     snapshots = {}
@@ -1146,31 +1146,34 @@ def get_option_snapshots(symbols):
     unique_symbols = list(dict.fromkeys(symbols))
 
     for start in range(0, len(unique_symbols), 50):
+
         batch = unique_symbols[start:start + 50]
 
         if not batch:
             continue
 
-                result = options_data_api(
-    "GET",
-    "/v1beta1/options/snapshots",
-    params={
-        "symbols": ",".join(batch)
-    }
-)
+        result = options_data_api(
+            "GET",
+            "/v1beta1/options/snapshots",
+            params={
+                "symbols": ",".join(batch)
+            }
+        )
 
-batch_snapshots = result.get("snapshots", {})
+        batch_snapshots = result.get("snapshots", {})
 
-if not isinstance(batch_snapshots, dict):
-    raise APIError(
-        "استجابة بيانات الخيارات غير صالحة."
-    )
+        if not isinstance(batch_snapshots, dict):
+            raise APIError(
+                "استجابة بيانات الخيارات غير صالحة."
+            )
 
-snapshots.update(batch_snapshots)
+        snapshots.update(batch_snapshots)
 
-return snapshots
+    return snapshots
+
 
 def extract_snapshot_values(snapshot):
+
     quote = snapshot.get("latestQuote") or {}
     trade = snapshot.get("latestTrade") or {}
     greeks = snapshot.get("greeks") or {}
@@ -1193,8 +1196,6 @@ def extract_snapshot_values(snapshot):
         "delta": delta,
         "last": last_price
     }
-
-
 # =========================================================
 # 16) CONTRACT SELECTION
 # =========================================================
