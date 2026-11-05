@@ -4670,7 +4670,22 @@ def startup_reconciliation():
     )
 
     account = get_account()
+try:
+    client_id = "c721effa-f1fd-46d3-9179-130b43d05017"
 
+    result = get_order_by_client_id(client_id)
+
+    log.warning(
+        "ORDER LOOKUP RESULT: %s",
+        result
+    )
+
+except Exception as exc:
+
+    log.warning(
+        "ORDER LOOKUP FAILED: %s",
+        repr(exc)
+    )
     log.info(
         "ACCOUNT | Status=%s | "
         "Equity=%s | BuyingPower=%s | "
