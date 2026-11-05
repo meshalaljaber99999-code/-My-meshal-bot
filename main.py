@@ -1,904 +1,3725 @@
+
 # -*- coding: utf-8 -*-
 """
 =========================================================
-صَفاء التحليل v113.0
-SPY 0-DTE | PAPER FIRST | DIAGNOSTIC EXECUTION
+صَفاء التحليل v114.0
+SPY 0-DTE | MULTI-LEG ENGINE | PAPER ONLY
+=========================================================
+CALL | PUT | BULL CALL SPREAD | BULL PUT SPREAD
 =========================================================
 """
 
-import os, sys, json, time, uuid, math, logging, hashlib, threading
+import os, sys, json, time, uuid, math, logging, hashlib
+import threading
+from pathlib import Path
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
-from pathlib import Path
+
 import requests
 
 # =========================================================
 # 1) CONFIGURATION
 # =========================================================
-VERSION = "113.0"
+
+VERSION = "114.0"
+UNDERLYING = "SPY"
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
 
 BASE_DIR = Path(os.getenv("BOT_DATA_DIR", "."))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-STATE_FILE = BASE_DIR / "safaa_v113_state.json"
-LEDGER_FILE = BASE_DIR / "safaa_v113_ledger.json"
-INIT_FILE = BASE_DIR / "safaa_v113_initialized.flag"
-LOCK_FILE = BASE_DIR / "safaa_v113.lock"
+STATE_FILE = BASE_DIR / "safaa_v114_state.json"
+LEDGER_FILE = BASE_DIR / "safaa_v114_ledger.json"
+INIT_FILE = BASE_DIR / "safaa_v114_initialized.flag"
+LOCK_FILE = BASE_DIR / "safaa_v114.lock"
 
 API_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
 API_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
-TRADING_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
-DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-OPTIONS_DATA_URL = os.getenv("APCA_OPTIONS_DATA_URL", "https://data.alpaca.markets").rstrip("/")
 
-ALLOW_LIVE = os.getenv("ALLOW_LIVE_TRADING", "false").lower() == "true"
-CONFIRM_LIVE = os.getenv("CONFIRM_LIVE_TRADING", "false").lower() == "true"
-UNDERLYING = "SPY"
-PAPER_REQUIRED = not (ALLOW_LIVE and CONFIRM_LIVE)
+TRADING_URL = os.getenv(
+    "APCA_API_BASE_URL",
+    "https://paper-api.alpaca.markets"
+).rstrip("/")
+
+DATA_URL = os.getenv(
+    "APCA_DATA_URL",
+    "https://data.alpaca.markets"
+).rstrip("/")
+
+OPTIONS_DATA_URL = os.getenv(
+    "APCA_OPTIONS_DATA_URL",
+    "https://data.alpaca.markets"
+).rstrip("/")
+
+# Paper-only hard lock
+if "paper" not in TRADING_URL.lower():
+    raise RuntimeError("v114 تعمل على Paper فقط. عنوان التداول غير مقبول.")
+
+if os.getenv("ALLOW_LIVE_TRADING", "false").lower() == "true":
+    raise RuntimeError("التداول الحقيقي ممنوع في v114.")
+
+STRATEGY_MODE = os.getenv("STRATEGY_MODE", "AUTO").upper()
+
+VALID_STRATEGIES = {
+    "AUTO",
+    "CALL",
+    "PUT",
+    "BULL_CALL_SPREAD",
+    "BULL_PUT_SPREAD"
+}
+
+if STRATEGY_MODE not in VALID_STRATEGIES:
+    raise RuntimeError(f"STRATEGY_MODE غير صالح: {STRATEGY_MODE}")
 
 # Risk controls
 RISK_PER_TRADE = 0.02
 MAX_DAILY_DRAWDOWN = 0.03
 MAX_PREMIUM_FRACTION = 0.02
+
 MAX_OPEN_POSITIONS = 1
 MAX_TRADES_PER_DAY = 4
 MAX_CONSECUTIVE_LOSSES = 2
 
-# Contract selection
-TARGET_DELTA_MIN, TARGET_DELTA_MAX, TARGET_DELTA = 0.40, 0.65, 0.52
+# Option selection
+TARGET_DELTA_MIN = 0.40
+TARGET_DELTA_MAX = 0.65
+TARGET_DELTA = 0.52
+
 MAX_SPREAD_PERCENT = 0.12
-MIN_OPTION_ASK, MAX_OPTION_ASK = 0.20, 8.00
+MIN_OPTION_ASK = 0.20
+MAX_OPTION_ASK = 8.00
+
+# Spread selection
+SPREAD_MIN_WIDTH = 1.00
+SPREAD_MAX_WIDTH = 5.00
+SPREAD_MAX_DEBIT = 3.00
+SPREAD_MIN_CREDIT = 0.10
 
 # Position management
-STOP_LOSS_PERCENT, TAKE_PROFIT_PERCENT = 0.30, 0.60
-TRAIL_ACTIVATION_PERCENT, TRAIL_DISTANCE_PERCENT = 0.35, 0.18
+STOP_LOSS_PERCENT = 0.30
+TAKE_PROFIT_PERCENT = 0.60
+TRAIL_ACTIVATION_PERCENT = 0.35
+TRAIL_DISTANCE_PERCENT = 0.18
 
 # Trading hours - New York
-ENTRY_START, ENTRY_END = (9, 45), (14, 0)
+ENTRY_START = (9, 45)
+ENTRY_END = (14, 0)
 FORCE_EXIT_TIME = (15, 40)
-SCAN_SECONDS, REQUEST_TIMEOUT, MAX_API_RETRIES = 20, 15, 3
 
-# Execution safety
+# Execution
+SCAN_SECONDS = 20
+REQUEST_TIMEOUT = 15
+MAX_API_RETRIES = 3
+
 MAX_ENTRY_SLIPPAGE_PERCENT = 0.08
-ORDER_LOOKUP_WAIT_SECONDS, RECONCILIATION_INTERVAL = 3, 20
-FILL_SYNC_GRACE_SECONDS, FILL_SYNC_RETRIES = 12, 3
+MAX_OPTION_QUOTE_AGE_SECONDS = 60
 
-# Strategy
-FAST_EMA, SLOW_EMA = 9, 21
-RSI_PERIOD, VOLUME_LOOKBACK, MIN_SIGNAL_SCORE = 14, 20, 3
+RECONCILIATION_INTERVAL = 20
+ORDER_LOOKUP_WAIT_SECONDS = 3
+
+# Indicators
+FAST_EMA = 9
+SLOW_EMA = 21
+RSI_PERIOD = 14
+VOLUME_LOOKBACK = 20
+MIN_SIGNAL_SCORE = 3
 
 # Market data
-MIN_SPY_BARS, SPY_DATA_RETRIES, SPY_RETRY_DELAY = 40, 3, 2.5
-SPY_MAX_BAR_AGE_SECONDS, SPY_LOOKBACK_HOURS = 180, 6
+MIN_SPY_BARS = 40
+SPY_DATA_RETRIES = 3
+SPY_RETRY_DELAY = 2.5
+SPY_MAX_BAR_AGE_SECONDS = 180
+SPY_LOOKBACK_HOURS = 6
 
-# Diagnostics & Safety
-DIAGNOSTICS_ENABLED, LOG_REJECTED_CONTRACTS = True, True
-MAX_CONTRACT_DIAGNOSTIC_LINES = 30
+# Diagnostics
+DIAGNOSTICS_ENABLED = True
 REQUIRE_SINGLE_INSTANCE = True
 
 # =========================================================
 # 2) LOGGING
 # =========================================================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(BASE_DIR / "safaa_v113.log", encoding="utf-8")]
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(
+            BASE_DIR / "safaa_v114.log",
+            encoding="utf-8"
+        )
+    ]
 )
-log = logging.getLogger("SAFAA_V113")
+
+log = logging.getLogger("SAFAA_V114")
+
 
 def diagnostic(stage, message, *args):
-    if DIAGNOSTICS_ENABLED: log.info(f"[DIAGNOSTIC:{stage}] " + message, *args)
+    if DIAGNOSTICS_ENABLED:
+        log.info("[DIAGNOSTIC:%s] " + message, stage, *args)
 
-def reject(stage, reason, *args):
-    log.warning(f"[REJECT:{stage}] " + reason, *args)
+
+def reject(stage, message, *args):
+    log.warning("[REJECT:%s] " + message, stage, *args)
+
 
 # =========================================================
-# 3) BASIC VALIDATION
+# 3) VALIDATION
 # =========================================================
-if not API_KEY or not API_SECRET: raise RuntimeError("مفاتيح Alpaca غير موجودة. أضف APCA_API_KEY_ID و APCA_API_SECRET_KEY.")
-if ALLOW_LIVE and not CONFIRM_LIVE: raise RuntimeError("تم طلب Live دون تأكيد مستقل.")
-if not ALLOW_LIVE and "paper" not in TRADING_URL.lower(): raise RuntimeError("إعداد Paper مطلوب. عنوان التداول لا يبدو Paper.")
-if ALLOW_LIVE and CONFIRM_LIVE: log.critical("LIVE TRADING ENABLED. REAL MONEY IS AT RISK.")
-if REQUIRE_SINGLE_INSTANCE: log.warning("يجب تشغيل نسخة واحدة فقط من البوت على الحساب.")
+
+if not API_KEY or not API_SECRET:
+    raise RuntimeError(
+        "أضف APCA_API_KEY_ID و APCA_API_SECRET_KEY في Railway."
+    )
+
+if "paper" not in TRADING_URL.lower():
+    raise RuntimeError("رفض التشغيل: Paper API مطلوب.")
+
+log.warning("SAFAA v%s | PAPER TRADING ONLY", VERSION)
+log.warning("STRATEGY MODE: %s", STRATEGY_MODE)
+
 
 # =========================================================
 # 4) HTTP SESSION
 # =========================================================
+
 SESSION = requests.Session()
-SESSION.headers.update({"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET, "Content-Type": "application/json"})
 
-class APIError(Exception): pass
-class SafetyHalt(Exception): pass
-class MarketDataUnavailable(Exception): pass
+SESSION.headers.update({
+    "APCA-API-KEY-ID": API_KEY,
+    "APCA-API-SECRET-KEY": API_SECRET,
+    "Content-Type": "application/json"
+})
 
-def api_request(method, url, params=None, payload=None, timeout=REQUEST_TIMEOUT):
+
+class APIError(Exception):
+    pass
+
+
+class SafetyHalt(Exception):
+    pass
+
+
+class MarketDataUnavailable(Exception):
+    pass
+
+
+def api_request(method, url, params=None, payload=None):
     method = method.upper()
     attempts = 1 if method == "POST" else MAX_API_RETRIES
     last_error = None
+
     for attempt in range(attempts):
         try:
-            response = SESSION.request(method=method, url=url, params=params, json=payload, timeout=timeout)
+            response = SESSION.request(
+                method=method,
+                url=url,
+                params=params,
+                json=payload,
+                timeout=REQUEST_TIMEOUT
+            )
+
             if response.status_code >= 400:
-                detail = response.json() if response.text else response.text[:1000]
-                raise APIError(f"{method} {url} HTTP {response.status_code}: {detail}")
+                try:
+                    detail = response.json()
+                except Exception:
+                    detail = response.text[:1000]
+
+                raise APIError(
+                    f"{method} {url} HTTP "
+                    f"{response.status_code}: {detail}"
+                )
+
             return response.json() if response.text else {}
-        except APIError: raise
+
+        except APIError:
+            raise
+
         except requests.RequestException as exc:
             last_error = exc
-            if method == "POST": raise APIError(f"نتيجة POST غير مؤكدة. لن تتم إعادة إرسال الأمر تلقائياً. {exc}")
-            if attempt + 1 < attempts: time.sleep(1.5 * (attempt + 1))
+
+            if method == "POST":
+                raise APIError(
+                    "نتيجة POST غير مؤكدة؛ "
+                    "لن تتم إعادة إرسال الأمر تلقائياً."
+                )
+
+            if attempt + 1 < attempts:
+                time.sleep(1.5 * (attempt + 1))
+
     raise APIError(str(last_error))
 
-def trading_api(method, path, params=None, payload=None): return api_request(method, f"{TRADING_URL}{path}", params=params, payload=payload)
-def data_api(method, path, params=None): return api_request(method, f"{DATA_URL}{path}", params=params)
-def options_data_api(method, path, params=None): return api_request(method, f"{OPTIONS_DATA_URL}{path}", params=params)
+
+def trading_api(method, path, params=None, payload=None):
+    return api_request(
+        method,
+        f"{TRADING_URL}{path}",
+        params=params,
+        payload=payload
+    )
+
+
+def data_api(method, path, params=None):
+    return api_request(
+        method,
+        f"{DATA_URL}{path}",
+        params=params
+    )
+
+
+def options_data_api(method, path, params=None):
+    return api_request(
+        method,
+        f"{OPTIONS_DATA_URL}{path}",
+        params=params
+    )
+
 
 # =========================================================
-# 5) TIME / STORAGE HELPERS
+# 5) TIME AND GENERAL HELPERS
 # =========================================================
-def utc_now(): return datetime.now(UTC).isoformat()
-def ny_now(): return datetime.now(NY)
-def today_ny(): return ny_now().date().isoformat()
-def make_id(prefix): return f"{prefix}-{uuid.uuid4().hex[:20]}"
-def sha256_text(value): return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+def utc_now():
+    return datetime.now(UTC).isoformat()
+
+
+def ny_now():
+    return datetime.now(NY)
+
+
+def today_ny():
+    return ny_now().date().isoformat()
+
+
+def make_id(prefix):
+    return f"{prefix}-{uuid.uuid4().hex[:20]}"
+
+
+def sha256_text(value):
+    return hashlib.sha256(
+        str(value).encode("utf-8")
+    ).hexdigest()
+
+
+def safe_float(value):
+    try:
+        result = float(value)
+        return result if math.isfinite(result) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_market_timestamp(value):
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+
+        return parsed.astimezone(UTC)
+
+    except Exception:
+        return None
+
 
 def atomic_write_json(path, data):
-    temp_path = Path(str(path) + ".tmp")
-    with open(temp_path, "w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
+    temp = Path(str(path) + ".tmp")
+
+    with open(temp, "w", encoding="utf-8") as file:
+        json.dump(
+            data,
+            file,
+            ensure_ascii=False,
+            indent=2
+        )
         file.flush()
         os.fsync(file.fileno())
-    os.replace(temp_path, path)
+
+    os.replace(temp, path)
+
 
 def read_json(path):
-    with open(path, "r", encoding="utf-8") as file: return json.load(file)
+    with open(path, "r", encoding="utf-8") as file:
+        return json.load(file)
+
 
 # =========================================================
-# 6) INSTANCE LOCK
+# 6) SINGLE INSTANCE LOCK
 # =========================================================
+
 _INSTANCE_LOCK_HANDLE = None
+
+
 def acquire_instance_lock():
     global _INSTANCE_LOCK_HANDLE
-    try: import fcntl
-    except ImportError: raise SafetyHalt("تعذر استخدام قفل النظام.")
-    _INSTANCE_LOCK_HANDLE = open(LOCK_FILE, "a+", encoding="utf-8")
-    try: fcntl.flock(_INSTANCE_LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError: raise SafetyHalt("هناك نسخة أخرى تعمل على المسار نفسه.")
+
+    try:
+        import fcntl
+    except ImportError:
+        raise SafetyHalt("تعذر استخدام قفل النظام.")
+
+    _INSTANCE_LOCK_HANDLE = open(
+        LOCK_FILE,
+        "a+",
+        encoding="utf-8"
+    )
+
+    try:
+        fcntl.flock(
+            _INSTANCE_LOCK_HANDLE.fileno(),
+            fcntl.LOCK_EX | fcntl.LOCK_NB
+        )
+    except BlockingIOError:
+        raise SafetyHalt("هناك نسخة أخرى تعمل بالفعل.")
+
     _INSTANCE_LOCK_HANDLE.seek(0)
     _INSTANCE_LOCK_HANDLE.truncate()
     _INSTANCE_LOCK_HANDLE.write(str(os.getpid()))
     _INSTANCE_LOCK_HANDLE.flush()
 
+
 # =========================================================
 # 7) STATE AND LEDGER
 # =========================================================
+
 def default_state():
+    now = utc_now()
+
     return {
-        "version": VERSION, "created_at": utc_now(), "updated_at": utc_now(), "halted": False, "halt_reason": None,
-        "trading_day": today_ny(), "starting_equity": None, "daily_pnl": 0.0, "trades_today": 0, "consecutive_losses": 0,
-        "last_scan_candle": None, "last_reconciliation": None, "candle_orders": {}, "active_client_order_id": None,
-        "last_known_positions": {}, "last_known_orders": {}, "position_meta": {}
+        "version": VERSION,
+        "created_at": now,
+        "updated_at": now,
+        "halted": False,
+        "halt_reason": None,
+
+        "trading_day": today_ny(),
+        "starting_equity": None,
+        "daily_pnl": 0.0,
+        "trades_today": 0,
+        "consecutive_losses": 0,
+
+        "last_scan_candle": None,
+        "last_reconciliation": None,
+
+        "active_client_order_id": None,
+        "last_known_positions": {},
+        "position_meta": {},
+        "spread_meta": {}
     }
 
-def default_ledger(): return {"version": VERSION, "orders": {}, "fills": {}, "events": []}
 
-STATE, LEDGER = None, None
+def default_ledger():
+    return {
+        "version": VERSION,
+        "orders": {},
+        "fills": {},
+        "events": []
+    }
+
+
+STATE = None
+LEDGER = None
 STATE_MUTEX = threading.RLock()
+
 
 def save_state():
     with STATE_MUTEX:
         STATE["updated_at"] = utc_now()
         atomic_write_json(STATE_FILE, STATE)
 
+
 def save_ledger():
-    with STATE_MUTEX: atomic_write_json(LEDGER_FILE, LEDGER)
+    with STATE_MUTEX:
+        atomic_write_json(LEDGER_FILE, LEDGER)
+
+
+def ledger_event(event_type, data=None):
+    LEDGER.setdefault("events", []).append({
+        "id": make_id("EVT"),
+        "type": event_type,
+        "timestamp": utc_now(),
+        "data": data or {}
+    })
+
+    LEDGER["events"] = LEDGER["events"][-10000:]
+    save_ledger()
+
 
 def halt_bot(reason):
-    STATE["halted"], STATE["halt_reason"] = True, str(reason)
+    STATE["halted"] = True
+    STATE["halt_reason"] = str(reason)
+
     save_state()
+
     log.critical("TRADING HALTED: %s", reason)
 
+
 def ensure_not_halted():
-    if STATE.get("halted"): raise SafetyHalt(STATE.get("halt_reason") or "البوت متوقف لأسباب السلامة.")
+    if STATE.get("halted"):
+        raise SafetyHalt(
+            STATE.get("halt_reason") or "البوت متوقف."
+        )
+
+
+# =========================================================
+# 8) STORAGE INITIALIZATION
+# =========================================================
 
 def initialize_storage():
     global STATE, LEDGER
+
     if INIT_FILE.exists():
-        if not STATE_FILE.exists(): raise SafetyHalt("ملف الحالة مفقود.")
-        if not LEDGER_FILE.exists(): raise SafetyHalt("دفتر الصفقات مفقود.")
+        if not STATE_FILE.exists() or not LEDGER_FILE.exists():
+            raise SafetyHalt(
+                "ملفات الحالة أو دفتر الصفقات مفقودة."
+            )
+
         try:
-            STATE, LEDGER = read_json(STATE_FILE), read_json(LEDGER_FILE)
-        except Exception as exc: raise SafetyHalt(f"تعذر قراءة الملفات: {exc}")
-        if not isinstance(STATE, dict) or not isinstance(LEDGER, dict) or "orders" not in LEDGER or "fills" not in LEDGER:
-            raise SafetyHalt("بنية الملفات غير صالحة أو غير مكتملة.")
+            STATE = read_json(STATE_FILE)
+            LEDGER = read_json(LEDGER_FILE)
+        except Exception as exc:
+            raise SafetyHalt(
+                f"تعذر قراءة ملفات v114: {exc}"
+            )
+
+        if not isinstance(STATE, dict):
+            raise SafetyHalt("ملف الحالة غير صالح.")
+
+        if not isinstance(LEDGER, dict):
+            raise SafetyHalt("دفتر الصفقات غير صالح.")
+
+        if not isinstance(LEDGER.get("orders"), dict):
+            raise SafetyHalt("بنية سجل الأوامر غير صالحة.")
+
+        if not isinstance(LEDGER.get("fills"), dict):
+            raise SafetyHalt("بنية سجل التنفيذ غير صالحة.")
+
         for key, value in default_state().items():
-            if key not in STATE: STATE[key] = value
-        STATE["version"] = VERSION
+            STATE.setdefault(key, value)
+
+        LEDGER.setdefault("events", [])
+
+        if STATE.get("version") != VERSION:
+            raise SafetyHalt(
+                "إصدار ملفات الحالة لا يطابق v114."
+            )
+
         save_state()
-        log.info("تم تحميل الحالة والدفتر السابقين.")
+        log.info("تم تحميل ملفات v114 السابقة.")
         return
 
     account = trading_api("GET", "/v2/account")
-    if account.get("status") != "ACTIVE": raise SafetyHalt(f"حالة الحساب ليست ACTIVE: {account.get('status')}")
-    STATE, LEDGER = default_state(), default_ledger()
-    STATE["starting_equity"] = float(account.get("equity", 0) or 0)
+
+    if account.get("status") != "ACTIVE":
+        raise SafetyHalt(
+            f"الحساب غير نشط: {account.get('status')}"
+        )
+
+    STATE = default_state()
+    LEDGER = default_ledger()
+
+    STATE["starting_equity"] = safe_float(
+        account.get("equity")
+    )
+
+    if not STATE["starting_equity"]:
+        raise SafetyHalt("تعذر تحديد رأس المال.")
+
     save_state()
     save_ledger()
+
     with open(INIT_FILE, "w", encoding="utf-8") as file:
-        file.write(f"Initialized {utc_now()} | version={VERSION}\n")
+        file.write(
+            f"Initialized {utc_now()} | version={VERSION}\n"
+        )
         file.flush()
         os.fsync(file.fileno())
-    log.info("تم إنشاء الحالة لأول مرة. Equity=%.2f", STATE["starting_equity"])
+
+    log.info(
+        "تم إنشاء ملفات v114 | Equity=%.2f",
+        STATE["starting_equity"]
+    )
+
 
 # =========================================================
-# 8) ACCOUNT HELPERS
+# 9) ACCOUNT HELPERS
 # =========================================================
-def get_account(): return trading_api("GET", "/v2/account")
+
+def get_account():
+    return trading_api("GET", "/v2/account")
+
+
 def get_account_equity():
-    equity = float(get_account().get("equity", 0) or 0)
-    if not math.isfinite(equity) or equity <= 0: raise SafetyHalt("قيمة Equity غير صالحة.")
+    equity = safe_float(get_account().get("equity"))
+
+    if equity is None or equity <= 0:
+        raise SafetyHalt("قيمة Equity غير صالحة.")
+
     return equity
-def get_clock(): return trading_api("GET", "/v2/clock")
-def market_is_open(): return bool(get_clock().get("is_open", False))
+
+
+def get_clock():
+    return trading_api("GET", "/v2/clock")
+
+
+def market_is_open():
+    return bool(get_clock().get("is_open", False))
+
 
 def refresh_daily_baseline():
     current_day = today_ny()
-    if STATE.get("trading_day") == current_day: return
-    if STATE.get("active_client_order_id"): raise SafetyHalt("تغير يوم التداول مع وجود أمر غير محسوم.")
+
+    if STATE.get("trading_day") == current_day:
+        return
+
+    if STATE.get("active_client_order_id"):
+        raise SafetyHalt(
+            "تغير يوم التداول مع وجود أمر غير محسوم."
+        )
+
+    if get_positions():
+        raise SafetyHalt(
+            "تغير يوم التداول مع وجود مراكز مفتوحة؛ "
+            "يلزم التحقق قبل تحديث خط الأساس."
+        )
+
     equity = get_account_equity()
-    STATE.update({"trading_day": current_day, "starting_equity": equity, "daily_pnl": 0.0, "trades_today": 0, "consecutive_losses": 0})
+
+    STATE.update({
+        "trading_day": current_day,
+        "starting_equity": equity,
+        "daily_pnl": 0.0,
+        "trades_today": 0,
+        "consecutive_losses": 0
+    })
+
     save_state()
-    log.info("بداية يوم تداول جديد. Equity=%.2f", equity)
+
+    log.info(
+        "بداية يوم جديد | Equity=%.2f",
+        equity
+    )
+
 
 def check_daily_risk():
     ensure_not_halted()
-    start_equity = float(STATE.get("starting_equity") or 0)
-    if start_equity <= 0: raise SafetyHalt("قيمة رأس المال المرجعية غير صالحة.")
-    current_equity = get_account_equity()
-    pnl = current_equity - start_equity
+
+    starting = safe_float(
+        STATE.get("starting_equity")
+    )
+
+    if not starting or starting <= 0:
+        raise SafetyHalt("رأس المال المرجعي غير صالح.")
+
+    current = get_account_equity()
+    pnl = current - starting
+
     STATE["daily_pnl"] = pnl
     save_state()
-    max_loss = start_equity * MAX_DAILY_DRAWDOWN
+
+    max_loss = starting * MAX_DAILY_DRAWDOWN
+
     if pnl <= -max_loss:
-        halt_bot(f"تم بلوغ حد الخسارة اليومية: {pnl:.2f} USD")
+        halt_bot(
+            f"تم بلوغ حد الخسارة اليومية: {pnl:.2f} USD"
+        )
         raise SafetyHalt("تجاوز حد الخسارة اليومية.")
+
     if STATE["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
         halt_bot("تم بلوغ حد الخسائر المتتالية.")
         raise SafetyHalt("توقف بعد خسائر متتالية.")
 
+
 # =========================================================
-# 9) MARKET DATA
+# نهاية الجزء الأول
 # =========================================================
+
+# =========================================================
+# 10) MARKET DATA
+# =========================================================
+
 def get_spy_bars(limit=120):
+    feed = os.getenv("ALPACA_STOCK_FEED", "iex").lower().strip()
+
+    if feed not in ("iex", "sip", "boats", "otc"):
+        raise MarketDataUnavailable("مصدر بيانات SPY غير صالح.")
+
     last_error = None
-    feed = os.getenv("ALPACA_STOCK_FEED", "iex").strip().lower()
-    if feed not in ("iex", "sip", "boats", "otc"): raise MarketDataUnavailable(f"مصدر بيانات غير صالح: {feed}")
-    
+
     for attempt in range(1, SPY_DATA_RETRIES + 1):
         try:
-            request_now = datetime.now(UTC)
-            params = {
-                "timeframe": "1Min", "limit": int(limit), "adjustment": "raw",
-                "feed": feed, "sort": "desc",
-                "start": (request_now - timedelta(hours=SPY_LOOKBACK_HOURS)).isoformat(),
-                "end": request_now.isoformat()
-            }
-            bars = data_api("GET", f"/v2/stocks/{UNDERLYING}/bars", params=params).get("bars", [])
-            if not isinstance(bars, list) or not bars: raise MarketDataUnavailable("لم تصل شموع SPY.")
-            
-            normalized, seen, completed = [], set(), []
             now = datetime.now(UTC)
-            
-            for bar in bars:
+
+            params = {
+                "timeframe": "1Min",
+                "limit": int(limit),
+                "adjustment": "raw",
+                "feed": feed,
+                "sort": "desc",
+                "start": (
+                    now - timedelta(hours=SPY_LOOKBACK_HOURS)
+                ).isoformat(),
+                "end": now.isoformat()
+            }
+
+            response = data_api(
+                "GET",
+                f"/v2/stocks/{UNDERLYING}/bars",
+                params
+            )
+
+            raw = response.get("bars", [])
+
+            if not isinstance(raw, list) or not raw:
+                raise MarketDataUnavailable("لم تصل شموع SPY.")
+
+            bars, seen = [], set()
+
+            for item in raw:
                 try:
-                    timestamp = datetime.fromisoformat(bar["t"].replace("Z", "+00:00")).replace(tzinfo=UTC)
-                    candle_id = timestamp.isoformat()
-                    if candle_id in seen: continue
-                    seen.add(candle_id)
-                    values = {"open": float(bar["o"]), "high": float(bar["h"]), "low": float(bar["l"]), "close": float(bar["c"]), "volume": float(bar["v"])}
-                    if not all(math.isfinite(v) for v in values.values()) or min(values.values()) <= 0 or values["high"] < values["low"] or values["volume"] < 0: continue
-                    normalized.append({"timestamp": bar["t"], "_datetime": timestamp, **values})
-                except Exception: continue
-                
-            normalized.sort(key=lambda x: x["_datetime"])
-            for bar in normalized:
-                if bar["_datetime"] + timedelta(minutes=1) <= now: completed.append(bar)
-                
-            if len(completed) < MIN_SPY_BARS: raise MarketDataUnavailable(f"شموع غير كافية: {len(completed)}/{MIN_SPY_BARS}")
-            age = (now - (completed[-1]["_datetime"] + timedelta(minutes=1))).total_seconds()
-            if age < -5: raise MarketDataUnavailable("توقيت الشمعة يقع في المستقبل.")
-            if age > SPY_MAX_BAR_AGE_SECONDS: raise MarketDataUnavailable(f"بيانات SPY قديمة: {age:.1f}s")
-            
-            for bar in completed: bar.pop("_datetime", None)
-            log.info("SPY DATA OK | Feed=%s | Candles=%s | Last=%s | Age=%.1fs | Attempt=%s/%s", feed, len(completed), completed[-1]["timestamp"], age, attempt, SPY_DATA_RETRIES)
+                    ts = parse_market_timestamp(item.get("t"))
+                    if not ts or ts.isoformat() in seen:
+                        continue
+
+                    seen.add(ts.isoformat())
+
+                    bar = {
+                        "timestamp": ts.isoformat(),
+                        "_time": ts,
+                        "open": float(item["o"]),
+                        "high": float(item["h"]),
+                        "low": float(item["l"]),
+                        "close": float(item["c"]),
+                        "volume": float(item["v"])
+                    }
+
+                    values = [
+                        bar["open"], bar["high"], bar["low"],
+                        bar["close"], bar["volume"]
+                    ]
+
+                    if not all(math.isfinite(x) for x in values):
+                        continue
+
+                    if min(values[:4]) <= 0:
+                        continue
+
+                    if bar["high"] < bar["low"] or bar["volume"] < 0:
+                        continue
+
+                    if bar["high"] < max(bar["open"], bar["close"]):
+                        continue
+
+                    if bar["low"] > min(bar["open"], bar["close"]):
+                        continue
+
+                    bars.append(bar)
+
+                except (TypeError, ValueError, KeyError):
+                    continue
+
+            bars.sort(key=lambda x: x["_time"])
+
+            completed = [
+                b for b in bars
+                if b["_time"] + timedelta(minutes=1) <= now
+            ]
+
+            if len(completed) < MIN_SPY_BARS:
+                raise MarketDataUnavailable(
+                    f"شموع غير كافية: {len(completed)}/{MIN_SPY_BARS}"
+                )
+
+            age = (
+                now - (
+                    completed[-1]["_time"] +
+                    timedelta(minutes=1)
+                )
+            ).total_seconds()
+
+            if age < -5 or age > SPY_MAX_BAR_AGE_SECONDS:
+                raise MarketDataUnavailable(
+                    f"عمر بيانات SPY غير صالح: {age:.1f}s"
+                )
+
+            for b in completed:
+                b.pop("_time", None)
+
+            log.info(
+                "SPY DATA OK | Feed=%s | Bars=%s | Last=%s | Age=%.1fs",
+                feed, len(completed),
+                completed[-1]["timestamp"], age
+            )
+
             return completed
-            
-        except (MarketDataUnavailable, APIError) as exc:
+
+        except (APIError, MarketDataUnavailable) as exc:
             last_error = exc
-            log.warning("SPY DATA RETRY %s/%s: %s", attempt, SPY_DATA_RETRIES, exc)
+            log.warning(
+                "SPY DATA RETRY %s/%s: %s",
+                attempt, SPY_DATA_RETRIES, exc
+            )
+
         except Exception as exc:
             last_error = exc
             log.exception("خطأ غير متوقع في بيانات SPY.")
-        if attempt < SPY_DATA_RETRIES: time.sleep(SPY_RETRY_DELAY * attempt)
-    raise MarketDataUnavailable(f"تعذر جلب بيانات SPY. آخر خطأ: {last_error}")
+
+        if attempt < SPY_DATA_RETRIES:
+            time.sleep(SPY_RETRY_DELAY * attempt)
+
+    raise MarketDataUnavailable(
+        f"تعذر جلب بيانات SPY: {last_error}"
+    )
+
 
 # =========================================================
-# 10) TECHNICAL INDICATORS
+# 11) TECHNICAL INDICATORS
 # =========================================================
+
+def average(values):
+    return sum(values) / len(values) if values else None
+
+
 def ema(values, period):
-    if len(values) < period: return None
-    multiplier = 2.0 / (period + 1.0)
-    current = sum(values[:period]) / period
-    for value in values[period:]: current = (value * multiplier) + (current * (1.0 - multiplier))
-    return current
+    if len(values) < period:
+        return None
+
+    multiplier = 2.0 / (period + 1)
+    result = sum(values[:period]) / period
+
+    for value in values[period:]:
+        result = (
+            value * multiplier +
+            result * (1 - multiplier)
+        )
+
+    return result
+
 
 def calculate_rsi(values, period=RSI_PERIOD):
-    if len(values) <= period: return None
-    gains, losses = [], []
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
-    avg_gain, avg_loss = sum(gains[:period]) / period, sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0: return 100.0
-    return 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+    if len(values) <= period:
+        return None
+
+    changes = [
+        values[i] - values[i - 1]
+        for i in range(1, len(values))
+    ]
+
+    gains = [max(x, 0) for x in changes]
+    losses = [max(-x, 0) for x in changes]
+
+    avg_gain = average(gains[:period])
+    avg_loss = average(losses[:period])
+
+    for i in range(period, len(changes)):
+        avg_gain = (
+            avg_gain * (period - 1) + gains[i]
+        ) / period
+
+        avg_loss = (
+            avg_loss * (period - 1) + losses[i]
+        ) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+
+    return 100 - (100 / (1 + rs))
+
 
 def calculate_vwap(bars):
-    cumulative_pv, cumulative_volume = 0.0, 0.0
-    for bar in bars:
-        tp = (bar["high"] + bar["low"] + bar["close"]) / 3.0
-        vol = max(bar["volume"], 0)
-        cumulative_pv += tp * vol
-        cumulative_volume += vol
-    return (cumulative_pv / cumulative_volume) if cumulative_volume > 0 else None
+    # VWAP يبدأ من جلسة التداول الحالية فقط
+    today = today_ny()
 
-def average(values): return sum(values) / len(values) if values else None
+    session = [
+        b for b in bars
+        if parse_market_timestamp(
+            b["timestamp"]
+        ).astimezone(NY).date().isoformat() == today
+    ]
+
+    pv = volume = 0.0
+
+    for b in session:
+        typical = (
+            b["high"] + b["low"] + b["close"]
+        ) / 3
+
+        vol = max(b["volume"], 0)
+
+        pv += typical * vol
+        volume += vol
+
+    return pv / volume if volume > 0 else None
+
 
 def calculate_atr(bars, period=14):
-    if len(bars) <= period: return None
+    if len(bars) <= period:
+        return None
+
     ranges = []
+
     for i in range(1, len(bars)):
-        curr, prev = bars[i], bars[i - 1]
-        ranges.append(max(curr["high"] - curr["low"], abs(curr["high"] - prev["close"]), abs(curr["low"] - prev["close"])))
+        current = bars[i]
+        previous = bars[i - 1]
+
+        ranges.append(max(
+            current["high"] - current["low"],
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"])
+        ))
+
     return average(ranges[-period:])
 
+
 def calculate_market_indicators(bars):
-    closes, volumes = [b["close"] for b in bars], [b["volume"] for b in bars]
-    fast, slow, rsi, vwap, atr = ema(closes, FAST_EMA), ema(closes, SLOW_EMA), calculate_rsi(closes), calculate_vwap(bars), calculate_atr(bars)
-    if None in (fast, slow, rsi, vwap, atr): raise APIError("تعذر حساب المؤشرات الفنية.")
-    last, prev = bars[-1], bars[-2]
-    avg_vol = average(volumes[-(VOLUME_LOOKBACK + 1):-1])
-    volume_ratio = (last["volume"] / avg_vol) if avg_vol and avg_vol > 0 else 0.0
-    return {"price": last["close"], "previous_close": prev["close"], "fast_ema": fast, "slow_ema": slow, "rsi": rsi, "vwap": vwap, "atr": atr, "volume_ratio": volume_ratio, "timestamp": last["timestamp"]}
+    if len(bars) < max(
+        SLOW_EMA + 1,
+        RSI_PERIOD + 1,
+        VOLUME_LOOKBACK + 2
+    ):
+        raise MarketDataUnavailable(
+            "عدد الشموع غير كافٍ للمؤشرات."
+        )
+
+    closes = [b["close"] for b in bars]
+    volumes = [b["volume"] for b in bars]
+
+    fast = ema(closes, FAST_EMA)
+    slow = ema(closes, SLOW_EMA)
+    rsi = calculate_rsi(closes)
+    vwap = calculate_vwap(bars)
+    atr = calculate_atr(bars)
+
+    if any(x is None for x in (fast, slow, rsi, vwap, atr)):
+        raise MarketDataUnavailable(
+            "تعذر حساب المؤشرات."
+        )
+
+    last = bars[-1]
+    previous = bars[-2]
+
+    avg_volume = average(
+        volumes[-(VOLUME_LOOKBACK + 1):-1]
+    )
+
+    volume_ratio = (
+        last["volume"] / avg_volume
+        if avg_volume and avg_volume > 0
+        else 0.0
+    )
+
+    return {
+        "price": last["close"],
+        "previous_close": previous["close"],
+        "fast_ema": fast,
+        "slow_ema": slow,
+        "rsi": rsi,
+        "vwap": vwap,
+        "atr": atr,
+        "volume_ratio": volume_ratio,
+        "timestamp": last["timestamp"]
+    }
+
 
 # =========================================================
-# 11) MARKET SIGNAL
+# 12) MARKET SIGNAL ENGINE
 # =========================================================
+
 def get_market_signal(ind):
-    p, f, s, r, v, prev, vr = ind["price"], ind["fast_ema"], ind["slow_ema"], ind["rsi"], ind["vwap"], ind["previous_close"], ind["volume_ratio"]
-    bull, bear = 0, 0
-    if f > s: bull += 1
-    elif f < s: bear += 1
-    if p > v: bull += 1
-    elif p < v: bear += 1
-    if p > prev: bull += 1
-    elif p < prev: bear += 1
-    if 50 <= r <= 68: bull += 1
-    elif 32 <= r < 50: bear += 1
-    if vr >= 1.10:
-        if p > prev: bull += 1
-        elif p < prev: bear += 1
+    price = ind["price"]
+    fast = ind["fast_ema"]
+    slow = ind["slow_ema"]
+    rsi = ind["rsi"]
+    vwap = ind["vwap"]
+    previous = ind["previous_close"]
+    volume_ratio = ind["volume_ratio"]
 
-    if bull >= MIN_SIGNAL_SCORE and bull > bear: return {"direction": "CALL", "score": bull, "bullish_score": bull, "bearish_score": bear}
-    elif bear >= MIN_SIGNAL_SCORE and bear > bull: return {"direction": "PUT", "score": bear, "bullish_score": bull, "bearish_score": bear}
-    return {"direction": "NEUTRAL", "score": max(bull, bear), "bullish_score": bull, "bearish_score": bear}
+    bull = bear = 0
+
+    if fast > slow:
+        bull += 1
+    elif fast < slow:
+        bear += 1
+
+    if price > vwap:
+        bull += 1
+    elif price < vwap:
+        bear += 1
+
+    if price > previous:
+        bull += 1
+    elif price < previous:
+        bear += 1
+
+    if 50 <= rsi <= 68:
+        bull += 1
+    elif 32 <= rsi < 50:
+        bear += 1
+
+    if volume_ratio >= 1.10:
+        if price > previous:
+            bull += 1
+        elif price < previous:
+            bear += 1
+
+    if bull >= MIN_SIGNAL_SCORE and bull > bear:
+        direction = "CALL"
+
+    elif bear >= MIN_SIGNAL_SCORE and bear > bull:
+        direction = "PUT"
+
+    else:
+        direction = "NEUTRAL"
+
+    return {
+        "direction": direction,
+        "score": max(bull, bear),
+        "bullish_score": bull,
+        "bearish_score": bear,
+        "confidence_score": (
+            max(bull, bear) / 5
+        ) * 100
+    }
+
 
 # =========================================================
-# 12) CANDLE / TIME HELPERS
+# 13) TIME AND CANDLE HELPERS
 # =========================================================
-def make_candle_id(timestamp): return sha256_text(f"{UNDERLYING}|{timestamp}")[:24]
+
+def make_candle_id(timestamp):
+    return sha256_text(
+        f"{UNDERLYING}|{timestamp}"
+    )[:24]
+
+
 def entry_time_allowed():
     now = ny_now()
-    if now.weekday() >= 5: return False
-    return (ENTRY_START[0] * 60 + ENTRY_START[1]) <= (now.hour * 60 + now.minute) <= (ENTRY_END[0] * 60 + ENTRY_END[1])
-def force_exit_time_reached(): return (ny_now().hour * 60 + ny_now().minute) >= (FORCE_EXIT_TIME[0] * 60 + FORCE_EXIT_TIME[1])
+
+    if now.weekday() >= 5:
+        return False
+
+    current = now.hour * 60 + now.minute
+
+    start = ENTRY_START[0] * 60 + ENTRY_START[1]
+    end = ENTRY_END[0] * 60 + ENTRY_END[1]
+
+    return start <= current <= end
+
+
+def force_exit_time_reached():
+    now = ny_now()
+
+    current = now.hour * 60 + now.minute
+    target = FORCE_EXIT_TIME[0] * 60 + FORCE_EXIT_TIME[1]
+
+    return current >= target
+
 
 # =========================================================
-# 13-25) OPTIONS HANDLING (Combined logic for brevity)
+# 14) STRATEGY ROUTER
 # =========================================================
-def get_today_expiration(): return today_ny()
-def get_option_contracts(option_type):
-    return trading_api("GET", "/v2/options/contracts", params={"underlying_symbols": UNDERLYING, "status": "active", "expiration_date": get_today_expiration(), "type": option_type, "limit": 1000}).get("option_contracts", [])
+
+def choose_strategy(signal):
+    direction = signal.get("direction")
+
+    if direction == "NEUTRAL":
+        return None
+
+    if STRATEGY_MODE == "CALL":
+        return "CALL" if direction == "CALL" else None
+
+    if STRATEGY_MODE == "PUT":
+        return "PUT" if direction == "PUT" else None
+
+    if STRATEGY_MODE == "BULL_CALL_SPREAD":
+        return (
+            "BULL_CALL_SPREAD"
+            if direction == "CALL"
+            else None
+        )
+
+    if STRATEGY_MODE == "BULL_PUT_SPREAD":
+        return (
+            "BULL_PUT_SPREAD"
+            if direction == "CALL"
+            else None
+        )
+
+    # AUTO
+    if direction == "PUT":
+        return "PUT"
+
+    if direction == "CALL":
+        return "BULL_CALL_SPREAD"
+
+    return None
+
+
+# =========================================================
+# نهاية الجزء الثاني
+# =========================================================
+
+# =========================================================
+# 15) OPTIONS CONTRACT DISCOVERY
+# =========================================================
+
+def get_option_contracts(expiration_date=None):
+    params = {
+        "underlying_symbols": UNDERLYING,
+        "status": "active",
+        "type": "call",
+        "limit": 1000
+    }
+
+    if expiration_date:
+        params["expiration_date"] = expiration_date
+
+    response = trading_api(
+        "GET",
+        "/v2/options/contracts",
+        params
+    )
+
+    contracts = response.get("option_contracts", [])
+
+    if not isinstance(contracts, list):
+        raise APIError("صيغة قائمة عقود الخيارات غير صحيحة.")
+
+    return contracts
+
+
+def contract_expiration(contract):
+    try:
+        return date.fromisoformat(
+            str(contract.get("expiration_date", ""))
+        )
+    except ValueError:
+        return None
+
+
+def contract_strike(contract):
+    try:
+        strike = float(contract.get("strike_price"))
+        return strike if strike > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def contract_type(contract):
+    return str(
+        contract.get("type", "")
+    ).lower().strip()
+
+
+def contract_symbol(contract):
+    return str(
+        contract.get("symbol", "")
+    ).strip()
+
+
+def valid_spy_contract(contract, option_type):
+    if not isinstance(contract, dict):
+        return False
+
+    if contract_type(contract) != option_type.lower():
+        return False
+
+    if not contract_symbol(contract):
+        return False
+
+    if contract.get("underlying_symbol") != UNDERLYING:
+        return False
+
+    if contract.get("status") != "active":
+        return False
+
+    expiration = contract_expiration(contract)
+
+    if not expiration or expiration < today_ny():
+        return False
+
+    if expiration != today_ny():
+        return False
+
+    strike = contract_strike(contract)
+
+    return strike is not None
+
+
+def get_spy_option_contracts(option_type):
+    if option_type not in ("call", "put"):
+        raise ValueError("نوع العقد يجب أن يكون call أو put.")
+
+    params = {
+        "underlying_symbols": UNDERLYING,
+        "status": "active",
+        "type": option_type,
+        "expiration_date": today_ny().isoformat(),
+        "limit": 1000
+    }
+
+    response = trading_api(
+        "GET",
+        "/v2/options/contracts",
+        params
+    )
+
+    contracts = response.get("option_contracts", [])
+
+    if not isinstance(contracts, list):
+        raise APIError("بيانات العقود غير صالحة.")
+
+    valid = [
+        c for c in contracts
+        if valid_spy_contract(c, option_type)
+    ]
+
+    return valid
+
+
+# =========================================================
+# 16) OPTIONS SNAPSHOTS
+# =========================================================
 
 def get_option_snapshots(symbols):
-    snapshots = {}
-    for start in range(0, len(symbols), 50):
-        data = options_data_api("GET", "/v1beta1/options/snapshots", params={"symbols": ",".join(symbols[start:start + 50])}).get("snapshots", {})
-        if not isinstance(data, dict): raise APIError("استجابة snapshots غير صالحة.")
-        snapshots.update(data)
-    return snapshots
+    symbols = list(dict.fromkeys(
+        str(s).strip() for s in symbols if s
+    ))
 
-def safe_float(value):
+    if not symbols:
+        return {}
+
+    result = {}
+
+    # تقسيم الطلب لتجنب طول URL
+    for start in range(0, len(symbols), 100):
+        batch = symbols[start:start + 100]
+
+        response = options_data_api(
+            "GET",
+            f"/v1beta1/options/snapshots/{UNDERLYING}",
+            {
+                "symbols": ",".join(batch
+                ),
+                "feed": os.getenv(
+                    "ALPACA_OPTIONS_FEED",
+                    "indicative"
+                )
+            }
+        )
+
+        snapshots = response.get("snapshots", {})
+
+        if isinstance(snapshots, dict):
+            result.update(snapshots)
+
+    return result
+
+
+def extract_option_quote(snapshot):
+    if not isinstance(snapshot, dict):
+        return None
+
+    quote = snapshot.get("latestQuote", {})
+
+    if not isinstance(quote, dict):
+        return None
+
     try:
-        res = float(value)
-        return res if math.isfinite(res) else None
-    except (TypeError, ValueError): return None
+        bid = float(quote.get("bp", 0))
+        ask = float(quote.get("ap", 0))
 
-def parse_market_timestamp(value):
-    if not value: return None
-    try: return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=UTC).astimezone(UTC)
-    except Exception: return None
+        bid_size = float(quote.get("bs", 0) or 0)
+        ask_size = float(quote.get("as", 0) or 0)
 
-def extract_quote_and_delta(snapshot):
-    q = snapshot.get("latestQuote", {}) if isinstance(snapshot.get("latestQuote"), dict) else {}
-    g = snapshot.get("greeks", {}) if isinstance(snapshot.get("greeks"), dict) else {}
-    return {"bid": safe_float(q.get("bp")), "ask": safe_float(q.get("ap")), "bid_size": safe_float(q.get("bs")), "ask_size": safe_float(q.get("as")), "timestamp": parse_market_timestamp(q.get("t")), "delta": safe_float(g.get("delta"))}
+        timestamp = parse_market_timestamp(
+            quote.get("t")
+        )
 
-def quote_freshness(quote):
-    ts = quote.get("timestamp")
-    if not ts: return False, None, "QUOTE_TIMESTAMP_MISSING"
-    age = (datetime.now(UTC) - ts).total_seconds()
-    if age < -5: return False, age, "QUOTE_TIMESTAMP_FUTURE"
-    if age > float(os.getenv("MAX_OPTION_QUOTE_AGE_SECONDS", "60")): return False, age, "QUOTE_STALE"
-    return True, age, "QUOTE_FRESH"
+        if not timestamp:
+            return None
 
-def validate_contract_metadata(contract, option_type):
-    if not contract.get("symbol"): return False, "SYMBOL_MISSING"
-    if str(contract.get("type", "")).lower() not in (option_type, ""): return False, "WRONG_TYPE"
-    if str(contract.get("expiration_date", "")) != get_today_expiration(): return False, "WRONG_EXPIRATION"
-    if str(contract.get("status", "active")).lower() not in ("active", ""): return False, "CONTRACT_NOT_ACTIVE"
-    return True, "OK"
+        age = (
+            datetime.now(UTC) - timestamp
+        ).total_seconds()
 
-def calculate_spread_percent(bid, ask):
-    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid: return None
-    return (ask - bid) / ((bid + ask) / 2.0)
+        if age < -5 or age > MAX_QUOTE_AGE_SECONDS:
+            return None
 
-def discover_option_candidates(option_type):
-    stats = {k: 0 for k in ["discovered", "snapshot_missing", "quote_missing", "quote_stale", "invalid_bid", "invalid_ask", "ask_below_min", "ask_above_max", "spread_too_wide", "delta_missing", "delta_outside_range", "wrong_type", "wrong_expiration", "passed", "budget_rejected"]}
-    contracts = get_option_contracts(option_type)
-    if not contracts: return [], stats
-    
-    valid_contracts = []
-    for c in contracts:
-        v, r = validate_contract_metadata(c, option_type)
-        if v: valid_contracts.append(c)
-        elif r == "WRONG_TYPE": stats["wrong_type"] += 1
-        elif r == "WRONG_EXPIRATION": stats["wrong_expiration"] += 1
-            
-    symbols = [c["symbol"] for c in valid_contracts]
-    if not symbols: return [], stats
-    
-    snapshots, candidates = get_option_snapshots(symbols), []
-    for contract in valid_contracts:
-        stats["discovered"] += 1
-        snapshot = snapshots.get(contract["symbol"])
-        if not snapshot: stats["snapshot_missing"] += 1; continue
-        qd = extract_quote_and_delta(snapshot)
-        bid, ask, delta = qd["bid"], qd["ask"], qd["delta"]
-        
-        if bid is None or ask is None: stats["quote_missing"] += 1; continue
-        fresh, age, r_fresh = quote_freshness(qd)
-        if not fresh: stats["quote_stale"] += 1; continue
-        if bid <= 0: stats["invalid_bid"] += 1; continue
-        if ask <= 0 or ask < bid: stats["invalid_ask"] += 1; continue
-        if ask < MIN_OPTION_ASK: stats["ask_below_min"] += 1; continue
-        if ask > MAX_OPTION_ASK: stats["ask_above_max"] += 1; continue
-        
-        spread = calculate_spread_percent(bid, ask)
-        if spread is None or spread > MAX_SPREAD_PERCENT: stats["spread_too_wide"] += 1; continue
-        if delta is None: stats["delta_missing"] += 1; continue
-        if not (TARGET_DELTA_MIN <= abs(delta) <= TARGET_DELTA_MAX): stats["delta_outside_range"] += 1; continue
-        if qd["bid_size"] is not None and qd["bid_size"] <= 0: continue
-        if qd["ask_size"] is not None and qd["ask_size"] <= 0: continue
-        
-        stats["passed"] += 1
-        candidates.append({"symbol": contract["symbol"], "type": option_type, "expiration": contract.get("expiration_date"), "strike": safe_float(contract.get("strike_price")), "bid": bid, "ask": ask, "spread_percent": spread, "delta": delta, "absolute_delta": abs(delta), "quote_age_seconds": age, "bid_size": qd["bid_size"], "ask_size": qd["ask_size"], "snapshot": snapshot})
-        
-    candidates.sort(key=lambda c: (abs(c["absolute_delta"] - TARGET_DELTA) * 0.65) + ((c["spread_percent"] / MAX_SPREAD_PERCENT) * 0.35))
-    return candidates, stats
+        if not all(math.isfinite(x) for x in (
+            bid, ask, bid_size, ask_size
+        )):
+            return None
 
-def calculate_entry_budget():
-    eq = get_account_equity()
-    return {"equity": eq, "risk_budget": eq * RISK_PER_TRADE, "premium_budget": eq * MAX_PREMIUM_FRACTION, "allowed_budget": min(eq * RISK_PER_TRADE, eq * MAX_PREMIUM_FRACTION)}
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
 
-def calculate_contract_quantity(candidate, budget):
-    if candidate["ask"] <= 0: return 0
-    cost = candidate["ask"] * 100.0
-    qty = int(math.floor(budget["allowed_budget"] / cost))
-    return qty if (qty >= 1 and qty * cost <= budget["allowed_budget"] + 0.000001) else 0
+        if bid_size <= 0 or ask_size <= 0:
+            return None
 
-def select_option_contract(option_type):
-    candidates, stats = discover_option_candidates(option_type)
-    if not candidates: return None
-    budget = calculate_entry_budget()
-    for c in candidates:
-        qty = calculate_contract_quantity(c, budget)
-        if qty > 0:
-            c.update({"quantity": qty, "estimated_cost": c["ask"] * 100.0 * qty, "budget": budget})
-            log.info("SELECTED CONTRACT | %s | Bid=%.2f Ask=%.2f Delta=%.3f Qty=%s", c["symbol"], c["bid"], c["ask"], c["delta"], qty)
-            return c
-        stats["budget_rejected"] += 1
-    return None
+        spread = ask - bid
+        midpoint = (ask + bid) / 2
 
-def refresh_selected_contract(candidate):
-    snapshot = get_option_snapshots([candidate["symbol"]]).get(candidate["symbol"])
-    if not snapshot: raise APIError("تعذر تحديث Snapshot للعقد")
-    qd = extract_quote_and_delta(snapshot)
-    fresh, age, r = quote_freshness(qd)
-    if not fresh or qd["bid"] is None or qd["ask"] is None or qd["ask"] < qd["bid"]: raise APIError("بيانات العقد غير صالحة قبل الدخول.")
-    spread = calculate_spread_percent(qd["bid"], qd["ask"])
-    if spread is None or spread > MAX_SPREAD_PERCENT: raise APIError("اتساع السبريد قبل الدخول.")
-    slippage = (qd["ask"] - candidate["ask"]) / candidate["ask"]
-    if slippage > MAX_ENTRY_SLIPPAGE_PERCENT: raise APIError(f"ارتفاع سعر الدخول: {slippage * 100:.2f}%")
-    if qd["delta"] is None or not (TARGET_DELTA_MIN <= abs(qd["delta"]) <= TARGET_DELTA_MAX): raise APIError("Delta خارج النطاق")
-    
-    candidate.update({"bid": qd["bid"], "ask": qd["ask"], "delta": qd["delta"], "absolute_delta": abs(qd["delta"]), "spread_percent": spread, "quote_age_seconds": age, "snapshot": snapshot})
-    qty = calculate_contract_quantity(candidate, candidate["budget"])
-    if qty <= 0: raise APIError("السعر المحدث لا يسمح بشراء عقد.")
-    candidate.update({"quantity": qty, "estimated_cost": qd["ask"] * 100.0 * qty})
-    return candidate
+        spread_percent = (
+            spread / midpoint
+            if midpoint > 0 else 1
+        )
+
+        if spread_percent > MAX_SPREAD_PERCENT:
+            return None
+
+        return {
+            "bid": bid,
+            "ask": ask,
+            "bid_size": bid_size,
+            "ask_size": ask_size,
+            "mid": midpoint,
+            "spread": spread,
+            "spread_percent": spread_percent,
+            "timestamp": timestamp.isoformat(),
+            "age_seconds": age
+        }
+
+    except (TypeError, ValueError):
+        return None
+
 
 # =========================================================
-# 26-31) ORDER MANAGEMENT
+# 17) OPTION GREEKS
 # =========================================================
-def get_orders(status="open", limit=500): return trading_api("GET", "/v2/orders", params={"status": status, "limit": limit, "direction": "desc", "nested": "true"})
-def get_positions(): return trading_api("GET", "/v2/positions")
-def get_order_by_id(order_id): return trading_api("GET", f"/v2/orders/{order_id}")
-def get_order_by_client_id(cid): return trading_api("GET", "/v2/orders:by_client_order_id", params={"client_order_id": cid})
 
-def ledger_event(event_type, data=None):
-    LEDGER.setdefault("events", []).append({"id": make_id("EVT"), "type": event_type, "timestamp": utc_now(), "data": data or {}})
-    if len(LEDGER["events"]) > 10000: LEDGER["events"] = LEDGER["events"][-10000:]
-    save_ledger()
+def extract_option_greeks(snapshot):
+    if not isinstance(snapshot, dict):
+        return {}
 
-def register_order_intent(cid, symbol, qty, side, price, signal):
-    if cid in LEDGER["orders"]: raise SafetyHalt("محاولة تسجيل client_order_id مكرر.")
-    intent = {"client_order_id": cid, "broker_order_id": None, "symbol": symbol, "quantity": int(qty), "side": side, "limit_price": float(price), "signal": signal, "status": "INTENT_CREATED", "created_at": utc_now(), "updated_at": utc_now(), "filled_qty": 0.0, "filled_avg_price": None, "submitted": False, "terminal": False, "submission_unknown": False, "last_broker_status": None, "last_error": None}
-    LEDGER["orders"][cid] = intent
-    save_ledger()
-    ledger_event("ORDER_INTENT_CREATED", {"client_order_id": cid, "symbol": symbol, "quantity": qty, "side": side})
-    return intent
+    greeks = snapshot.get("greeks", {})
 
-def update_order_record(cid, **updates):
-    record = LEDGER["orders"].get(cid)
-    if not record: raise SafetyHalt("سجل الأمر غير موجود.")
-    record.update(updates)
-    record["updated_at"] = utc_now()
-    save_ledger()
-    return record
+    if not isinstance(greeks, dict):
+        return {}
 
-TERMINAL_ORDER_STATUSES = {"filled", "canceled", "expired", "rejected"}
-def order_is_terminal(status): return str(status).lower() in TERMINAL_ORDER_STATUSES
-def normalize_order(order): return {"id": order.get("id"), "client_order_id": order.get("client_order_id"), "symbol": order.get("symbol"), "status": str(order.get("status", "")).lower(), "qty": safe_float(order.get("qty")) or 0.0, "filled_qty": safe_float(order.get("filled_qty")) or 0.0, "filled_avg_price": safe_float(order.get("filled_avg_price")), "side": order.get("side"), "limit_price": safe_float(order.get("limit_price")), "submitted_at": order.get("submitted_at")}
-
-def apply_broker_order_update(order):
-    norm = normalize_order(order)
-    cid = norm["client_order_id"]
-    if not cid: raise SafetyHalt("أمر لدى الوسيط بلا client_order_id.")
-    record = LEDGER["orders"].get(cid)
-    if not record: raise SafetyHalt(f"أمر غير مسجل: {cid}")
-    if norm["filled_qty"] + 0.000001 < float(record.get("filled_qty", 0) or 0): raise SafetyHalt(f"تراجع كمية التنفيذ: {cid}")
-    record.update({"broker_order_id": norm["id"], "status": norm["status"], "last_broker_status": norm["status"], "filled_qty": norm["filled_qty"], "filled_avg_price": norm["filled_avg_price"], "submitted": True, "terminal": order_is_terminal(norm["status"]), "submission_unknown": False, "updated_at": utc_now()})
-    save_ledger()
-    return norm
-
-def create_client_order_id(symbol, candle_id): return f"SF113-{sha256_text(f'{VERSION}|{symbol}|{candle_id}')[:18]}"
-def active_entry_intent_exists(): return any(r.get("side") == "buy" and (r.get("submission_unknown") or not r.get("terminal", False) or r.get("status", "").lower() in ("new", "accepted", "pending_new", "partially_filled")) for r in LEDGER["orders"].values())
-
-def lookup_order_after_submit(cid):
-    last_error = None
-    for attempt in range(ORDER_LOOKUP_WAIT_SECONDS):
+    def number(name):
         try:
-            o = get_order_by_client_id(cid)
-            if o and o.get("id"): return o
-        except Exception as exc: last_error = exc
-        time.sleep(1)
-    log.warning("ORDER LOOKUP INCONCLUSIVE | ClientID=%s | LastError=%s", cid, last_error)
-    return None
+            value = float(greeks.get(name))
+            return value if math.isfinite(value) else None
+        except (TypeError, ValueError):
+            return None
 
-def submit_limit_order_once(candidate, signal):
-    ensure_not_halted()
-    if active_entry_intent_exists(): raise SafetyHalt("يوجد أمر شراء سابق غير محسوم.")
-    sym, qty, limit_price = candidate["symbol"], int(candidate["quantity"]), round(float(candidate["ask"]), 2)
-    if qty <= 0 or limit_price <= 0 or (limit_price * 100 * qty) > candidate["budget"]["allowed_budget"] + 0.000001: raise APIError("قيم العقد غير صالحة للميزانية.")
-    cid = create_client_order_id(sym, make_candle_id(candidate.get("signal_timestamp", utc_now())))
-    if cid in LEDGER["orders"]: raise SafetyHalt("تم تسجيل نية سابقة.")
-    
-    register_order_intent(cid, sym, qty, "buy", limit_price, signal)
-    STATE["active_client_order_id"] = cid
-    save_state()
-    
-    payload = {"symbol": sym, "qty": str(qty), "side": "buy", "type": "limit", "time_in_force": "day", "limit_price": f"{limit_price:.2f}", "client_order_id": cid}
-    log.info("SUBMITTING BUY | %s | Qty=%s | Limit=$%.2f | ClientID=%s", sym, qty, limit_price, cid)
-    try:
-        res = trading_api("POST", "/v2/orders", payload=payload)
-        if not res.get("id"): raise APIError("لا يوجد ID")
-        apply_broker_order_update(res)
-        ledger_event("ORDER_SUBMITTED", {"client_order_id": cid, "broker_order_id": res.get("id")})
-        return res
-    except APIError as exc:
-        update_order_record(cid, status="SUBMISSION_UNRESOLVED", submission_unknown=True, last_error=str(exc))
-        found = lookup_order_after_submit(cid)
-        if found: return apply_broker_order_update(found)
-        halt_bot(f"نتيجة إرسال الأمر غير محسومة: {cid}")
-        raise SafetyHalt("لم نتمكن من تأكيد حالة الأمر.")
-    except Exception as exc:
-        update_order_record(cid, status="SUBMISSION_UNRESOLVED", submission_unknown=True, last_error=str(exc))
-        halt_bot(f"خطأ إرسال: {exc}")
-        raise SafetyHalt("تم إيقاف التداول لحماية الحساب.")
+    return {
+        "delta": number("delta"),
+        "gamma": number("gamma"),
+        "theta": number("theta"),
+        "vega": number("vega"),
+        "rho": number("rho")
+    }
 
-def refresh_order_status(cid):
-    r = LEDGER["orders"].get(cid)
-    if not r: raise SafetyHalt("لا يوجد سجل للأمر.")
-    try:
-        o = get_order_by_id(r["broker_order_id"]) if r.get("broker_order_id") else get_order_by_client_id(cid)
-        if not o: return None
-        return apply_broker_order_update(o)
-    except Exception: return None
 
-# =========================================================
-# 34-38) FILLS & RECONCILIATION
-# =========================================================
-def fetch_fill_activities(after=None, max_pages=10):
-    acts, params = [], {"activity_types": "FILL", "direction": "asc", "page_size": 100}
-    if after: params["after"] = after
-    for _ in range(max_pages):
-        res = trading_api("GET", "/v2/account/activities", params=params)
-        if not res: break
-        acts.extend(res)
-        if len(res) < 100 or not res[-1].get("id"): break
-        params["page_token"] = res[-1].get("id")
-    return acts
+def delta_matches(snapshot, option_type):
+    greeks = extract_option_greeks(snapshot)
+    delta = greeks.get("delta")
 
-def apply_fill_activity(act):
-    aid = str(act.get("id", ""))
-    if not aid or aid in LEDGER["fills"]: return False
-    cid = act.get("client_order_id") or next((k for k, v in LEDGER["orders"].items() if v.get("broker_order_id") == act.get("order_id")), None)
-    if not cid or cid not in LEDGER["orders"]: return False
-    q, p, s = safe_float(act.get("qty")), safe_float(act.get("price")), str(act.get("side", "")).lower()
-    if not q or not p or s not in ("buy", "sell"): raise SafetyHalt("بيانات تنفيذ تالفة.")
-    rec = {"activity_id": aid, "order_id": act.get("order_id"), "client_order_id": cid, "symbol": act.get("symbol"), "qty": q, "price": p, "side": s, "timestamp": act.get("transaction_time"), "recorded_at": utc_now()}
-    LEDGER["fills"][aid] = rec
-    save_ledger()
-    ledger_event("FILL_RECORDED", rec)
+    if delta is None:
+        return False
+
+    absolute_delta = abs(delta)
+
+    if not MIN_DELTA <= absolute_delta <= MAX_DELTA:
+        return False
+
+    if option_type == "call" and delta <= 0:
+        return False
+
+    if option_type == "put" and delta >= 0:
+        return False
+
     return True
 
-def reconcile_order_fills(cid):
-    rec = LEDGER["orders"].get(cid)
-    if not rec: raise SafetyHalt("لا يوجد أمر.")
-    broker_f = float(rec.get("filled_qty", 0) or 0)
-    if broker_f <= 0: return True
-    for attempt in range(FILL_SYNC_RETRIES):
-        try:
-            for act in fetch_fill_activities(after=rec.get("submitted_at")):
-                if act.get("order_id") == rec.get("broker_order_id"): apply_fill_activity(act)
-            local_f = sum(float(f.get("qty", 0)) for f in LEDGER["fills"].values() if f.get("client_order_id") == cid and f.get("side") == rec.get("side"))
-            if abs(broker_f - local_f) <= 0.000001:
-                rec["fill_sync_pending"], rec["fill_sync_checked"] = False, True
-                save_ledger()
-                return True
-        except Exception: pass
-        if attempt + 1 < FILL_SYNC_RETRIES: time.sleep(FILL_SYNC_GRACE_SECONDS)
-    rec["fill_sync_pending"], rec["last_fill_sync_attempt"] = True, utc_now()
-    save_ledger()
-    return False
 
-def sync_all_pending_fills():
-    pending = [cid for cid, r in LEDGER["orders"].items() if float(r.get("filled_qty", 0) or 0) > 0 and (r.get("fill_sync_pending") or not r.get("fill_sync_checked"))]
-    return all(reconcile_order_fills(cid) for cid in pending)
+# =========================================================
+# 18) OPTION CANDIDATE BUILDER
+# =========================================================
 
-def reconcile_all_orders():
-    try: broker_orders = get_orders(status="all", limit=500)
-    except Exception as exc: log.error("تعذر جلب أوامر الوسيط: %s", exc); return False
-    known_ids = set(LEDGER["orders"].keys())
-    active_statuses = {"new", "accepted", "pending_new", "partially_filled", "pending_cancel", "pending_replace", "held", "stopped", "calculated"}
-    
-    for bo in broker_orders:
-        cid, status = bo.get("client_order_id"), str(bo.get("status", "")).lower()
-        if not cid: continue
-        if cid not in known_ids:
-            if status not in active_statuses:
-                log.debug("تجاهل أمر تاريخي غير نشط وغير مسجل محلياً | %s | %s", cid, status) # FIXED: Changed from info to debug
+def build_option_candidates(option_type, market_price):
+    contracts = get_spy_option_contracts(option_type)
+
+    if not contracts:
+        log.warning(
+            "لا توجد عقود %s متاحة.",
+            option_type.upper()
+        )
+        return []
+
+    selected = []
+
+    for contract in contracts:
+        strike = contract_strike(contract)
+
+        if strike is None:
+            continue
+
+        # نطاق أولي لتقليل عدد طلبات الأسعار
+        if abs(strike - market_price) > 15:
+            continue
+
+        selected.append(contract)
+
+    if not selected:
+        return []
+
+    symbols = [
+        contract_symbol(c)
+        for c in selected
+    ]
+
+    snapshots = get_option_snapshots(symbols)
+
+    candidates = []
+
+    for contract in selected:
+        symbol = contract_symbol(contract)
+        snapshot = snapshots.get(symbol)
+
+        quote = extract_option_quote(snapshot)
+
+        if not quote:
+            continue
+
+        if quote["ask"] < MIN_OPTION_ASK:
+            continue
+
+        if quote["ask"] > MAX_OPTION_ASK:
+            continue
+
+        if not delta_matches(snapshot, option_type):
+            continue
+
+        greeks = extract_option_greeks(snapshot)
+
+        candidates.append({
+            "symbol": symbol,
+            "type": option_type,
+            "strike": contract_strike(contract),
+            "expiration": contract_expiration(
+                contract
+            ).isoformat(),
+            "quote": quote,
+            "greeks": greeks,
+            "snapshot": snapshot
+        })
+
+    candidates.sort(
+        key=lambda x: (
+            abs(
+                abs(x["greeks"]["delta"]) -
+                TARGET_DELTA
+            ),
+            x["quote"]["spread_percent"],
+            x["quote"]["age_seconds"]
+        )
+    )
+
+    return candidates
+
+
+# =========================================================
+# 19) SINGLE LEG SELECTION
+# =========================================================
+
+def select_single_option(option_type, market_price):
+    candidates = build_option_candidates(
+        option_type,
+        market_price
+    )
+
+    if not candidates:
+        reject(
+            f"لم نجد عقد {option_type.upper()} "
+            "مطابقاً لشروط السعر والدلتا والسيولة."
+        )
+        return None
+
+    best = candidates[0]
+
+    log.info(
+        "OPTION SELECTED | %s | Strike=%.2f | "
+        "Bid=%.2f Ask=%.2f Delta=%.3f",
+        best["symbol"],
+        best["strike"],
+        best["quote"]["bid"],
+        best["quote"]["ask"],
+        best["greeks"]["delta"]
+    )
+
+    return best
+
+
+# =========================================================
+# 20) SPREAD PAIR SELECTION
+# =========================================================
+
+def spread_width_allowed(width):
+    return MIN_SPREAD_WIDTH <= width <= MAX_SPREAD_WIDTH
+
+
+def build_bull_call_pairs(market_price):
+    calls = build_option_candidates(
+        "call",
+        market_price
+    )
+
+    pairs = []
+
+    for long_call in calls:
+        for short_call in calls:
+            if (
+                long_call["symbol"] ==
+                short_call["symbol"]
+            ):
                 continue
-            log.critical("UNKNOWN ACTIVE BROKER ORDER | %s | %s", cid, status)
-            halt_bot(f"أمر نشط غير معروف: {cid}")
-            return False
-        apply_broker_order_update(bo)
-        
-    for cid, rec in LEDGER["orders"].items():
-        if rec.get("submission_unknown") and not rec.get("broker_order_id"):
-            found = lookup_order_after_submit(cid)
-            if found: apply_broker_order_update(found)
-            else: return False
-            
-    if not sync_all_pending_fills(): return False
-    STATE["last_reconciliation"] = utc_now()
-    save_state()
-    return True
+
+            width = (
+                short_call["strike"] -
+                long_call["strike"]
+            )
+
+            if not spread_width_allowed(width):
+                continue
+
+            if short_call["strike"] <= long_call["strike"]:
+                continue
+
+            debit = (
+                long_call["quote"]["ask"] -
+                short_call["quote"]["bid"]
+            )
+
+            if debit <= 0 or debit > MAX_SPREAD_DEBIT:
+                continue
+
+            if debit >= width:
+                continue
+
+            # اختيار الرجل الطويلة أقرب إلى الدلتا المستهدفة
+            long_delta = abs(
+                long_call["greeks"]["delta"]
+            )
+
+            short_delta = abs(
+                short_call["greeks"]["delta"]
+            )
+
+            score = (
+                abs(long_delta - TARGET_DELTA) * 3
+                + abs(short_delta - 0.25)
+                + long_call["quote"]["spread_percent"]
+                + short_call["quote"]["spread_percent"]
+            )
+
+            pairs.append({
+                "strategy": "BULL_CALL_SPREAD",
+                "long_leg": long_call,
+                "short_leg": short_call,
+                "width": width,
+                "entry_price": round(debit, 2),
+                "max_loss_per_share": debit,
+                "max_gain_per_share": width - debit,
+                "breakeven": (
+                    long_call["strike"] + debit
+                ),
+                "score": score
+            })
+
+    pairs.sort(key=lambda x: x["score"])
+
+    return pairs
+
+
+def build_bull_put_pairs(market_price):
+    puts = build_option_candidates(
+        "put",
+        market_price
+    )
+
+    pairs = []
+
+    for short_put in puts:
+        for long_put in puts:
+            if (
+                short_put["symbol"] ==
+                long_put["symbol"]
+            ):
+                continue
+
+            width = (
+                short_put["strike"] -
+                long_put["strike"]
+            )
+
+            if not spread_width_allowed(width):
+                continue
+
+            if short_put["strike"] <= long_put["strike"]:
+                continue
+
+            credit = (
+                short_put["quote"]["bid"] -
+                long_put["quote"]["ask"]
+            )
+
+            if credit < MIN_SPREAD_CREDIT:
+                continue
+
+            if credit >= width:
+                continue
+
+            short_delta = abs(
+                short_put["greeks"]["delta"]
+            )
+
+            long_delta = abs(
+                long_put["greeks"]["delta"]
+            )
+
+            score = (
+                abs(short_delta - TARGET_DELTA) * 3
+                + abs(long_delta - 0.25)
+                + short_put["quote"]["spread_percent"]
+                + long_put["quote"]["spread_percent"]
+            )
+
+            pairs.append({
+                "strategy": "BULL_PUT_SPREAD",
+                "short_leg": short_put,
+                "long_leg": long_put,
+                "width": width,
+                "entry_price": round(credit, 2),
+                "max_gain_per_share": credit,
+                "max_loss_per_share": width - credit,
+                "breakeven": (
+                    short_put["strike"] - credit
+                ),
+                "score": score
+            })
+
+    pairs.sort(key=lambda x: x["score"])
+
+    return pairs
+
+
+def select_spread(strategy, market_price):
+    if strategy == "BULL_CALL_SPREAD":
+        pairs = build_bull_call_pairs(market_price)
+
+    elif strategy == "BULL_PUT_SPREAD":
+        pairs = build_bull_put_pairs(market_price)
+
+    else:
+        raise ValueError(
+            f"استراتيجية سبريد غير مدعومة: {strategy}"
+        )
+
+    if not pairs:
+        reject(
+            f"لم نجد زوج عقود صالحاً للاستراتيجية {strategy}."
+        )
+        return None
+
+    best = pairs[0]
+
+    log.info(
+        "SPREAD SELECTED | %s | Width=%.2f | "
+        "Entry=%.2f | MaxLoss=%.2f | MaxGain=%.2f",
+        strategy,
+        best["width"],
+        best["entry_price"],
+        best["max_loss_per_share"],
+        best["max_gain_per_share"]
+    )
+
+    return best
+
 
 # =========================================================
-# 39-50) POSITIONS & EXIT ENGINE
+# نهاية الجزء الثالث
 # =========================================================
-def get_option_positions(): return [p for p in get_positions() if str(p.get("asset_class", "")).lower() == "us_option" or str(p.get("symbol", "")).startswith("SPY")]
-def position_quantity(position): return safe_float(position.get("qty")) or 0.0
 
-def reconcile_positions():
-    broker_pos = {p["symbol"]: {"qty": position_quantity(p), "avg_entry_price": safe_float(p.get("avg_entry_price"))} for p in get_option_positions() if p.get("symbol") and abs(position_quantity(p)) > 0}
-    known_syms = {r["symbol"] for r in LEDGER["orders"].values() if float(r.get("filled_qty", 0) or 0) > 0 and r.get("symbol")}
-    for sym, bp in broker_pos.items():
-        if sym not in known_syms:
-            halt_bot(f"مركز خيارات غير معروف: {sym}")
-            return False
-    STATE["last_known_positions"] = broker_pos
-    save_state()
+# =========================================================
+# 21) POSITION SIZING AND RISK ENGINE
+# =========================================================
+
+def get_available_buying_power():
+    account = get_account()
+
+    buying_power = safe_float(
+        account.get("buying_power"), 0
+    )
+
+    if buying_power <= 0:
+        raise SafetyHalt("Buying power غير صالح.")
+
+    return buying_power
+
+
+def calculate_contract_quantity(
+    entry_price,
+    max_loss_per_share,
+    equity
+):
+    if entry_price <= 0 or max_loss_per_share <= 0:
+        return 0
+
+    buying_power = get_available_buying_power()
+
+    risk_budget = equity * RISK_PER_TRADE
+    premium_budget = equity * MAX_PREMIUM_FRACTION
+
+    risk_budget = min(
+        risk_budget,
+        equity * MAX_DAILY_DRAWDOWN
+    )
+
+    max_contracts_by_risk = math.floor(
+        risk_budget / (max_loss_per_share * 100)
+    )
+
+    max_contracts_by_premium = math.floor(
+        premium_budget / (entry_price * 100)
+    )
+
+    max_contracts_by_buying_power = math.floor(
+        buying_power / (entry_price * 100)
+    )
+
+    quantity = min(
+        max_contracts_by_risk,
+        max_contracts_by_premium,
+        max_contracts_by_buying_power,
+        10
+    )
+
+    return max(0, int(quantity))
+
+
+def calculate_single_leg_quantity(option, equity):
+    ask = option["quote"]["ask"]
+
+    quantity = calculate_contract_quantity(
+        entry_price=ask,
+        max_loss_per_share=ask,
+        equity=equity
+    )
+
+    return quantity
+
+
+def calculate_spread_quantity(spread, equity):
+    entry = spread["entry_price"]
+
+    if spread["strategy"] == "BULL_CALL_SPREAD":
+        max_loss = spread["max_loss_per_share"]
+
+    elif spread["strategy"] == "BULL_PUT_SPREAD":
+        max_loss = spread["max_loss_per_share"]
+
+    else:
+        return 0
+
+    return calculate_contract_quantity(
+        entry_price=entry,
+        max_loss_per_share=max_loss,
+        equity=equity
+    )
+
+
+# =========================================================
+# 22) ORDER VALIDATION
+# =========================================================
+
+def validate_order_quantity(quantity):
+    if not isinstance(quantity, int):
+        raise ValueError("كمية الأمر يجب أن تكون عدداً صحيحاً.")
+
+    if quantity < 1 or quantity > 10:
+        raise SafetyHalt("كمية العقد خارج حدود الأمان.")
+
     return True
 
-def count_filled_entries_today():
-    c = sum(1 for r in LEDGER["orders"].values() if r.get("side") == "buy" and r.get("created_at") and parse_market_timestamp(r["created_at"]) and parse_market_timestamp(r["created_at"]).astimezone(NY).date().isoformat() == today_ny() and float(r.get("filled_qty", 0) or 0) > 0)
-    STATE["trades_today"] = c
-    save_state()
-    return c
 
-def can_open_new_trade():
+def validate_option_symbol(symbol):
+    symbol = str(symbol or "").strip()
+
+    if not symbol.startswith("SPY"):
+        raise SafetyHalt(
+            f"رفض عقد خارج الأصل الأساسي: {symbol}"
+        )
+
+    if len(symbol) < 15:
+        raise SafetyHalt(
+            f"رمز عقد الخيارات غير مكتمل: {symbol}"
+        )
+
+    return True
+
+
+def validate_entry_window():
+    if not market_is_open():
+        raise SafetyHalt("السوق مغلق.")
+
+    if not entry_time_allowed():
+        raise SafetyHalt("خارج وقت السماح بالدخول.")
+
+    if force_exit_time_reached():
+        raise SafetyHalt("وصل وقت إيقاف الدخول.")
+
+    return True
+
+
+def validate_entry_conditions():
     ensure_not_halted()
-    if not market_is_open(): return reject("MARKET", "السوق مغلق.") or False
-    if not entry_time_allowed(): return reject("TIME", "خارج الدخول.") or False
-    if active_entry_intent_exists(): return reject("ORDER", "أمر دخول غير محسوم.") or False
-    if not reconcile_all_orders(): return reject("RECON", "فشل مصالحة الأوامر.") or False
-    if not reconcile_positions(): return reject("POS", "فشل مصالحة المراكز.") or False
-    if len(get_option_positions()) >= MAX_OPEN_POSITIONS: return reject("LIMIT", "الحد الأقصى للمراكز.") or False
-    if count_filled_entries_today() >= MAX_TRADES_PER_DAY: return reject("TRADES", "الحد اليومي.") or False
+    validate_entry_window()
     check_daily_risk()
+
+    if state.get("active_order_id"):
+        raise SafetyHalt(
+            "يوجد أمر سابق لم تتم تسويته."
+        )
+
+    if len(state.get("position_meta", {})) >= MAX_OPEN_POSITIONS:
+        raise SafetyHalt("تم بلوغ الحد الأقصى للمراكز.")
+
+    if state.get("trades_today", 0) >= MAX_TRADES_PER_DAY:
+        raise SafetyHalt("تم بلوغ الحد اليومي للصفقات.")
+
+    if state.get("consecutive_losses", 0) >= MAX_CONSECUTIVE_LOSSES:
+        raise SafetyHalt("تم بلوغ حد الخسائر المتتالية.")
+
     return True
 
-def calc_stop(p): return round(p * (1 - STOP_LOSS_PERCENT), 2)
-def calc_target(p): return round(p * (1 + TAKE_PROFIT_PERCENT), 2)
-def calc_trail(p, h): return round(max(h * (1 - TRAIL_DISTANCE_PERCENT), p), 2) if h >= p * (1 + TRAIL_ACTIVATION_PERCENT) else None
 
-def init_pos_meta(sym, entry, qty):
-    STATE["position_meta"][sym] = {"entry_price": float(entry), "quantity": float(qty), "highest_price": float(entry), "stop_price": calc_stop(entry), "target_price": calc_target(entry), "created_at": utc_now(), "last_update": utc_now()}
+# =========================================================
+# 23) ORDER LEDGER
+# =========================================================
+
+def register_order(order_data):
+    order_id = order_data.get("id")
+
+    if not order_id:
+        raise APIError("استجابة الوسيط لا تحتوي order ID.")
+
+    ledger.setdefault("orders", {})[order_id] = {
+        "id": order_id,
+        "client_order_id": order_data.get(
+            "client_order_id"
+        ),
+        "status": order_data.get("status"),
+        "created_at": utc_now().isoformat(),
+        "updated_at": utc_now().isoformat(),
+        "strategy": order_data.get(
+            "_strategy", "UNKNOWN"
+        ),
+        "order_class": order_data.get(
+            "order_class", "simple"
+        ),
+        "symbols": order_data.get(
+            "_symbols", []
+        ),
+        "legs": order_data.get(
+            "_legs", []
+        ),
+        "requested_qty": int(
+            order_data.get("qty", 0) or 0
+        ),
+        "filled_qty": 0,
+        "average_fill_price": None
+    }
+
+    save_ledger()
+
+    return order_id
+
+
+def update_order_record(order_id, order):
+    record = ledger.setdefault(
+        "orders", {}
+    ).get(order_id)
+
+    if not record:
+        return
+
+    record["status"] = order.get("status")
+    record["filled_qty"] = int(
+        safe_float(order.get("filled_qty"), 0)
+    )
+
+    record["average_fill_price"] = safe_float(
+        order.get("filled_avg_price")
+    )
+
+    record["updated_at"] = utc_now().isoformat()
+
+    save_ledger()
+
+
+# =========================================================
+# 24) ORDER SUBMISSION
+# =========================================================
+
+def submit_order_payload(payload):
+    validate_order_quantity(
+        int(payload.get("qty", 0))
+    )
+
+    client_order_id = (
+        f"SAFAA114-{today_ny().strftime('%Y%m%d')}-"
+        f"{uuid.uuid4().hex[:12]}"
+    )
+
+    payload["client_order_id"] = client_order_id
+
+    response = trading_api(
+        "POST",
+        "/v2/orders",
+        payload
+    )
+
+    if not isinstance(response, dict) or not response.get("id"):
+        raise APIError(
+            "لم يؤكد الوسيط إنشاء الأمر."
+        )
+
+    log.info(
+        "ORDER SUBMITTED | ID=%s | Status=%s",
+        response["id"],
+        response.get("status")
+    )
+
+    return response
+
+
+# =========================================================
+# 25) SINGLE LEG ORDER
+# =========================================================
+
+def submit_single_leg(option, direction, quantity):
+    validate_entry_conditions()
+    validate_order_quantity(quantity)
+
+    if direction not in ("CALL", "PUT"):
+        raise ValueError("اتجاه الصفقة غير صالح.")
+
+    validate_option_symbol(option["symbol"])
+
+    if option["type"] != direction.lower():
+        raise SafetyHalt(
+            "نوع العقد لا يتوافق مع اتجاه الصفقة."
+        )
+
+    quote = option["quote"]
+
+    if quote["age_seconds"] > MAX_QUOTE_AGE_SECONDS:
+        raise SafetyHalt("سعر العقد قديم.")
+
+    limit_price = round(
+        quote["ask"] + MAX_ENTRY_SLIPPAGE,
+        2
+    )
+
+    if limit_price > MAX_OPTION_ASK:
+        raise SafetyHalt("سعر الدخول تجاوز الحد الأعلى.")
+
+    payload = {
+        "symbol": option["symbol"],
+        "qty": str(quantity),
+        "side": "buy",
+        "type": "limit",
+        "time_in_force": "day",
+        "limit_price": f"{limit_price:.2f}",
+        "position_intent": "buy_to_open"
+    }
+
+    response = submit_order_payload(payload)
+
+    response["_strategy"] = direction
+    response["_symbols"] = [option["symbol"]]
+
+    order_id = register_order(response)
+
+    state["active_order_id"] = order_id
+
+    state["position_meta"][order_id] = {
+        "strategy": direction,
+        "symbol": option["symbol"],
+        "quantity": quantity,
+        "entry_limit": limit_price,
+        "entry_reference": quote["ask"],
+        "entry_filled": 0,
+        "exit_order_id": None,
+        "created_at": utc_now().isoformat()
+    }
+
     save_state()
 
-def update_position_metadata_from_broker():
-    bps = {p["symbol"]: {"qty": position_quantity(p), "avg": safe_float(p.get("avg_entry_price"))} for p in get_option_positions() if p.get("symbol") and position_quantity(p) > 0}
-    for sym, d in bps.items():
-        if not d["avg"]: raise SafetyHalt(f"سعر غير صالح: {sym}")
-        if sym not in STATE["position_meta"]: init_pos_meta(sym, d["avg"], d["qty"])
-        else: STATE["position_meta"][sym].update({"quantity": d["qty"], "entry_price": d["avg"], "last_update": utc_now()})
-    for sym in list(STATE["position_meta"].keys()):
-        if sym not in bps: STATE["position_meta"].pop(sym, None)
+    return response
+
+
+# =========================================================
+# 26) MULTI-LEG ORDER BUILDER
+# =========================================================
+
+def build_mleg_payload(
+    strategy,
+    long_leg,
+    short_leg,
+    quantity,
+    limit_price,
+    closing=False
+):
+    validate_order_quantity(quantity)
+
+    validate_option_symbol(long_leg["symbol"])
+    validate_option_symbol(short_leg["symbol"])
+
+    if long_leg["symbol"] == short_leg["symbol"]:
+        raise SafetyHalt("لا يمكن استخدام العقد نفسه للرجلين.")
+
+    if long_leg["expiration"] != short_leg["expiration"]:
+        raise SafetyHalt("تاريخ انتهاء الرجلين غير متطابق.")
+
+    if strategy == "BULL_CALL_SPREAD":
+        if long_leg["type"] != "call" or short_leg["type"] != "call":
+            raise SafetyHalt("نوع عقود Bull Call غير صحيح.")
+
+        if long_leg["strike"] >= short_leg["strike"]:
+            raise SafetyHalt("ترتيب strikes في Bull Call غير صحيح.")
+
+        if closing:
+            legs = [
+                {
+                    "symbol": long_leg["symbol"],
+                    "ratio_qty": 1,
+                    "side": "sell",
+                    "position_intent": "sell_to_close"
+                },
+                {
+                    "symbol": short_leg["symbol"],
+                    "ratio_qty": 1,
+                    "side": "buy",
+                    "position_intent": "buy_to_close"
+                }
+            ]
+        else:
+            legs = [
+                {
+                    "symbol": long_leg["symbol"],
+                    "ratio_qty": 1,
+                    "side": "buy",
+                    "position_intent": "buy_to_open"
+                },
+                {
+                    "symbol": short_leg["symbol"],
+                    "ratio_qty": 1,
+                    "side": "sell",
+                    "position_intent": "sell_to_open"
+                }
+            ]
+
+    elif strategy == "BULL_PUT_SPREAD":
+        if long_leg["type"] != "put" or short_leg["type"] != "put":
+            raise SafetyHalt("نوع عقود Bull Put غير صحيح.")
+
+        if short_leg["strike"] <= long_leg["strike"]:
+            raise SafetyHalt("ترتيب strikes في Bull Put غير صحيح.")
+
+        if closing:
+            legs = [
+                {
+                    "symbol": short_leg["symbol"],
+                    "ratio_qty": 1,
+                    "side": "buy",
+                    "position_intent": "buy_to_close"
+                },
+                {
+                    "symbol": long_leg["symbol"],
+                    "ratio_qty": 1,
+                    "side": "sell",
+                    "position_intent": "sell_to_close"
+                }
+            ]
+        else:
+            legs = [
+                {
+                    "symbol": short_leg["symbol"],
+                    "ratio_qty": 1,
+                    "side": "sell",
+                    "position_intent": "sell_to_open"
+                },
+                {
+                    "symbol": long_leg["symbol"],
+                    "ratio_qty": 1,
+                    "side": "buy",
+                    "position_intent": "buy_to_open"
+                }
+            ]
+
+    else:
+        raise ValueError(
+            f"استراتيجية MLeg غير مدعومة: {strategy}"
+        )
+
+    price = round(float(limit_price), 2)
+
+    if not math.isfinite(price) or price == 0:
+        raise SafetyHalt("سعر السبريد غير صالح.")
+
+    # Bull Call entry: debit موجب
+    # Bull Put entry: credit سالب في طلب Alpaca
+    # عند الإغلاق تُحسب القيمة وفق اتجاه الرجلين.
+    if not closing and strategy == "BULL_PUT_SPREAD":
+        price = -abs(price)
+
+    elif not closing and strategy == "BULL_CALL_SPREAD":
+        price = abs(price)
+
+    return {
+        "order_class": "mleg",
+        "qty": str(quantity),
+        "type": "limit",
+        "time_in_force": "day",
+        "limit_price": f"{price:.2f}",
+        "legs": legs
+    }
+
+
+# =========================================================
+# 27) SUBMIT SPREAD ENTRY
+# =========================================================
+
+def submit_spread_entry(spread, quantity):
+    validate_entry_conditions()
+    validate_order_quantity(quantity)
+
+    strategy = spread["strategy"]
+
+    long_leg = spread["long_leg"]
+    short_leg = spread["short_leg"]
+
+    if strategy == "BULL_CALL_SPREAD":
+        limit_price = (
+            long_leg["quote"]["ask"]
+            - short_leg["quote"]["bid"]
+            + MAX_ENTRY_SLIPPAGE
+        )
+
+    elif strategy == "BULL_PUT_SPREAD":
+        limit_price = (
+            short_leg["quote"]["bid"]
+            - long_leg["quote"]["ask"]
+            - MAX_ENTRY_SLIPPAGE
+        )
+
+    else:
+        raise ValueError("استراتيجية السبريد غير صالحة.")
+
+    if limit_price <= 0 and strategy == "BULL_CALL_SPREAD":
+        raise SafetyHalt("Debit Bull Call غير صالح.")
+
+    if limit_price <= 0 and strategy == "BULL_PUT_SPREAD":
+        raise SafetyHalt("Credit Bull Put غير كافٍ.")
+
+    payload = build_mleg_payload(
+        strategy=strategy,
+        long_leg=long_leg,
+        short_leg=short_leg,
+        quantity=quantity,
+        limit_price=limit_price,
+        closing=False
+    )
+
+    response = submit_order_payload(payload)
+
+    symbols = [
+        long_leg["symbol"],
+        short_leg["symbol"]
+    ]
+
+    response["_strategy"] = strategy
+    response["_symbols"] = symbols
+    response["_legs"] = payload["legs"]
+
+    order_id = register_order(response)
+
+    state["active_order_id"] = order_id
+
+    state["spread_meta"][order_id] = {
+        "strategy": strategy,
+        "long_symbol": long_leg["symbol"],
+        "short_symbol": short_leg["symbol"],
+        "long_strike": long_leg["strike"],
+        "short_strike": short_leg["strike"],
+        "expiration": long_leg["expiration"],
+        "quantity": quantity,
+        "entry_limit": abs(limit_price),
+        "entry_filled": 0,
+        "exit_order_id": None,
+        "created_at": utc_now().isoformat()
+    }
+
     save_state()
 
-def request_position_exit(sym, qty, reason):
-    if qty <= 0 or any(r.get("symbol") == sym and r.get("side") == "sell" and (r.get("submission_unknown") or not r.get("terminal", False)) for r in LEDGER["orders"].values()): return None
-    bp = next((p for p in get_option_positions() if p.get("symbol") == sym), None)
-    if not bp or position_quantity(bp) <= 0: return None
-    qty = min(qty, position_quantity(bp))
-    q = extract_quote_and_delta(get_option_snapshots([sym]).get(sym)) if sym in get_option_snapshots([sym]) else None
-    if not q or q["bid"] is None: raise APIError(f"لا أسعار للإغلاق: {sym}")
-    lp = round(max(0.01, q["bid"]), 2)
-    cid = f"SF113-EXIT-{sha256_text(f'{sym}|{qty}|{utc_now()}')[:16]}"
-    register_order_intent(cid, sym, qty, "sell", lp, "POSITION_EXIT")
+    log.info(
+        "SPREAD SUBMITTED | %s | Qty=%s | Limit=%s | ID=%s",
+        strategy,
+        quantity,
+        payload["limit_price"],
+        order_id
+    )
+
+    return response
+
+
+# =========================================================
+# 28) ENTRY DISPATCHER
+# =========================================================
+
+def execute_selected_strategy(strategy, market_price, equity):
+    if strategy in ("CALL", "PUT"):
+        option = select_single_option(
+            strategy.lower(),
+            market_price
+        )
+
+        if not option:
+            return None
+
+        quantity = calculate_single_leg_quantity(
+            option,
+            equity
+        )
+
+        if quantity < 1:
+            reject("رأس المال لا يسمح بعقد واحد ضمن حدود المخاطرة.")
+            return None
+
+        return submit_single_leg(
+            option,
+            strategy,
+            quantity
+        )
+
+    if strategy in (
+        "BULL_CALL_SPREAD",
+        "BULL_PUT_SPREAD"
+    ):
+        spread = select_spread(
+            strategy,
+            market_price
+        )
+
+        if not spread:
+            return None
+
+        quantity = calculate_spread_quantity(
+            spread,
+            equity
+        )
+
+        if quantity < 1:
+            reject("رأس المال لا يسمح بسبريد واحد ضمن المخاطرة.")
+            return None
+
+        return submit_spread_entry(
+            spread,
+            quantity
+        )
+
+    return None
+
+
+# =========================================================
+# نهاية الجزء الرابع
+# =========================================================
+
+# =========================================================
+# 29) BROKER ORDER MANAGEMENT
+# =========================================================
+
+OPEN_ORDER_STATUSES = {
+    "new",
+    "accepted",
+    "pending_new",
+    "partially_filled",
+    "accepted_for_bidding",
+    "pending_replace",
+    "pending_cancel"
+}
+
+FINAL_ORDER_STATUSES = {
+    "filled",
+    "canceled",
+    "expired",
+    "rejected",
+    "done_for_day"
+}
+
+
+def get_order(order_id):
+    if not order_id:
+        return None
+
+    return trading_api(
+        "GET",
+        f"/v2/orders/{order_id}"
+    )
+
+
+def cancel_order(order_id):
+    if not order_id:
+        return False
+
     try:
-        res = trading_api("POST", "/v2/orders", payload={"symbol": sym, "qty": str(qty), "side": "sell", "type": "limit", "time_in_force": "day", "limit_price": f"{lp:.2f}", "client_order_id": cid})
-        if not res.get("id"): raise APIError("لا ID للإغلاق")
-        apply_broker_order_update(res)
-        ledger_event("EXIT_SUBMITTED", {"cid": cid, "sym": sym, "reason": reason})
-        log.info("EXIT ACCEPTED | %s | Qty=%s", sym, qty)
-        return res
-    except Exception as exc:
-        update_order_record(cid, status="SUBMISSION_UNRESOLVED", submission_unknown=True, last_error=str(exc))
-        halt_bot(f"إغلاق غير محسوم: {sym}")
-        raise SafetyHalt(f"تعذر الإغلاق: {exc}")
+        trading_api(
+            "DELETE",
+            f"/v2/orders/{order_id}"
+        )
 
-def manage_single_position(p):
-    sym, qty = p.get("symbol"), position_quantity(p)
-    if not sym or qty <= 0: return
-    meta = STATE["position_meta"].get(sym)
-    if not meta: return
-    q = extract_quote_and_delta(get_option_snapshots([sym]).get(sym)) if sym in get_option_snapshots([sym]) else None
-    if not q or q["bid"] is None: return
-    bid, entry = q["bid"], meta["entry_price"]
-    if bid > meta.get("highest_price", entry): meta["highest_price"] = bid; save_state()
-    stop, target, trail = calc_stop(entry), calc_target(entry), calc_trail(entry, meta["highest_price"])
-    log.info("POS | %s | Entry=%.2f | Bid=%.2f | PnL=%.2f%% | Stop=%.2f | Target=%.2f | Trail=%s", sym, entry, bid, (bid-entry)/entry*100, stop, target, f"{trail:.2f}" if trail else "OFF")
-    
-    if force_exit_time_reached(): request_position_exit(sym, qty, "END_OF_DAY")
-    elif bid <= stop: request_position_exit(sym, qty, "STOP_LOSS")
-    elif bid >= target: request_position_exit(sym, qty, "TAKE_PROFIT")
-    elif trail and bid <= trail: request_position_exit(sym, qty, "TRAILING_STOP")
+        log.warning(
+            "CANCEL REQUESTED | Order=%s",
+            order_id
+        )
+
+        return True
+
+    except APIError as exc:
+        log.error(
+            "CANCEL FAILED | Order=%s | %s",
+            order_id,
+            exc
+        )
+
+        return False
+
+
+def list_open_orders():
+    response = trading_api(
+        "GET",
+        "/v2/orders",
+        {
+            "status": "open",
+            "limit": 500,
+            "nested": "true"
+        }
+    )
+
+    return response if isinstance(response, list) else []
+
+
+def wait_for_order_update(order_id, attempts=3):
+    latest = None
+
+    for _ in range(attempts):
+        try:
+            latest = get_order(order_id)
+
+            if not latest:
+                continue
+
+            status = str(
+                latest.get("status", "")
+            ).lower()
+
+            if status in FINAL_ORDER_STATUSES:
+                break
+
+        except Exception:
+            log.exception(
+                "ORDER UPDATE ERROR | %s",
+                order_id
+            )
+
+        time.sleep(ORDER_LOOKUP_INTERVAL)
+
+    return latest
+
+
+# =========================================================
+# 30) BROKER OPTION POSITIONS
+# =========================================================
+
+def get_option_positions():
+    response = trading_api(
+        "GET",
+        "/v2/positions"
+    )
+
+    if not isinstance(response, list):
+        raise APIError(
+            "تعذر قراءة مراكز الحساب."
+        )
+
+    result = []
+
+    for position in response:
+        if not isinstance(position, dict):
+            continue
+
+        # لا نعتبر أسهم SPY مراكز خيارات
+        if str(
+            position.get("asset_class", "")
+        ).lower() != "us_option":
+            continue
+
+        symbol = str(
+            position.get("symbol", "")
+        ).strip()
+
+        if not symbol.startswith("SPY"):
+            continue
+
+        try:
+            quantity = abs(
+                float(position.get("qty", 0))
+            )
+
+            if quantity <= 0:
+                continue
+
+            side = str(
+                position.get("side", "")
+            ).lower()
+
+            signed_qty = (
+                quantity if side == "long"
+                else -quantity
+            )
+
+            result.append({
+                "symbol": symbol,
+                "qty": quantity,
+                "signed_qty": signed_qty,
+                "side": side,
+                "avg_entry_price": safe_float(
+                    position.get("avg_entry_price")
+                ),
+                "market_value": safe_float(
+                    position.get("market_value")
+                ),
+                "unrealized_pl": safe_float(
+                    position.get("unrealized_pl")
+                ),
+                "current_price": safe_float(
+                    position.get("current_price")
+                )
+            })
+
+        except (TypeError, ValueError):
+            log.warning(
+                "POSITION PARSE ERROR | %s",
+                symbol
+            )
+
+    return result
+
+
+def positions_by_symbol(positions):
+    return {
+        p["symbol"]: p
+        for p in positions
+    }
+
+
+# =========================================================
+# 31) ORDER FILL RECONCILIATION
+# =========================================================
+
+def reconcile_order_fills(order_id):
+    record = ledger.get(
+        "orders", {}
+    ).get(order_id)
+
+    if not record:
+        return None
+
+    order = get_order(order_id)
+
+    if not order:
+        return None
+
+    update_order_record(order_id, order)
+
+    filled_qty = int(
+        safe_float(order.get("filled_qty"), 0)
+    )
+
+    status = str(
+        order.get("status", "")
+    ).lower()
+
+    record["filled_qty"] = filled_qty
+    record["status"] = status
+
+    if filled_qty > 0:
+        record["average_fill_price"] = safe_float(
+            order.get("filled_avg_price")
+        )
+
+    record["updated_at"] = utc_now().isoformat()
+
+    save_ledger()
+
+    if status in FINAL_ORDER_STATUSES:
+        state["active_order_id"] = None
+        save_state()
+
+    return {
+        "order": order,
+        "status": status,
+        "filled_qty": filled_qty,
+        "average_fill_price": record.get(
+            "average_fill_price"
+        )
+    }
+
+
+def reconcile_active_order():
+    order_id = state.get("active_order_id")
+
+    if not order_id:
+        return None
+
+    result = reconcile_order_fills(order_id)
+
+    if not result:
+        halt_bot(
+            "تعذر التحقق من حالة الأمر النشط."
+        )
+        return None
+
+    status = result["status"]
+
+    if status in OPEN_ORDER_STATUSES:
+        return result
+
+    if status in FINAL_ORDER_STATUSES:
+        log.info(
+            "ORDER FINALIZED | ID=%s | Status=%s | Filled=%s",
+            order_id,
+            status,
+            result["filled_qty"]
+        )
+
+    return result
+
+
+# =========================================================
+# 32) POSITION RECONCILIATION
+# =========================================================
+
+def expected_positions_from_state():
+    expected = {}
+
+    for meta in state.get(
+        "position_meta", {}
+    ).values():
+
+        symbol = meta.get("symbol")
+        quantity = int(
+            meta.get("entry_filled", 0)
+        )
+
+        if symbol and quantity > 0:
+            expected[symbol] = (
+                expected.get(symbol, 0) + quantity
+            )
+
+    for meta in state.get(
+        "spread_meta", {}
+    ).values():
+
+        quantity = int(
+            meta.get("entry_filled", 0)
+        )
+
+        if quantity <= 0:
+            continue
+
+        strategy = meta.get("strategy")
+
+        long_symbol = meta.get("long_symbol")
+        short_symbol = meta.get("short_symbol")
+
+        if not long_symbol or not short_symbol:
+            continue
+
+        if strategy == "BULL_CALL_SPREAD":
+            expected[long_symbol] = (
+                expected.get(long_symbol, 0) + quantity
+            )
+
+            expected[short_symbol] = (
+                expected.get(short_symbol, 0) - quantity
+            )
+
+        elif strategy == "BULL_PUT_SPREAD":
+            expected[short_symbol] = (
+                expected.get(short_symbol, 0) - quantity
+            )
+
+            expected[long_symbol] = (
+                expected.get(long_symbol, 0) + quantity
+            )
+
+    return expected
+
+
+def reconcile_broker_positions():
+    positions = get_option_positions()
+
+    actual = {
+        p["symbol"]: int(round(p["signed_qty"]))
+        for p in positions
+    }
+
+    expected = expected_positions_from_state()
+
+    all_symbols = set(actual) | set(expected)
+
+    mismatches = []
+
+    for symbol in sorted(all_symbols):
+        expected_qty = expected.get(symbol, 0)
+        actual_qty = actual.get(symbol, 0)
+
+        if expected_qty != actual_qty:
+            mismatches.append({
+                "symbol": symbol,
+                "expected": expected_qty,
+                "actual": actual_qty
+            })
+
+    state["last_positions"] = actual
+    state["last_reconciliation"] = utc_now().isoformat()
+
+    save_state()
+
+    if mismatches:
+        for item in mismatches:
+            log.critical(
+                "POSITION MISMATCH | %s | Expected=%s | Actual=%s",
+                item["symbol"],
+                item["expected"],
+                item["actual"]
+            )
+
+        halt_bot(
+            "اختلاف بين المراكز الفعلية والسجل المحلي."
+        )
+
+        return False
+
+    log.info(
+        "POSITION RECONCILIATION OK | Positions=%s",
+        len(actual)
+    )
+
+    return True
+
+
+# =========================================================
+# 33) FILL STATE UPDATES
+# =========================================================
+
+def update_entry_fill_metadata(order_id, order):
+    filled_qty = int(
+        safe_float(order.get("filled_qty"), 0)
+    )
+
+    if order_id in state.get("position_meta", {}):
+        meta = state["position_meta"][order_id]
+
+        old_qty = int(meta.get("entry_filled", 0))
+
+        if filled_qty > old_qty:
+            state["trades_today"] = (
+                int(state.get("trades_today", 0)) + 1
+            )
+
+        meta["entry_filled"] = filled_qty
+
+        meta["entry_average_price"] = safe_float(
+            order.get("filled_avg_price")
+        )
+
+    elif order_id in state.get("spread_meta", {}):
+        meta = state["spread_meta"][order_id]
+
+        old_qty = int(meta.get("entry_filled", 0))
+
+        if filled_qty > old_qty:
+            state["trades_today"] = (
+                int(state.get("trades_today", 0)) + 1
+            )
+
+        meta["entry_filled"] = filled_qty
+
+        meta["entry_average_price"] = safe_float(
+            order.get("filled_avg_price")
+        )
+
+    save_state()
+
+
+# =========================================================
+# 34) QUOTE REFRESH FOR OPEN POSITIONS
+# =========================================================
+
+def get_fresh_quote(symbol):
+    validate_option_symbol(symbol)
+
+    snapshots = get_option_snapshots([symbol])
+
+    snapshot = snapshots.get(symbol)
+
+    if not snapshot:
+        return None
+
+    return extract_option_quote(snapshot)
+
+
+def calculate_single_position_return(meta, quote):
+    entry = safe_float(
+        meta.get("entry_average_price"),
+        meta.get("entry_limit", 0)
+    )
+
+    if entry <= 0 or not quote:
+        return None
+
+    current = quote["bid"]
+
+    if current <= 0:
+        return None
+
+    return (current - entry) / entry
+
+
+def calculate_spread_return(meta, snapshots):
+    strategy = meta.get("strategy")
+
+    long_symbol = meta.get("long_symbol")
+    short_symbol = meta.get("short_symbol")
+
+    long_quote = extract_option_quote(
+        snapshots.get(long_symbol)
+    )
+
+    short_quote = extract_option_quote(
+        snapshots.get(short_symbol)
+    )
+
+    if not long_quote or not short_quote:
+        return None
+
+    entry = safe_float(
+        meta.get("entry_average_price"),
+        meta.get("entry_limit", 0)
+    )
+
+    if entry <= 0:
+        return None
+
+    if strategy == "BULL_CALL_SPREAD":
+        # قيمة التصفية التقريبية للسبريد
+        current_value = (
+            long_quote["bid"] -
+            short_quote["ask"]
+        )
+
+        pnl_per_share = current_value - entry
+
+    elif strategy == "BULL_PUT_SPREAD":
+        # تكلفة إغلاق السبريد
+        close_cost = (
+            short_quote["ask"] -
+            long_quote["bid"]
+        )
+
+        pnl_per_share = entry - close_cost
+
+    else:
+        return None
+
+    return {
+        "long_quote": long_quote,
+        "short_quote": short_quote,
+        "pnl_per_share": pnl_per_share,
+        "return_percent": pnl_per_share / entry,
+        "current_value": current_value
+        if strategy == "BULL_CALL_SPREAD"
+        else close_cost
+    }
+
+
+# =========================================================
+# 35) EXIT ORDER BUILDER
+# =========================================================
+
+def submit_single_leg_exit(meta, quantity, quote):
+    if meta.get("exit_order_id"):
+        return None
+
+    symbol = meta["symbol"]
+
+    validate_option_symbol(symbol)
+    validate_order_quantity(quantity)
+
+    limit_price = max(
+        0.01,
+        round(
+            quote["bid"] - MAX_ENTRY_SLIPPAGE,
+            2
+        )
+    )
+
+    payload = {
+        "symbol": symbol,
+        "qty": str(quantity),
+        "side": "sell",
+        "type": "limit",
+        "time_in_force": "day",
+        "limit_price": f"{limit_price:.2f}",
+        "position_intent": "sell_to_close"
+    }
+
+    response = submit_order_payload(payload)
+
+    response["_strategy"] = (
+        f"EXIT_{meta.get('strategy', 'UNKNOWN')}"
+    )
+
+    response["_symbols"] = [symbol]
+
+    order_id = register_order(response)
+
+    meta["exit_order_id"] = order_id
+
+    save_state()
+
+    log.warning(
+        "SINGLE EXIT SUBMITTED | %s | Qty=%s | ID=%s",
+        symbol,
+        quantity,
+        order_id
+    )
+
+    return response
+
+
+def submit_spread_exit(meta, quantity, snapshots):
+    if meta.get("exit_order_id"):
+        return None
+
+    strategy = meta.get("strategy")
+
+    long_symbol = meta["long_symbol"]
+    short_symbol = meta["short_symbol"]
+
+    long_quote = extract_option_quote(
+        snapshots.get(long_symbol)
+    )
+
+    short_quote = extract_option_quote(
+        snapshots.get(short_symbol)
+    )
+
+    if not long_quote or not short_quote:
+        reject("تعذر الحصول على أسعار إغلاق السبريد.")
+        return None
+
+    long_leg = {
+        "symbol": long_symbol,
+        "type": (
+            "call" if strategy == "BULL_CALL_SPREAD"
+            else "put"
+        ),
+        "strike": meta["long_strike"],
+        "expiration": meta["expiration"]
+    }
+
+    short_leg = {
+        "symbol": short_symbol,
+        "type": (
+            "call" if strategy == "BULL_CALL_SPREAD"
+            else "put"
+        ),
+        "strike": meta["short_strike"],
+        "expiration": meta["expiration"]
+    }
+
+    if strategy == "BULL_CALL_SPREAD":
+        # البيع لإغلاق السبريد ينتج ائتماناً غالباً
+        close_price = (
+            short_quote["ask"] -
+            long_quote["bid"]
+        )
+
+    elif strategy == "BULL_PUT_SPREAD":
+        # الشراء لإغلاق السبريد ينتج تكلفة غالباً
+        close_price = (
+            short_quote["ask"] -
+            long_quote["bid"]
+        )
+
+    else:
+        raise SafetyHalt("نوع السبريد غير صالح للإغلاق.")
+
+    payload = build_mleg_payload(
+        strategy=strategy,
+        long_leg=long_leg,
+        short_leg=short_leg,
+        quantity=quantity,
+        limit_price=close_price,
+        closing=True
+    )
+
+    response = submit_order_payload(payload)
+
+    response["_strategy"] = f"EXIT_{strategy}"
+    response["_symbols"] = [
+        long_symbol,
+        short_symbol
+    ]
+    response["_legs"] = payload["legs"]
+
+    order_id = register_order(response)
+
+    meta["exit_order_id"] = order_id
+
+    save_state()
+
+    log.warning(
+        "SPREAD EXIT SUBMITTED | %s | Qty=%s | Price=%s | ID=%s",
+        strategy,
+        quantity,
+        payload["limit_price"],
+        order_id
+    )
+
+    return response
+
+
+# =========================================================
+# 36) POSITION RISK MANAGEMENT
+# =========================================================
+
+def should_exit_position(return_percent, meta):
+    if return_percent is None:
+        return False, "NO_VALID_MARK"
+
+    if return_percent <= -STOP_LOSS_PERCENT:
+        return True, "STOP_LOSS"
+
+    if return_percent >= TAKE_PROFIT_PERCENT:
+        return True, "TAKE_PROFIT"
+
+    peak = safe_float(
+        meta.get("peak_return"),
+        return_percent
+    )
+
+    peak = max(peak, return_percent)
+
+    meta["peak_return"] = peak
+
+    if peak >= TRAIL_ACTIVATION_PERCENT:
+        drawdown = peak - return_percent
+
+        if drawdown >= TRAIL_DISTANCE_PERCENT:
+            return True, "TRAILING_STOP"
+
+    if force_exit_time_reached():
+        return True, "TIME_EXIT"
+
+    return False, "HOLD"
+
+
+def manage_single_position(order_id, meta):
+    if meta.get("exit_order_id"):
+        return
+
+    quantity = int(meta.get("entry_filled", 0))
+
+    if quantity <= 0:
+        return
+
+    quote = get_fresh_quote(meta["symbol"])
+
+    if not quote:
+        log.warning(
+            "SINGLE POSITION QUOTE UNAVAILABLE | %s",
+            meta["symbol"]
+        )
+        return
+
+    result = calculate_single_position_return(
+        meta,
+        quote
+    )
+
+    if result is None:
+        return
+
+    should_exit, reason = should_exit_position(
+        result,
+        meta
+    )
+
+    log.info(
+        "SINGLE POSITION | %s | Return=%.2f%% | Decision=%s",
+        meta["symbol"],
+        result * 100,
+        reason
+    )
+
+    save_state()
+
+    if should_exit:
+        log.warning(
+            "EXIT TRIGGERED | %s | %s",
+            meta["symbol"],
+            reason
+        )
+
+        submit_single_leg_exit(
+            meta,
+            quantity,
+            quote
+        )
+
+
+def manage_spread_position(order_id, meta):
+    if meta.get("exit_order_id"):
+        return
+
+    quantity = int(meta.get("entry_filled", 0))
+
+    if quantity <= 0:
+        return
+
+    symbols = [
+        meta["long_symbol"],
+        meta["short_symbol"]
+    ]
+
+    snapshots = get_option_snapshots(symbols)
+
+    result = calculate_spread_return(
+        meta,
+        snapshots
+    )
+
+    if not result:
+        log.warning(
+            "SPREAD MARK UNAVAILABLE | %s",
+            order_id
+        )
+        return
+
+    should_exit, reason = should_exit_position(
+        result["return_percent"],
+        meta
+    )
+
+    log.info(
+        "SPREAD POSITION | %s | Return=%.2f%% | "
+        "PnL/share=%.3f | Decision=%s",
+        meta["strategy"],
+        result["return_percent"] * 100,
+        result["pnl_per_share"],
+        reason
+    )
+
+    save_state()
+
+    if should_exit:
+        log.warning(
+            "SPREAD EXIT TRIGGERED | %s",
+            reason
+        )
+
+        submit_spread_exit(
+            meta,
+            quantity,
+            snapshots
+        )
+
+
+# =========================================================
+# 37) MANAGE ALL OPEN POSITIONS
+# =========================================================
 
 def manage_all_positions():
-    update_position_metadata_from_broker()
-    for p in get_option_positions(): manage_single_position(p)
+    if state.get("active_order_id"):
+        result = reconcile_active_order()
+
+        if result:
+            order_id = state.get("active_order_id")
+
+            if order_id:
+                update_entry_fill_metadata(
+                    order_id,
+                    result["order"]
+                )
+
+        # لا نبدأ إدارة خروج جديدة حتى نتأكد
+        # من تسوية الأمر النشط
+        if state.get("active_order_id"):
+            return
+
+    for order_id, meta in list(
+        state.get("position_meta", {}).items()
+    ):
+        try:
+            manage_single_position(
+                order_id,
+                meta
+            )
+        except SafetyHalt as exc:
+            halt_bot(str(exc))
+            return
+        except Exception:
+            log.exception(
+                "SINGLE POSITION MANAGEMENT ERROR | %s",
+                order_id
+            )
+
+    for order_id, meta in list(
+        state.get("spread_meta", {}).items()
+    ):
+        try:
+            manage_spread_position(
+                order_id,
+                meta
+            )
+        except SafetyHalt as exc:
+            halt_bot(str(exc))
+            return
+        except Exception:
+            log.exception(
+                "SPREAD POSITION MANAGEMENT ERROR | %s",
+                order_id
+            )
+
 
 # =========================================================
-# 51-57) MAIN ENTRY
+# 38) PERIODIC RECONCILIATION
 # =========================================================
-def scan_for_entry():
-    if not can_open_new_trade(): return False
-    bars = get_spy_bars()
-    ind = calculate_market_indicators(bars)
-    sig = get_market_signal(ind)
-    log.info("SPY %.2f | Sig=%s | Score=%s | RSI=%.1f | EMA9=%.2f EMA21=%.2f", ind["price"], sig["direction"], sig["score"], ind["rsi"], ind["fast_ema"], ind["slow_ema"])
-    if sig["direction"] == "NEUTRAL" or sig["score"] < MIN_SIGNAL_SCORE: return False
-    cid = make_candle_id(ind["timestamp"])
-    if STATE.get("last_scan_candle") == cid: return False
-    STATE["last_scan_candle"] = cid; save_state()
-    c = select_option_contract("call" if sig["direction"] == "CALL" else "put")
-    if not c: return False
-    c["signal_timestamp"], c["signal"] = ind["timestamp"], sig["direction"]
-    c = refresh_selected_contract(c)
-    if not can_open_new_trade(): return False
-    return bool(submit_limit_order_once(c, sig["direction"]))
 
-def manage_pending_orders():
-    for cid, r in list(LEDGER["orders"].items()):
-        if r.get("terminal", False) or r.get("submission_unknown"): continue
-        o = refresh_order_status(cid)
-        if o and o["status"] in ("partially_filled", "filled"): reconcile_order_fills(cid)
-        if o and o["status"] in ("canceled", "expired", "rejected", "filled") and r.get("side") == "buy":
-            STATE["active_client_order_id"] = None
-            save_state()
+def periodic_reconciliation():
+    now = utc_now()
 
-def refresh_active_order_state():
-    STATE["active_client_order_id"] = next((c for c, r in LEDGER["orders"].items() if r.get("side") == "buy" and not r.get("terminal", False)), None)
+    previous = parse_market_timestamp(
+        state.get("last_reconciliation")
+    )
+
+    if previous:
+        elapsed = (
+            now - previous
+        ).total_seconds()
+
+        if elapsed < RECONCILIATION_INTERVAL:
+            return True
+
+    if not reconcile_broker_positions():
+        return False
+
+    state["last_reconciliation"] = now.isoformat()
+
     save_state()
 
-TELEGRAM_TOKEN, TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_BOT_TOKEN", "").strip(), os.getenv("TELEGRAM_CHAT_ID", "").strip()
-def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return False
-    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "disable_web_page_preview": True}, timeout=10); return True
-    except Exception: return False
+    return True
+
+
+# =========================================================
+# 39) END OF DAY SAFETY
+# =========================================================
+
+def check_end_of_day():
+    if not force_exit_time_reached():
+        return
+
+    log.warning(
+        "END OF DAY EXIT WINDOW REACHED."
+    )
+
+    if state.get("active_order_id"):
+        order_id = state["active_order_id"]
+
+        cancel_order(order_id)
+
+        log.warning(
+            "ACTIVE ORDER CANCELLATION REQUESTED | %s",
+            order_id
+        )
+
+        return
+
+    manage_all_positions()
+
+
+# =========================================================
+# نهاية الجزء الخامس
+# =========================================================
+
+# =========================================================
+# 40) TELEGRAM NOTIFICATIONS
+# =========================================================
+
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN", ""
+).strip()
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID", ""
+).strip()
+
+
+def telegram_send(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram credentials not configured.")
+        return False
+
+    url = (
+        "https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    try:
+        response = requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": str(message),
+                "disable_web_page_preview": True
+            },
+            timeout=REQUEST_TIMEOUT
+        )
+
+        response.raise_for_status()
+
+        result = response.json()
+
+        if not result.get("ok"):
+            log.error("Telegram rejected message: %s", result)
+            return False
+
+        return True
+
+    except Exception:
+        log.exception("Telegram delivery failed.")
+        return False
+
+
+def format_money(value):
+    if value is None:
+        return "غير متاح"
+
+    try:
+        return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "غير متاح"
+
 
 def status_message():
-    acc = get_account()
-    return f"صَفاء التحليل v{VERSION}\nالحساب: {acc.get('status')}\nEquity: ${safe_float(acc.get('equity',0)):.2f}\nالمراكز: {len(get_option_positions())}\nالبوت: {'متوقف' if STATE.get('halted') else 'يعمل'}"
+    try:
+        account = get_account()
 
-def startup_reconciliation(): # FIXED: Removed bad try...except block that caused IndentationError
-    log.info("بدء فحوص ما قبل التشغيل.")
-    account = get_account()
-    log.info("ACCOUNT | Status=%s | Equity=%s | Paper=%s", account.get("status"), account.get("equity"), "YES" if "paper" in TRADING_URL.lower() else "NO")
-    if account.get("status") != "ACTIVE": raise SafetyHalt("الحساب غير نشط.")
-    if not reconcile_all_orders(): raise SafetyHalt("فشلت مصالحة الأوامر عند بدء التشغيل.")
-    if not reconcile_positions(): raise SafetyHalt("فشلت مصالحة المراكز عند بدء التشغيل.")
-    update_position_metadata_from_broker()
-    refresh_active_order_state()
-    log.info("اكتملت فحوص ما قبل التشغيل.")
+        equity = safe_float(account.get("equity"))
+        buying_power = safe_float(
+            account.get("buying_power")
+        )
 
-def run_bot():
-    log.info("صَفاء التحليل v%s بدأ التشغيل.", VERSION)
-    acquire_instance_lock()
-    initialize_storage()
-    startup_reconciliation()
-    send_telegram(status_message())
-    last_recon = 0
-    while True:
+        positions = get_option_positions()
+
+        active_order = state.get("active_order_id")
+        halted = state.get("halted", False)
+
+        lines = [
+            "💎 صَفاء التحليل v114.0",
+            "SPY 0-DTE | PAPER ONLY",
+            "",
+            f"الحالة: {'متوقف احترازياً' if halted else 'يعمل'}",
+            f"Equity: {format_money(equity)}",
+            f"Buying Power: {format_money(buying_power)}",
+            f"صافي اليوم: {format_money(state.get('daily_pnl', 0))}",
+            f"صفقات اليوم: {state.get('trades_today', 0)}",
+            f"الخسائر المتتالية: {state.get('consecutive_losses', 0)}",
+            f"مراكز الخيارات: {len(positions)}",
+            f"أمر نشط: {'نعم' if active_order else 'لا'}",
+            "",
+            "تحليل احتمالي — لا يوجد ضمان للربح."
+        ]
+
+        return "\n".join(lines)
+
+    except Exception as exc:
+        log.exception("Status message error.")
+        return (
+            "💎 صَفاء التحليل v114.0\n"
+            f"تعذر استخراج الحالة: {exc}"
+        )
+
+
+# =========================================================
+# 41) TELEGRAM COMMANDS
+# =========================================================
+
+def telegram_get_updates(offset=None):
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+
+    url = (
+        "https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/getUpdates"
+    )
+
+    params = {
+        "timeout": 1
+    }
+
+    if offset is not None:
+        params["offset"] = offset
+
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            timeout=REQUEST_TIMEOUT
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not data.get("ok"):
+            return []
+
+        return data.get("result", [])
+
+    except Exception:
+        log.exception("Telegram updates error.")
+        return []
+
+
+def handle_telegram_command(text, chat_id):
+    if str(chat_id) != TELEGRAM_CHAT_ID:
+        log.warning(
+            "Rejected unauthorized Telegram chat: %s",
+            chat_id
+        )
+        return
+
+    command = str(text or "").strip().lower()
+
+    if command in ("/start", "/help"):
+        telegram_send(
+            "أوامر صَفاء التحليل:\n"
+            "/status - حالة الحساب والبوت\n"
+            "/risk - حدود المخاطر\n"
+            "/halt - إيقاف احترازي\n"
+            "/help - المساعدة"
+        )
+
+    elif command == "/status":
+        telegram_send(status_message())
+
+    elif command == "/risk":
+        telegram_send(
+            "حدود المخاطر الحالية:\n"
+            f"Risk/Trade: {RISK_PER_TRADE * 100:.1f}%\n"
+            f"Daily Drawdown: {MAX_DAILY_DRAWDOWN * 100:.1f}%\n"
+            f"Premium Limit: {MAX_PREMIUM_FRACTION * 100:.1f}%\n"
+            f"Max Trades: {MAX_TRADES_PER_DAY}\n"
+            f"Max Positions: {MAX_OPEN_POSITIONS}\n"
+            f"Strategy: {STRATEGY_MODE}\n"
+            "الوضع: PAPER ONLY"
+        )
+
+    elif command == "/halt":
+        halt_bot(
+            "تم طلب الإيقاف من Telegram."
+        )
+
+        telegram_send(
+            "⛔ تم تفعيل الإيقاف الاحترازي.\n"
+            "لن يفتح البوت صفقات جديدة."
+        )
+
+
+def poll_telegram_commands():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    offset = state.get("telegram_offset")
+
+    updates = telegram_get_updates(offset)
+
+    for update in updates:
         try:
-            ensure_not_halted()
-            refresh_daily_baseline()
-            now = time.time()
-            manage_pending_orders()
-            refresh_active_order_state()
-            if now - last_recon >= RECONCILIATION_INTERVAL:
-                reconcile_all_orders()
-                reconcile_positions()
-                last_recon = now
-            manage_all_positions()
-            if force_exit_time_reached(): time.sleep(SCAN_SECONDS); continue
-            if entry_time_allowed(): scan_for_entry()
-            time.sleep(SCAN_SECONDS)
-        except SafetyHalt as exc: halt_bot(str(exc)); send_telegram(f"🚨 صَفاء توقف:\n{exc}"); break
-        except (MarketDataUnavailable, APIError) as exc: log.error("TEMP ERROR: %s", exc); time.sleep(SCAN_SECONDS)
-        except KeyboardInterrupt: break
-        except Exception as exc: halt_bot(f"خطأ: {exc}"); send_telegram(f"🚨 خطأ قاتل:\n{exc}"); break
-    log.warning("انتهى التشغيل.")
+            update_id = int(update.get("update_id", 0))
+
+            state["telegram_offset"] = update_id + 1
+
+            message = update.get("message", {})
+            chat = message.get("chat", {})
+
+            chat_id = chat.get("id")
+            text = message.get("text", "")
+
+            if text:
+                handle_telegram_command(text, chat_id)
+
+        except Exception:
+            log.exception("Telegram command processing error.")
+
+    save_state()
+
+
+# =========================================================
+# 42) ENTRY SIGNAL EVALUATION
+# =========================================================
+
+def evaluate_entry_signal():
+    if state.get("halted"):
+        return None
+
+    if not entry_time_allowed():
+        return None
+
+    if force_exit_time_reached():
+        return None
+
+    if state.get("active_order_id"):
+        return None
+
+    if state.get("trades_today", 0) >= MAX_TRADES_PER_DAY:
+        return None
+
+    bars = get_spy_bars()
+
+    indicators = calculate_market_indicators(bars)
+
+    candle_id = make_candle_id(
+        indicators["timestamp"]
+    )
+
+    if candle_id == state.get("last_candle_id"):
+        return None
+
+    # نسجل الشمعة حتى لا تتكرر الإشارة عليها
+    state["last_candle_id"] = candle_id
+    save_state()
+
+    signal = get_market_signal(indicators)
+
+    strategy = choose_strategy(signal)
+
+    log.info(
+        "SPY %.2f | Signal=%s | Score=%s | "
+        "RSI=%.1f | EMA9=%.2f | EMA21=%.2f | VWAP=%.2f",
+        indicators["price"],
+        signal["direction"],
+        signal["score"],
+        indicators["rsi"],
+        indicators["fast_ema"],
+        indicators["slow_ema"],
+        indicators["vwap"]
+    )
+
+    if not strategy:
+        log.info("No qualifying strategy.")
+        return None
+
+    if signal["score"] < MIN_SIGNAL_SCORE:
+        reject("درجة الإشارة أقل من الحد المطلوب.")
+        return None
+
+    return {
+        "strategy": strategy,
+        "signal": signal,
+        "indicators": indicators
+    }
+
+
+# =========================================================
+# 43) ENTRY EXECUTION
+# =========================================================
+
+def run_entry_engine():
+    candidate = evaluate_entry_signal()
+
+    if not candidate:
+        return None
+
+    validate_entry_conditions()
+
+    equity = get_account_equity()
+
+    if equity <= 0:
+        raise SafetyHalt("Equity غير صالح.")
+
+    strategy = candidate["strategy"]
+
+    indicators = candidate["indicators"]
+
+    log.info(
+        "ENTRY CANDIDATE | Strategy=%s | Price=%.2f | "
+        "Score=%s",
+        strategy,
+        indicators["price"],
+        candidate["signal"]["score"]
+    )
+
+    result = execute_selected_strategy(
+        strategy,
+        indicators["price"],
+        equity
+    )
+
+    if result:
+        telegram_send(
+            "🚨 أمر دخول جديد\n"
+            f"الاستراتيجية: {strategy}\n"
+            f"SPY: {indicators['price']:.2f}\n"
+            f"النتيجة: {candidate['signal']['score']}\n"
+            f"Order ID: {result.get('id')}\n"
+            "الحساب: PAPER"
+        )
+
+    return result
+
+
+# =========================================================
+# 44) STARTUP SAFETY CHECKS
+# =========================================================
+
+def startup_safety_checks():
+    validate_configuration()
+
+    if "paper" not in TRADING_URL.lower():
+        raise SafetyHalt(
+            "رفض التشغيل: عنوان التداول ليس Paper."
+        )
+
+    if os.getenv(
+        "ALLOW_LIVE_TRADING", "false"
+    ).lower() == "true":
+        raise SafetyHalt(
+            "رفض التشغيل: تم تفعيل ALLOW_LIVE_TRADING."
+        )
+
+    account = get_account()
+
+    if account.get("status") != "ACTIVE":
+        raise SafetyHalt(
+            "حساب Alpaca ليس ACTIVE."
+        )
+
+    if account.get("trading_blocked"):
+        raise SafetyHalt(
+            "الحساب محظور من التداول."
+        )
+
+    if account.get("account_blocked"):
+        raise SafetyHalt(
+            "الحساب محظور."
+        )
+
+    clock = get_clock()
+
+    if not isinstance(clock, dict):
+        raise SafetyHalt(
+            "تعذر التحقق من ساعة السوق."
+        )
+
+    equity = safe_float(account.get("equity"))
+
+    if equity <= 0:
+        raise SafetyHalt(
+            "Equity غير صالح."
+        )
+
+    log.info(
+        "STARTUP CHECKS PASSED | Equity=%.2f | Paper=True",
+        equity
+    )
+
+    return True
+
+
+# =========================================================
+# 45) SAFE MAIN CYCLE
+# =========================================================
+
+def run_one_cycle():
+    try:
+        poll_telegram_commands()
+
+        if state.get("halted"):
+            return
+
+        check_daily_risk()
+
+        # متابعة أوامر الدخول والمراكز القائمة
+        manage_all_positions()
+
+        if state.get("halted"):
+            return
+
+        if state.get("active_order_id"):
+            return
+
+        # المصالحة قبل فتح أي صفقة جديدة
+        if not periodic_reconciliation():
+            return
+
+        # لا تفتح صفقة إذا توجد مراكز غير مسجلة
+        if get_option_positions() and not (
+            state.get("position_meta")
+            or state.get("spread_meta")
+        ):
+            halt_bot(
+                "مراكز خيارات موجودة دون سجل محلي."
+            )
+            return
+
+        if force_exit_time_reached():
+            check_end_of_day()
+            return
+
+        if not entry_time_allowed():
+            return
+
+        run_entry_engine()
+
+    except SafetyHalt as exc:
+        halt_bot(str(exc))
+
+    except MarketDataUnavailable as exc:
+        log.warning(
+            "MARKET DATA UNAVAILABLE: %s",
+            exc
+        )
+
+    except APIError as exc:
+        log.error(
+            "BROKER API ERROR: %s",
+            exc
+        )
+
+    except Exception:
+        log.exception("UNHANDLED MAIN CYCLE ERROR.")
+
+
+# =========================================================
+# 46) MAIN
+# =========================================================
+
+def main():
+    global state, ledger
+
+    log.info("=" * 55)
+    log.info("صَفاء التحليل v114.0 STARTING")
+    log.info("SPY 0-DTE | MULTI-LEG | PAPER ONLY")
+    log.info("=" * 55)
+
+    acquire_instance_lock()
+
+    startup_safety_checks()
+
+    initialize_storage()
+
+    # إعادة التحقق بعد تحميل الحالة
+    ensure_not_halted()
+
+    # لا نسمح ببدء دورة تداول قبل فحص المراكز الفعلية
+    if not reconcile_broker_positions():
+        raise SafetyHalt(
+            "فشلت المصالحة الأولية للمراكز."
+        )
+
+    telegram_send(
+        "💎 صَفاء التحليل v114.0 بدأ العمل.\n"
+        "SPY 0-DTE\n"
+        "MULTI-LEG ENGINE\n"
+        "PAPER ONLY"
+    )
+
+    log.info("MAIN LOOP STARTED.")
+
+    while True:
+        started = time.monotonic()
+
+        try:
+            run_one_cycle()
+
+        except KeyboardInterrupt:
+            log.warning("Manual shutdown requested.")
+            break
+
+        except Exception:
+            log.exception("MAIN LOOP FAILURE.")
+
+        elapsed = time.monotonic() - started
+
+        sleep_time = max(
+            1,
+            SCAN_INTERVAL - elapsed
+        )
+
+        time.sleep(sleep_time)
+
+    telegram_send(
+        "⛔ صَفاء التحليل v114.0 توقف."
+    )
+
+    log.warning("BOT STOPPED.")
+
+
+# =========================================================
+# 47) PROGRAM ENTRY
+# =========================================================
 
 if __name__ == "__main__":
-    try: run_bot()
-    except Exception as exc: log.exception("STARTUP FAILED"); sys.exit(1)
+    try:
+        main()
+
+    except KeyboardInterrupt:
+        log.warning("Keyboard interrupt.")
+
+    except Exception as exc:
+        log.critical(
+            "FATAL STARTUP ERROR: %s",
+            exc,
+            exc_info=True
+        )
+
+        try:
+            telegram_send(
+                "⛔ خطأ قاتل أثناء تشغيل صَفاء التحليل:\n"
+                f"{exc}"
+            )
+        except Exception:
+            pass
+
+        raise
+
+# =========================================================
+# END OF SAFAA v114.0
+# =========================================================
