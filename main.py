@@ -594,8 +594,9 @@ def check_daily_risk():
         raise SafetyHalt("توقف بعد خسائر متتالية.")
 
 
+
 # =========================================================
-# 10) MARKET DATA — SMART RETRY & FAIL-SOFT
+# 10) MARKET DATA — LATEST BARS & FAIL-CLOSED
 # =========================================================
 
 MIN_SPY_BARS = 40
@@ -603,32 +604,60 @@ SPY_DATA_RETRIES = 3
 SPY_RETRY_DELAY = 2.5
 SPY_MAX_BAR_AGE_SECONDS = 180
 
+SPY_LOOKBACK_HOURS = 6
+
 
 class MarketDataUnavailable(Exception):
-    """نقص مؤقت في بيانات السوق، وليس عطلاً يستوجب إيقاف البوت."""
+    """نقص مؤقت في بيانات السوق."""
     pass
 
 
 def get_spy_bars(limit=120):
     """
-    جلب شموع SPY مع إعادة المحاولة.
-    لا يتم إيقاف البوت عند نقص البيانات.
-    لا يتم تخفيض الحد الأدنى للشموع.
+    الإصدار المصحح:
+
+    1. طلب أحدث الشموع أولاً باستخدام DESC.
+    2. تحديد start و end صراحة.
+    3. عكس الشموع إلى الترتيب الزمني الصحيح.
+    4. استبعاد الشمعة غير المكتملة.
+    5. رفض البيانات القديمة.
+    6. عدم تخفيض شروط السلامة عند فشل البيانات.
     """
 
     last_error = None
 
+    feed = os.getenv(
+        "ALPACA_STOCK_FEED", "iex"
+    ).strip().lower()
+
+    if feed not in ("iex", "sip", "boats", "otc"):
+        raise MarketDataUnavailable(
+            f"مصدر بيانات غير صالح: {feed}"
+        )
+
     for attempt in range(1, SPY_DATA_RETRIES + 1):
 
         try:
+            request_now = datetime.now(UTC)
+
+            start_time = (
+                request_now
+                - timedelta(hours=SPY_LOOKBACK_HOURS)
+            )
+
             params = {
                 "timeframe": "1Min",
-                "limit": limit,
+                "limit": int(limit),
                 "adjustment": "raw",
-                "feed": os.getenv(
-                    "ALPACA_STOCK_FEED", "iex"
-                ),
-                "sort": "asc"
+                "feed": feed,
+
+                # أهم إصلاح:
+                # أحدث الشموع أولاً.
+                "sort": "desc",
+
+                # تحديد الفترة صراحة.
+                "start": start_time.isoformat(),
+                "end": request_now.isoformat()
             }
 
             result = data_api(
@@ -641,28 +670,81 @@ def get_spy_bars(limit=120):
 
             if not isinstance(bars, list):
                 raise MarketDataUnavailable(
-                    "استجابة شموع SPY ليست قائمة."
+                    "استجابة شموع SPY غير صالحة."
+                )
+
+            if not bars:
+                raise MarketDataUnavailable(
+                    "لم تصل أي شموع من Alpaca."
                 )
 
             normalized = []
+            seen_timestamps = set()
+
+            now = datetime.now(UTC)
 
             for bar in bars:
+
                 try:
                     timestamp = datetime.fromisoformat(
                         bar["t"].replace("Z", "+00:00")
                     )
 
                     if timestamp.tzinfo is None:
-                        timestamp = timestamp.replace(tzinfo=UTC)
+                        timestamp = timestamp.replace(
+                            tzinfo=UTC
+                        )
+
+                    timestamp = timestamp.astimezone(UTC)
+
+                    candle_id = timestamp.isoformat()
+
+                    if candle_id in seen_timestamps:
+                        continue
+
+                    seen_timestamps.add(candle_id)
+
+                    open_price = float(bar["o"])
+                    high_price = float(bar["h"])
+                    low_price = float(bar["l"])
+                    close_price = float(bar["c"])
+                    volume = float(bar["v"])
+
+                    values = (
+                        open_price,
+                        high_price,
+                        low_price,
+                        close_price,
+                        volume
+                    )
+
+                    if not all(
+                        math.isfinite(v) for v in values
+                    ):
+                        continue
+
+                    if min(
+                        open_price,
+                        high_price,
+                        low_price,
+                        close_price
+                    ) <= 0:
+                        continue
+
+                    if high_price < low_price:
+                        continue
+
+                    if volume < 0:
+                        continue
 
                     normalized.append({
                         "timestamp": bar["t"],
                         "_datetime": timestamp,
-                        "open": float(bar["o"]),
-                        "high": float(bar["h"]),
-                        "low": float(bar["l"]),
-                        "close": float(bar["c"]),
-                        "volume": float(bar["v"])
+                        "open": open_price,
+                        "high": high_price,
+                        "low": low_price,
+                        "close": close_price,
+                        "volume": volume
                     })
 
                 except (
@@ -672,13 +754,12 @@ def get_spy_bars(limit=120):
                 ):
                     continue
 
+            # الترتيب الزمني الصحيح بعد جلب الأحدث أولاً.
             normalized.sort(
                 key=lambda x: x["_datetime"]
             )
 
-            # استبعاد الشمعة الحالية غير المكتملة.
-            now = datetime.now(UTC)
-
+            # استبعاد الشموع غير المكتملة.
             completed = []
 
             for bar in normalized:
@@ -691,60 +772,59 @@ def get_spy_bars(limit=120):
                 if candle_end <= now:
                     completed.append(bar)
 
-            # التحقق من الأسعار.
-            valid = []
-
-            for bar in completed:
-
-                if (
-                    bar["open"] <= 0
-                    or bar["high"] <= 0
-                    or bar["low"] <= 0
-                    or bar["close"] <= 0
-                ):
-                    continue
-
-                if bar["high"] < bar["low"]:
-                    continue
-
-                if bar["volume"] < 0:
-                    continue
-
-                valid.append(bar)
-
-            if len(valid) < MIN_SPY_BARS:
+            if len(completed) < MIN_SPY_BARS:
 
                 raise MarketDataUnavailable(
-                    f"شموع SPY غير كافية: "
-                    f"{len(valid)}/{MIN_SPY_BARS}"
+                    f"عدد الشموع المكتملة غير كافٍ: "
+                    f"{len(completed)}/{MIN_SPY_BARS}"
                 )
 
-            # التأكد من حداثة آخر شمعة.
-            last_bar = valid[-1]
+            # التحقق من أحدث شمعة مكتملة.
+            last_bar = completed[-1]
+
+            candle_end = (
+                last_bar["_datetime"]
+                + timedelta(minutes=1)
+            )
 
             age = (
-                now - last_bar["_datetime"]
+                now - candle_end
             ).total_seconds()
+
+            if age < -5:
+                raise MarketDataUnavailable(
+                    "توقيت شمعة SPY يقع في المستقبل."
+                )
 
             if age > SPY_MAX_BAR_AGE_SECONDS:
 
                 raise MarketDataUnavailable(
                     f"بيانات SPY قديمة: "
-                    f"{age:.0f} ثانية."
+                    f"{age:.0f} ثانية | "
+                    f"Feed={feed}."
                 )
 
-            # إزالة الحقل الداخلي.
-            for bar in valid:
+            # إزالة الحقول الداخلية.
+            for bar in completed:
                 bar.pop("_datetime", None)
 
             log.info(
-                "SPY DATA OK | Candles=%s | Last=%s | Attempt=%s",
-                len(valid),
-                valid[-1]["timestamp"],
-                attempt
+                "SPY DATA OK | "
+                "Feed=%s | "
+                "Candles=%s | "
+                "Last=%s | "
+                "Age=%.1fs | "
+                "Attempt=%s/%s",
+
+                feed,
+                len(completed),
+                completed[-1]["timestamp"],
+                age,
+                attempt,
+                SPY_DATA_RETRIES
             )
 
-            return valid
+            return completed
 
         except MarketDataUnavailable as exc:
 
@@ -782,7 +862,7 @@ def get_spy_bars(limit=120):
             )
 
     raise MarketDataUnavailable(
-        f"تعذر الحصول على بيانات SPY الكافية "
+        f"تعذر الحصول على بيانات SPY الحديثة "
         f"بعد {SPY_DATA_RETRIES} محاولات. "
         f"آخر خطأ: {last_error}"
     )
