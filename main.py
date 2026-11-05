@@ -1151,12 +1151,9 @@ def get_option_snapshots(symbols):
         if not batch:
             continue
 
-        result = options_data_api(
+                result = options_data_api(
             "GET",
-            f"/v1beta1/options/snapshots/{UNDERLYING}",
-            params={
-                "symbols": ",".join(batch)
-            }
+            f"/v1beta1/options/snapshots/{UNDERLYING}"
         )
 
         batch_snapshots = result.get("snapshots", {})
@@ -1166,8 +1163,12 @@ def get_option_snapshots(symbols):
                 "استجابة بيانات الخيارات غير صالحة."
             )
 
-        snapshots.update(batch_snapshots)
+        # استخراج العقود المطلوبة فقط من سلسلة الخيارات
+        for symbol in batch:
+            snapshot = batch_snapshots.get(symbol)
 
+            if snapshot is not None:
+                snapshots[symbol] = snapshot
     return snapshots
 
 
