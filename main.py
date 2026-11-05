@@ -2882,6 +2882,28 @@ def run_reconciliation_if_due():
 # 37) MAIN LOOP
 # =========================================================
 
+def run_bot():
+
+    # تشغيل قفل النسخة الواحدة
+    acquire_instance_lock()
+
+    # تحميل الحالة ودفتر الصفقات
+    initialize_storage()
+
+    # تجهيز بيانات إدارة المراكز
+    ensure_position_metadata()
+
+    log.info("=" * 55)
+    log.info("SAFAA ANALYSIS v%s STARTING", VERSION)
+    log.info("PAPER MODE: %s", PAPER_REQUIRED)
+    log.info("UNDERLYING: %s", UNDERLYING)
+    log.info("=" * 55)
+
+    # مصالحة إجبارية قبل السماح بأي تداول
+    reconcile_all_orders()
+
+    log.info("اكتملت مصالحة البداية. بدء حلقة التشغيل.")
+
     while True:
 
         try:
@@ -2892,10 +2914,10 @@ def run_reconciliation_if_due():
 
             check_daily_risk()
 
-            # المصالحة الدورية.
+            # المصالحة الدورية
             run_reconciliation_if_due()
 
-            # إدارة المراكز أولاً دائماً.
+            # إدارة المراكز أولاً دائماً
             positions = reconcile_positions()
 
             if positions:
@@ -2909,6 +2931,8 @@ def run_reconciliation_if_due():
                         "تعذر تحديث بيانات المركز: %s",
                         exc
                     )
+
+                    # لا نحاول فتح مركز جديد عند تعذر إدارة مركز قائم.
 
             elif market_is_open():
 
@@ -2956,24 +2980,30 @@ def run_reconciliation_if_due():
 
             break
 
+
 # =========================================================
 # 38) ENTRY POINT
 # =========================================================
 
 if __name__ == "__main__":
+
     try:
         run_bot()
 
     except SafetyHalt as exc:
+
         log.critical(
             "SAFETY HALT: %s",
             exc
         )
+
         sys.exit(2)
 
     except Exception as exc:
+
         log.exception(
             "FATAL ERROR: %s",
             exc
         )
+
         sys.exit(1)
