@@ -520,8 +520,12 @@ def refresh_daily_baseline():
     if STATE.get("trading_day") == current_day:
         return
 
+    # أوامر اليوم السابق انتهت صلاحيتها: سوِّها أولاً بدل التوقف
+    process_orders()
+
     if any_pending_orders():
-        raise SafetyHalt("تغير يوم التداول مع وجود أمر غير محسوم.")
+        log.info("بانتظار تسوية أوامر اليوم السابق قبل بدء يوم جديد.")
+        return  # يُعاد المحاولة في الدورة التالية
 
     if get_option_positions():
         raise SafetyHalt(
@@ -552,7 +556,6 @@ def refresh_daily_baseline():
 
     save_state()
     log.info("بداية يوم جديد | Equity=%.2f", equity)
-
 
 def check_daily_risk():
     ensure_not_halted()
