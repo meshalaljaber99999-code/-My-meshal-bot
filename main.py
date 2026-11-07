@@ -1103,22 +1103,41 @@ def submit_entry(meta, step):
     syms = [meta["symbol"]] if meta["kind"] == "SINGLE" else [meta["long_symbol"], meta["short_symbol"]]
     for s in syms: validate_symbol(s)
     snaps = get_option_snapshots(syms)
-    price = entry_frac_price(meta, snaps, ENTRY_STEPS[step])
+    
+    # 1. حالة العقد المفرد (لم تتغير)
     if meta["kind"] == "SINGLE":
+        price = entry_frac_price(meta, snaps, ENTRY_STEPS[step])
         payload = {"symbol": meta["symbol"], "qty": str(meta["quantity"]), "side": "buy", "type": "limit",
                    "time_in_force": "day", "limit_price": f"{price:.2f}", "position_intent": "buy_to_open"}
+        r = submit_order_payload(payload)
+        meta.update(status="PENDING_ENTRY", entry_step=step, step_at=utc_iso(), entry_limit=abs(price),
+                    entry_filled=0, entry_average_price=None, exit_order_id=None, exit_attempts=0,
+                    realized_pnl=meta.get("realized_pnl", 0.0), order_id=r["id"])
+        
+    # 2. حالة السبريد (نظام الـ Legging الجديد)
     else:
-        payload = mleg_payload(meta, meta["quantity"], price, closing=False)
-    r = submit_order_payload(payload)
-    meta.update(status="PENDING_ENTRY", entry_step=step, step_at=utc_iso(), entry_limit=abs(price),
-                entry_filled=0, entry_average_price=None, exit_order_id=None, exit_attempts=0,
-                realized_pnl=meta.get("realized_pnl", 0.0))
+        lq = extract_quote(snaps.get(meta["long_symbol"]))
+        if not lq: raise EntryBlocked("لا سعر حديث للعقد الأول (Long).")
+        
+        # نحاول نصطاد العقد الأول بسعر أقرب للـ Bid لتقليل التكلفة
+        leg1_price = round(lq["bid"] + ENTRY_STEPS[step] * (lq["ask"] - lq["bid"]), 2)
+        leg1_price = max(0.01, leg1_price)
+        
+        payload = {"symbol": meta["long_symbol"], "qty": str(meta["quantity"]), "side": "buy", "type": "limit",
+                   "time_in_force": "day", "limit_price": f"{leg1_price:.2f}", "position_intent": "buy_to_open"}
+        
+        r = submit_order_payload(payload)
+        meta.update(status="PENDING_LEG1", entry_step=step, step_at=utc_iso(), leg1_limit=leg1_price,
+                    leg1_order_id=r["id"], entry_filled=0, exit_order_id=None, exit_attempts=0,
+                    realized_pnl=meta.get("realized_pnl", 0.0), order_id=r["id"])
+
     meta.setdefault("created_at", utc_iso())
     STATE["position_meta"][r["id"]] = meta
     save_state()
-    ledger_event("ENTRY_SUBMITTED", {"order": r["id"], "strategy": meta["strategy"], "step": step, "price": price})
-    log.info("ENTRY SUBMITTED | %s | Qty=%s | Price=%.2f | Step=%s", meta["strategy"], meta["quantity"], price, step)
+    ledger_event("ENTRY_SUBMITTED", {"order": r["id"], "strategy": meta["strategy"], "step": step})
+    log.info("ENTRY SUBMITTED | %s | Qty=%s | Step=%s", meta["strategy"], meta["quantity"], step)
     return r
+
 
 
 def entry_window_ok():
@@ -1127,36 +1146,95 @@ def entry_window_ok():
 
 
 def handle_entry_order(oid, meta):
-    order = get_order(oid)
-    if not order: return
-    update_order_record(oid, order)
-    status = str(order.get("status", "")).lower()
-    filled = int(safe_float(order.get("filled_qty"), 0) or 0)
-    if status in FINAL:
-        if filled > 0:
-            avg = abs(safe_float(order.get("filled_avg_price"), meta.get("entry_limit", 0.0)))
-            risk_base = avg if (meta["kind"] == "SINGLE" or not meta["credit"]) else meta["width"] - avg
-            meta.update(status="OPEN", entry_filled=filled, entry_average_price=avg, risk_base=risk_base,
-                        opened_at=utc_iso(), peak_return=0.0, partial_done=False)
-            STATE["trades_today"] += 1
-            save_state()
-            ledger_event("ENTRY_FILLED", {"order": oid, "filled": filled, "avg": avg})
-            telegram_send(f"✅ تم الدخول\n{meta['strategy']} × {filled} @ {avg:.2f}\n"
-                          f"القناعة: {meta.get('conv', 0):.0f} | EV: {meta.get('ev_text', '-')}\nPAPER")
-        else:
-            STATE["position_meta"].pop(oid, None)
-            save_state()
-            step = meta.get("entry_step", 0)
-            if step + 1 < len(ENTRY_STEPS) and entry_window_ok():
-                try:
-                    submit_entry(meta, step + 1)
-                except (EntryBlocked, APIError) as exc:
-                    log.info("ENTRY RETRY STOPPED: %s", exc)
+    # حالة العقود المفردة القديمة
+    if meta.get("status") == "PENDING_ENTRY":
+        order = get_order(meta.get("order_id", oid))
+        if not order: return
+        update_order_record(oid, order)
+        status = str(order.get("status", "")).lower()
+        filled = int(safe_float(order.get("filled_qty"), 0) or 0)
+        
+        if status in FINAL:
+            if filled > 0:
+                avg = abs(safe_float(order.get("filled_avg_price"), meta.get("entry_limit", 0.0)))
+                meta.update(status="OPEN", entry_filled=filled, entry_average_price=avg, risk_base=avg,
+                            opened_at=utc_iso(), peak_return=0.0, partial_done=False)
+                STATE["trades_today"] += 1
+                save_state()
+                telegram_send(f"✅ تم الدخول\n{meta['strategy']} × {filled} @ {avg:.2f}\nPAPER")
             else:
-                ledger_event("ENTRY_NOT_FILLED", {"order": oid, "status": status})
-        return
-    if seconds_since(meta.get("step_at")) > ENTRY_STEP_SECONDS or force_exit_time_reached():
-        cancel_order(oid)
+                STATE["position_meta"].pop(oid, None)
+                save_state()
+            return
+        if seconds_since(meta.get("step_at")) > ENTRY_STEP_SECONDS or force_exit_time_reached():
+            cancel_order(oid)
+
+    # المرحلة الأولى من السبريد (شراء الـ Long)
+    elif meta.get("status") == "PENDING_LEG1":
+        leg1_id = meta.get("leg1_order_id")
+        order = get_order(leg1_id)
+        if not order: return
+        status = str(order.get("status", "")).lower()
+        filled = int(safe_float(order.get("filled_qty"), 0) or 0)
+        
+        if status in FINAL:
+            if filled > 0:
+                meta["leg1_avg"] = safe_float(order.get("filled_avg_price"), meta.get("leg1_limit", 0.0))
+                meta["leg1_filled"] = filled
+                meta["status"] = "PENDING_LEG2"
+                
+                # إطلاق العقد الثاني (البيع) فوراً لضمان اكتمال السبريد!
+                snaps = get_option_snapshots([meta["short_symbol"]])
+                sq = extract_quote(snaps.get(meta["short_symbol"]))
+                leg2_price = round(sq["bid"] + 0.1 * (sq["ask"] - sq["bid"]), 2) if sq else 0.01
+                
+                p2 = {"symbol": meta["short_symbol"], "qty": str(filled), "side": "sell", "type": "limit",
+                      "time_in_force": "day", "limit_price": f"{max(0.01, leg2_price):.2f}", "position_intent": "sell_to_open"}
+                
+                r2 = submit_order_payload(p2)
+                meta.update(leg2_order_id=r2["id"], leg2_limit=leg2_price, step_at=utc_iso())
+                save_state()
+                log.info("LEG 1 FILLED! Firing LEG 2 (Short) -> %s", meta["short_symbol"])
+            else:
+                STATE["position_meta"].pop(oid, None)
+                save_state()
+            return
+        if seconds_since(meta.get("step_at")) > ENTRY_STEP_SECONDS or force_exit_time_reached():
+            cancel_order(leg1_id)
+
+    # المرحلة الثانية من السبريد (تأكيد اكتمال الصفقة)
+    elif meta.get("status") == "PENDING_LEG2":
+        leg2_id = meta.get("leg2_order_id")
+        order2 = get_order(leg2_id)
+        if not order2: return
+        status2 = str(order2.get("status", "")).lower()
+        filled2 = int(safe_float(order2.get("filled_qty"), 0) or 0)
+        
+        if status2 in FINAL:
+            if filled2 > 0:
+                # اكتمل السبريد بنجاح! نقوم بحساب التكلفة الإجمالية بدقة
+                leg2_avg = safe_float(order2.get("filled_avg_price"), meta.get("leg2_limit", 0.0))
+                net_avg = meta["leg1_avg"] - leg2_avg  # التكلفة الصافية
+                risk_base = meta["width"] - abs(net_avg) if meta.get("credit") else abs(net_avg)
+                
+                meta.update(status="OPEN", entry_filled=filled2, entry_average_price=abs(net_avg),
+                            risk_base=risk_base, opened_at=utc_iso(), peak_return=0.0, partial_done=False)
+                STATE["trades_today"] += 1
+                save_state()
+                telegram_send(f"✅ تم اصطياد السبريد (Legging)\n{meta['strategy']} × {filled2}\nصافي التكلفة: {abs(net_avg):.2f}\nPAPER")
+            else:
+                # لم يتنفذ العقد الثاني؟ نرسل أمر ماركت فوراً لمنع الانكشاف (Naked Long Risk)
+                log.warning("LEG 2 FAILED TO FILL! Converting to MARKET order to lock spread.")
+                p2_market = {"symbol": meta["short_symbol"], "qty": str(meta["leg1_filled"]), "side": "sell", 
+                             "type": "market", "time_in_force": "day", "position_intent": "sell_to_open"}
+                r_market = submit_order_payload(p2_market)
+                meta["leg2_order_id"] = r_market["id"]
+                save_state()
+            return
+        
+        # إذا تأخر التنفيذ لأكثر من 5 ثوانٍ، نعيد إرساله بسعر السوق
+        if seconds_since(meta.get("step_at")) > 5:
+            cancel_order(leg2_id)
 
 
 def pnl_per_share(meta, exit_avg):
