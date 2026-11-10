@@ -41,8 +41,8 @@ if os.getenv("ALLOW_LIVE_TRADING", "false").lower() == "true":
 
 ALL_STRATEGIES = ["CALL", "PUT", "BULL_CALL_SPREAD", "BEAR_PUT_SPREAD",
                   "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"]
-STRATEGY_MODE = os.getenv("STRATEGY_MODE", "AUTO").upper()
-if STRATEGY_MODE != "AUTO" and STRATEGY_MODE not in ALL_STRATEGIES:
+STRATEGY_MODE = os.getenv("STRATEGY_MODE", "SINGLES").upper()
+if STRATEGY_MODE not in ("AUTO", "SINGLES") and STRATEGY_MODE not in ALL_STRATEGIES:
     raise RuntimeError(f"STRATEGY_MODE غير صالح: {STRATEGY_MODE}")
 
 # --- Risk (مرنة، تتدرج حسب القناعة)
@@ -88,7 +88,7 @@ REVERSAL_CONV = 55
 
 # --- Times (دقائق من منتصف الليل بتوقيت نيويورك)
 ENTRY_START = 9 * 60 + 55
-ENTRY_END = 15 * 60 + 15
+ENTRY_END = 14 * 60
 LATE_SPREAD_AFTER = 14 * 60
 FORCE_EXIT = 15 * 60 + 45
 DEAD_ZONE = (11 * 60 + 30, 13 * 60 + 30)
@@ -357,8 +357,8 @@ def force_exit_time_reached(): return minutes_ny() >= FORCE_EXIT
 
 
 def any_pending_orders():
-    return any(m.get("status") in ("PENDING_ENTRY", "PENDING_EXIT")
-               for m in STATE["position_meta"].values())
+    return any(m.get("status") in ("PENDING_ENTRY", "PENDING_LEG1", "PENDING_LEG2", "PENDING_EXIT")
+           for m in STATE["position_meta"].values())
 
 
 def parse_events():
@@ -981,6 +981,8 @@ def build_vertical(kind, chain, moves):
 
 
 def candidate_strategies(d, vs, regime):
+    if STRATEGY_MODE == "SINGLES":
+        return ["CALL"] if d > 0 else ["PUT"]
     c = ["CALL", "BULL_CALL_SPREAD", "BULL_PUT_SPREAD"] if d > 0 else ["PUT", "BEAR_PUT_SPREAD", "BEAR_CALL_SPREAD"]
     if STRATEGY_MODE != "AUTO": return [x for x in c if x == STRATEGY_MODE]
     if minutes_ny() >= LATE_SPREAD_AFTER: c = [x for x in c if x not in ("CALL", "PUT")]
@@ -1281,8 +1283,10 @@ def handle_exit_order(oid, meta):
 def process_orders():
     for oid, meta in list(STATE["position_meta"].items()):
         try:
-            if meta.get("status") == "PENDING_ENTRY": handle_entry_order(oid, meta)
-            elif meta.get("status") == "PENDING_EXIT": handle_exit_order(oid, meta)
+            if meta.get("status") in ("PENDING_ENTRY", "PENDING_LEG1", "PENDING_LEG2"):
+                handle_entry_order(oid, meta)
+            elif meta.get("status") == "PENDING_EXIT":
+                handle_exit_order(oid, meta)
         except APIError as exc:
             log.error("ORDER API ERROR %s: %s", oid, exc)
         except SafetyHalt:
@@ -1290,6 +1294,7 @@ def process_orders():
         except Exception:
             log.exception("ORDER ERROR %s", oid)
     save_state()
+
 
 
 # ========================= 16) POSITIONS / RECONCILIATION =========================
