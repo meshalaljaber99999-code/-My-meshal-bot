@@ -858,12 +858,13 @@ def score_market(ind, chain, vs, regime, heavy, analog, levels):
     if d:
         room = levels["room_up"] if d > 0 else levels["room_dn"]
         adj = 10 * clamp((room - 0.7) / 1.0, -1, 1)
-    pen = 0.0
-        near_hi = (ind["day_hi"] - p) < 0.3 * scale
+        pen = 0.0
+    near_hi = (ind["day_hi"] - p) < 0.3 * scale
     near_lo = (p - ind["day_lo"]) < 0.3 * scale
     if (d > 0 and near_hi) or (d < 0 and near_lo):
         if vs["range_used"] > 1.8: pen += 14
         elif vs["range_used"] > 1.3: pen += 8
+    if DEAD_ZONE[0] <= minutes_ny() <= DEAD_ZONE[1]: pen += 4
     conv = clamp(abs(S) + adj - pen, 0, 100)
     return {"S": S, "dir": d, "conv": conv, "parts": {k: round(w[k] * c[k], 1) for k in c},
             "adj": adj, "pen": pen, "z": z}
