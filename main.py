@@ -577,12 +577,24 @@ def compute_indicators(sb):
     er = abs(last[-1] - last[0]) / path if path > 0 else 0.0
     sides = [sign(c - vwap) for c in last]
     crosses = sum(1 for i in range(1, len(sides)) if sides[i] and sides[i - 1] and sides[i] != sides[i - 1])
+    
+    # --- إضافة صائد الانفجارات: رصد الاختناق السعري ---
+    c20 = closes[-20:]
+    squeeze = False
+    if len(c20) == 20:
+        std20 = std(c20)
+        bb_width = 4 * std20           # عرض بولينجر
+        kc_width = 3 * atr1            # عرض كيلتنر التقريبي
+        squeeze = (bb_width < kc_width) # السعر يختنق ويستعد للانفجار
+    # --------------------------------------------------
+
     return {"price": closes[-1], "prev": closes[-2], "closes": closes, "ema9": e9, "ema21": e21,
             "rsi": rsi, "vwap": vwap, "sigma": sigma, "atr1": atr1, "scale": atr1 * math.sqrt(15),
             "vr": vr, "day_open": sb[0]["open"], "day_hi": max(b["high"] for b in sb),
             "day_lo": min(b["low"] for b in sb), "or_hi": max(b["high"] for b in orb) if or_ok else None,
             "or_lo": min(b["low"] for b in orb) if or_ok else None, "closes5": five_min_closes(sb),
-            "er": er, "crosses": crosses, "t": sb[-1]["t"].isoformat()}
+            "er": er, "crosses": crosses, "t": sb[-1]["t"].isoformat(), 
+            "squeeze": squeeze}
 
 
 def classify_regime(ind):
@@ -1372,6 +1384,18 @@ def decide_exit(meta, ret, held, price):
     if peak >= BREAKEVEN_AFTER and ret < 0.02: return "BREAKEVEN_STOP"
     if ret >= TP_FULL: return "TAKE_PROFIT"
     if peak >= TRAIL_ACTIVATE and peak - ret >= max(0.15, 0.35 * peak): return "TRAILING"
+    
+    # --- إضافة صائد الانفجارات: الهروب عند موت الزخم ---
+    if meta.get("pre_breakout") and peak >= 0.15: # إذا ربحنا 15% أو أكثر من الانفجار الاستباقي
+        ind_ctx = CTX.get("ind")
+        sc_ctx = CTX.get("score")
+        if ind_ctx and sc_ctx:
+            mom_val = sc_ctx.get("parts", {}).get("mom", 0.0)
+            # إذا انعكس الزخم أو اختفت السيولة فجأة
+            if (d > 0 and mom_val <= 0) or (d < 0 and mom_val >= 0) or ind_ctx.get("vr", 1) < 0.8:
+                return "MOMENTUM_DEATH"
+    # ---------------------------------------------------
+
     tgt = meta.get("target")
     if price and tgt and ret > 0.05 and (price - tgt) * d >= -0.02: return "TARGET_LEVEL"
     sc = CTX.get("score")
@@ -1541,8 +1565,26 @@ def evaluate_and_enter():
     save_state()
     if d == 0 or not chain:
         return None
+        
     mx0 = meta_features(sc, analog, None, vs, regime)
     need = CONV_MIN + (0 if analog else 10)
+    
+    # --- تعديل صائد الانفجارات (الهجوم الاستباقي بدون تكرار) ---
+    is_pre_breakout = False
+    heavy_val = heavy_bias()
+    if ind.get("squeeze") and regime == "RANGE" and vs["iv_ratio"] < 1.15:
+        if heavy_val >= 2.0 and ind["vwap"] - price < ind["scale"]:
+            d = 1
+            need = 20
+            is_pre_breakout = True
+            log.info("🔥 SQUEEZE HUNTER: تجهيز عقد CALL قبل الانفجار!")
+        elif heavy_val <= -2.0 and price - ind["vwap"] < ind["scale"]:
+            d = -1
+            need = 20
+            is_pre_breakout = True
+            log.info("🔥 SQUEEZE HUNTER: تجهيز عقد PUT قبل الانهيار!")
+    # ---------------------------------------------------------
+
     moves = [f * scale * 0.7 for f in analog["fwds"]] if analog else None
     best, best_score = None, -1e9
     for strat in candidate_strategies(d, vs, regime):
@@ -1576,7 +1618,8 @@ def evaluate_and_enter():
                     "option_type": lg[0][0]["type"], "expiration": lg[0][0]["expiration"],
                     "inval": price - d * STOP_ATR_MULT * scale,
                     "target": levels["target_up"] if d > 0 else levels["target_dn"],
-                    "conv": conv, "ev_text": f"{ev:.2f}" if ev is not None else "-"}
+                    "conv": conv, "ev_text": f"{ev:.2f}" if ev is not None else "-",
+                    "pre_breakout": is_pre_breakout}  # تسجيل حالة الاستباق
             if best["kind"] == "SINGLE":
                 meta["symbol"] = lg[0][0]["symbol"]
             else:
@@ -1593,6 +1636,7 @@ def evaluate_and_enter():
     STATE["last_decision"] += f"\n→ مرفوض: {reason}"
     if conv >= SHADOW_MIN_SCORE: record_shadow(sc, ind, pick, mx, False, reason)
     return None
+
 
 
 # ========================= 20) TELEGRAM / REPORTS =========================
