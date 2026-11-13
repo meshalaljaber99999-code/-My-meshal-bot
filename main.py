@@ -854,11 +854,11 @@ def score_market(ind, chain, vs, regime, heavy, analog, levels):
         w["mr"] = 14
     S = sum(w[k] * c[k] for k in c)
     d = 1 if S >= 10 else -1 if S <= -10 else 0
-    adj = 0.0
+        adj = 0.0
+    pen = 0.0
     if d:
         room = levels["room_up"] if d > 0 else levels["room_dn"]
         adj = 10 * clamp((room - 0.7) / 1.0, -1, 1)
-        pen = 0.0
     near_hi = (ind["day_hi"] - p) < 0.3 * scale
     near_lo = (p - ind["day_lo"]) < 0.3 * scale
     if (d > 0 and near_hi) or (d < 0 and near_lo):
